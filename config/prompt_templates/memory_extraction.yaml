@@ -1,0 +1,64 @@
+# Memory extraction prompt templates
+# Used by the asynchronous memory:extract task to distill one completed QA
+# turn into long-term memory facts (L3) and a rolling session summary (L2).
+templates:
+  - id: "default_memory_extraction"
+    name: "Memory Extraction"
+    description: "Extract user facts, preferences, todos and feedback from a conversation turn"
+    default: true
+    content: |
+      ## Task
+      You maintain the long-term memory of an AI assistant. Analyze the
+      user-provided conversation excerpt (recent turns of one session,
+      ending with the latest turn) and extract memories worth persisting
+      for future conversations.
+
+      ## Memory categories
+      - profile: stable user attributes (name, role, organization, location).
+      - fact: durable facts about the user or their world, expressed as a
+        (subject, predicate, object) triple, e.g. (用户, 负责, Project X).
+      - preference: likes/dislikes, habits, answer-style or tooling
+        preferences, e.g. (用户, 偏好, Python).
+      - todo: an open task, plan or commitment the user mentioned, with an
+        optional deadline in due_at (ISO 8601, e.g. "2026-08-20").
+      - feedback: explicit praise or criticism of the assistant's answers
+        (e.g. "回答太啰嗦了"), so future answers can adapt.
+
+      ## Requirements
+      1. Output JSON only, matching this schema:
+         {"memories":[{"category":"...","subject":"...","predicate":"...",
+          "object":"...","content":"...","confidence":0.0,"importance":0.0,
+          "due_at":""}],
+          "session_summary":"...","key_topics":["..."]}
+      2. Only extract what is explicitly stated or strongly implied by the
+         user; never fabricate. Assistant statements are evidence about the
+         topic, not about the user — do not record the assistant's opinions
+         as user facts.
+      3. content is a single self-contained natural-language sentence (in
+         the conversation's language) that still makes sense without the
+         conversation, e.g. "用户负责 Project X 的交付".
+      4. confidence: how certain the extraction is (0.5 tentative – 1.0
+         explicit). importance: how valuable this memory is for future
+         answers (0.1 trivia – 1.0 critical identity/deadline).
+      5. Skip small talk, one-off questions, and anything already obvious
+         from the current turn alone. Prefer fewer, higher-quality memories;
+         at most 5 per turn. If nothing is worth remembering, return an
+         empty memories array.
+      6. session_summary: refresh the rolling summary of the whole session
+         in at most 3 sentences, merging the previous summary (if provided)
+         with the latest turn. Write it in the conversation's language.
+         key_topics: up to 5 short topic labels for the session.
+      7. Do not output any explanation or markdown fencing; output only the
+         JSON object.
+
+      ## Example
+      [Input]
+      Previous summary: 用户在评估团队的监控方案。
+      user: 我下周三要给团队演示 Prometheus 的部署方案，我比较倾向用 Helm 管理。
+      assistant: 好的，演示可以按 values.yaml 分层覆盖的思路来组织……
+
+      [Output]
+      {"memories":[
+        {"category":"todo","subject":"用户","predicate":"需要完成","object":"向团队演示 Prometheus 部署方案","content":"用户需要向团队演示 Prometheus 的部署方案（截止下周三）","confidence":0.95,"importance":0.9,"due_at":""},
+        {"category":"preference","subject":"用户","predicate":"偏好","object":"用 Helm 管理部署","content":"用户偏好使用 Helm 来管理 Prometheus 部署","confidence":0.9,"importance":0.6,"due_at":""}
+      ],"session_summary":"用户正在准备向团队演示 Prometheus 部署方案，倾向用 Helm 管理，助手建议按 values.yaml 分层覆盖组织演示。","key_topics":["Prometheus","Helm","部署演示"]}

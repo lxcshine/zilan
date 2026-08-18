@@ -1,0 +1,64 @@
+# Session precipitation prompt templates (知识沉淀, memory layer 4.4)
+# Used by the asynchronous session:precipitate task to distill a high-value
+# conversation into a curated knowledge document, and by the one-click
+# "将本次对话整理为 Wiki" endpoint to produce an interlinked wiki article.
+templates:
+  - id: "default_session_precipitation"
+    name: "Session Precipitation"
+    description: "Distill a high-value conversation into a curated Markdown knowledge document"
+    default: true
+    content: |
+      ## Task
+      You are the knowledge curator of an AI assistant. Read the provided
+      conversation (one complete session between a user and the assistant)
+      and distill it into a durable knowledge document that will be indexed
+      into a knowledge base and retrieved by future conversations.
+
+      ## Output requirements
+      1. Output GitHub-flavored Markdown only — no JSON, no code fences
+         around the whole document, no commentary about your process.
+      2. Structure:
+         - One `# ` title line capturing the session's core topic.
+         - `## 背景与目标` — what the user is trying to achieve.
+         - `## 关键结论` — the settled answers, decisions and facts, as
+           bullet points. Each bullet must be self-contained (understandable
+           without the conversation).
+         - `## 待办与后续` — open tasks, deadlines and next steps mentioned
+           (omit the section when there are none).
+         - `## 涉及实体` — people, projects, products, technologies named in
+           the conversation, one per line as `- 名称 — 一句话说明`.
+      3. Write in the conversation's language. Be faithful: only record
+         what was actually said or decided; never invent conclusions.
+      4. Keep the whole document under 800 words. Drop small talk, failed
+         attempts and superseded intermediate answers — only the final,
+         validated outcome belongs in the record.
+
+  - id: "default_session_wiki"
+    name: "Session To Wiki"
+    description: "Distill a conversation into a wiki article (title + summary + markdown body)"
+    default: true
+    content: |
+      ## Task
+      You are the wiki editor of an AI assistant. Read the provided
+      conversation and distill it into ONE wiki article so the knowledge
+      becomes a permanent, interlinked page of the knowledge base wiki.
+
+      ## Output requirements
+      1. Output JSON only, matching this schema:
+         {"title":"...","summary":"...","content":"..."}
+      2. title: a concise noun-phrase naming the article's subject (not
+         "关于...的对话"). summary: exactly one sentence for index listings.
+         content: the GitHub-flavored Markdown body.
+      3. The body should read as a standalone article, NOT as a chat log:
+         open with a definition/overview paragraph, then organize the
+         settled conclusions into `##` sections. Do not include "user said /
+         assistant replied" narration.
+      4. When the article mentions a concept, entity or product that plausibly
+         has its own wiki page, link it with `[[slug]]` syntax (lowercase,
+         hyphenated slug, e.g. [[retrieval-augmented-generation]]). Only link
+         first mention per term; at most 10 links.
+      5. Be faithful: only record what was actually said or decided; never
+         fabricate facts. Write in the conversation's language. Keep the
+         body under 1200 words.
+      6. Do not output any explanation or markdown fencing; output only the
+         JSON object.

@@ -1,0 +1,288 @@
+<template>
+  <div class="kb-advanced-settings" :class="{ 'kb-advanced-settings--embedded': embedded }">
+    <div v-if="!embedded" class="section-header">
+      <h2>{{ $t('knowledgeEditor.advanced.title') }}</h2>
+      <p class="section-description">{{ $t('knowledgeEditor.advanced.description') }}</p>
+    </div>
+
+    <div class="settings-group">
+      <!-- Question Generation feature (only useful for RAG indexing) -->
+      <template v-if="ragEnabled !== false">
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>{{ $t('knowledgeEditor.advanced.questionGeneration.label') }}</label>
+          <p class="desc">{{ $t('knowledgeEditor.advanced.questionGeneration.description') }}</p>
+        </div>
+        <div class="setting-control">
+          <t-switch
+            v-model="localQuestionGeneration.enabled"
+            @change="handleQuestionGenerationToggle"
+            size="medium"
+          />
+        </div>
+      </div>
+
+      <!-- Question Generation configuration -->
+      <div v-if="localQuestionGeneration.enabled" class="subsection">
+        <div class="setting-row">
+          <div class="setting-info">
+            <label>{{ $t('knowledgeEditor.advanced.questionGeneration.countLabel') }}</label>
+            <p class="desc">{{ $t('knowledgeEditor.advanced.questionGeneration.countDescription') }}</p>
+          </div>
+          <div class="setting-control">
+            <t-input-number
+              v-model="localQuestionGeneration.questionCount"
+              :min="1"
+              :max="10"
+              :step="1"
+              theme="normal"
+              @change="handleQuestionGenerationChange"
+              style="width: 120px;"
+            />
+          </div>
+        </div>
+        <div class="setting-row setting-row-vertical">
+          <div class="setting-info">
+            <label>{{ $t('knowledgeEditor.advanced.questionGeneration.instructionsLabel') }}</label>
+            <p class="desc">{{ $t('knowledgeEditor.advanced.questionGeneration.instructionsDescription') }}</p>
+          </div>
+          <div class="setting-control">
+            <t-textarea
+              v-model="localQuestionGeneration.customInstructions"
+              :placeholder="$t('knowledgeEditor.advanced.questionGeneration.instructionsPlaceholder')"
+              :maxlength="4000"
+              :autosize="{ minRows: 3, maxRows: 8 }"
+              @change="handleQuestionGenerationChange"
+            />
+          </div>
+        </div>
+      </div>
+      </template>
+
+      <div class="setting-row setting-row-vertical">
+        <div class="setting-info">
+          <label>{{ $t('knowledgeEditor.advanced.tableMetadataInstructions.label') }}</label>
+          <p class="desc">{{ $t('knowledgeEditor.advanced.tableMetadataInstructions.description') }}</p>
+        </div>
+        <div class="setting-control">
+          <t-textarea
+            :model-value="tableMetadataInstructions"
+            :placeholder="$t('knowledgeEditor.advanced.tableMetadataInstructions.placeholder')"
+            :maxlength="4000"
+            :autosize="{ minRows: 3, maxRows: 8 }"
+            @change="(value: string) => emit('update:tableMetadataInstructions', value)"
+          />
+        </div>
+      </div>
+
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, watch } from 'vue'
+
+interface QuestionGenerationConfig {
+  enabled: boolean
+  questionCount: number
+  customInstructions?: string
+}
+
+interface Props {
+  questionGeneration?: QuestionGenerationConfig
+  ragEnabled?: boolean
+  allModels?: any[]
+  embedded?: boolean
+  tableMetadataInstructions?: string
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  embedded: false,
+})
+
+const emit = defineEmits<{
+  'update:questionGeneration': [value: QuestionGenerationConfig]
+  'update:tableMetadataInstructions': [value: string]
+}>()
+
+const localQuestionGeneration = ref<QuestionGenerationConfig>(
+  props.questionGeneration
+    ? { ...props.questionGeneration, customInstructions: props.questionGeneration.customInstructions || '' }
+    : { enabled: false, questionCount: 3, customInstructions: '' }
+)
+
+watch(() => props.questionGeneration, (newVal) => {
+  if (newVal) {
+    localQuestionGeneration.value = { customInstructions: '', ...newVal }
+  }
+}, { deep: true })
+
+const handleQuestionGenerationToggle = () => {
+  if (!localQuestionGeneration.value.enabled) {
+    localQuestionGeneration.value.questionCount = 3
+  }
+  emit('update:questionGeneration', localQuestionGeneration.value)
+}
+
+const handleQuestionGenerationChange = () => {
+  emit('update:questionGeneration', localQuestionGeneration.value)
+}
+</script>
+
+<style lang="less" scoped>
+.kb-advanced-settings {
+  width: 100%;
+}
+
+.section-header {
+  margin-bottom: 20px;
+
+  h2 {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--td-text-color-primary);
+    margin: 0 0 6px 0;
+  }
+
+  .section-description {
+    font-size: 14px;
+    color: var(--td-text-color-secondary);
+    margin: 0;
+    line-height: 1.5;
+  }
+}
+
+.settings-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.setting-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--td-component-stroke);
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.setting-info {
+  flex: 0 0 40%;
+  max-width: 40%;
+  padding-right: 24px;
+
+  label {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--td-text-color-primary);
+    display: block;
+    margin-bottom: 4px;
+  }
+
+  .desc {
+    font-size: 13px;
+    color: var(--td-text-color-secondary);
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .hint {
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+    margin: 6px 0 0 0;
+    line-height: 1.5;
+  }
+}
+
+.setting-control {
+  flex: 0 0 55%;
+  max-width: 55%;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.setting-row-vertical {
+  flex-direction: column;
+  gap: 12px;
+
+  .setting-info,
+  .setting-control {
+    flex: none;
+    width: 100%;
+    max-width: none;
+    padding-right: 0;
+  }
+
+  .setting-control {
+    display: block;
+  }
+}
+
+.subsection {
+  padding: 16px 20px;
+  margin: 12px 0 0 0;
+  background: var(--td-bg-color-container);
+  border-radius: 8px;
+  border-left: 3px solid var(--td-brand-color);
+  position: relative;
+}
+
+.required {
+  color: var(--td-error-color);
+  margin-left: 2px;
+  font-weight: 500;
+}
+
+.kb-advanced-settings--embedded {
+  .setting-row {
+    padding: 12px 0;
+  }
+
+  .setting-row:has(.t-switch) {
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
+
+    .setting-info {
+      flex: 1;
+      min-width: 0;
+      max-width: none;
+      padding-right: 0;
+    }
+
+    .setting-control {
+      flex: none;
+      align-self: center;
+    }
+  }
+
+  .subsection .setting-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+
+    .setting-info {
+      flex: none;
+      max-width: none;
+      padding-right: 0;
+    }
+
+    .setting-control {
+      align-self: flex-start;
+    }
+  }
+
+  .subsection {
+    margin-top: 0;
+    padding: 0;
+    border: none;
+    background: none;
+  }
+}
+
+</style>

@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package docreader;
+
+option go_package = "github.com/Tencent/WeKnora/internal/docreader/proto";
+
+service DocReader {
+  rpc Read(ReadRequest) returns (ReadResponse) {}
+  // ReadStream is the streaming counterpart of Read. It first emits one
+  // ReadStreamResponse carrying the parse metadata (markdown / metadata /
+  // error), then emits one message per image. This keeps every gRPC message
+  // small so large scanned PDFs (hundreds of page images, far exceeding the
+  // unary message-size cap) can be returned without RESOURCE_EXHAUSTED and
+  // with bounded memory on both ends.
+  rpc ReadStream(ReadRequest) returns (stream ReadStreamResponse) {}
+  rpc ListEngines(ListEnginesRequest) returns (ListEnginesResponse) {}
+}
+
+message ReadConfig {
+  string parser_engine = 1;
+  map<string, string> parser_engine_overrides = 2;
+  // image_storage removed: image persistence is now handled entirely by the Go App.
+  // Field number 3 is reserved for backward compatibility.
+  reserved 3;
+}
+
+// Unified read request: set file_content for file mode, url for URL mode.
+message ReadRequest {
+  bytes  file_content = 1;
+  string file_name = 2;
+  string file_type = 3;
+  string url = 4;
+  string title = 5;
+  ReadConfig config = 6;
+  string request_id = 7;
+}
+
+message ImageRef {
+  string filename = 1;
+  string original_ref = 2;
+  string mime_type = 3;
+  string storage_key = 4;    // download URL from shared storage
+  bytes  image_data = 5;     // inline bytes fallback
+}
+
+message ReadResponse {
+  string markdown_content = 1;
+  repeated ImageRef image_refs = 2;
+  string image_dir_path = 3;
+  map<string, string> metadata = 4;
+  string error = 5;
+}
+
+// Metadata header for a streamed read. Sent exactly once, before any image.
+message ReadStreamMeta {
+  string markdown_content = 1;
+  string image_dir_path = 2;
+  map<string, string> metadata = 3;
+  string error = 4;
+  uint32 image_count = 5; // best-effort total image count (0 if unknown)
+}
+
+// One frame of a ReadStream. The first frame carries `meta`; every subsequent
+// frame carries a single `image`.
+message ReadStreamResponse {
+  oneof payload {
+    ReadStreamMeta meta = 1;
+    ImageRef image = 2;
+  }
+}
+
+message ListEnginesRequest {
+  map<string, string> config_overrides = 1;
+}
+
+message ParserEngineInfo {
+  string name = 1;
+  string description = 2;
+  repeated string file_types = 3;
+  bool available = 4;
+  string unavailable_reason = 5;
+}
+
+message ListEnginesResponse {
+  repeated ParserEngineInfo engines = 1;
+}

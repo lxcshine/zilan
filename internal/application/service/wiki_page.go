@@ -1,0 +1,1880 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Tencent/WeKnora/internal/application/repository"
+	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+)
+
+// wikiLinkRegex matches [[wiki-link]] syntax in markdown content
+var wikiLinkRegex = regexp.MustCompile(`\[\[([^\]]+)\]\]`)
+
+// wikiInlineChunkCitationRegex matches internal short handles emitted by the
+// wiki ingest prompt while it classifies supporting chunks. The stable source
+// relationship lives in WikiPage.ChunkRefs, so these handles have no meaning
+// to readers and must not leak into generated Markdown.
+var wikiInlineChunkCitationRegex = regexp.MustCompile(`[ \t]*\[c\d{3,}(?:\s*[,;]\s*c\d{3,})*\]`)
+
+func stripWikiInlineChunkCitations(content string) string {
+	return wikiInlineChunkCitationRegex.ReplaceAllString(content, "")
+}
+
+func stripWikiPageInlineChunkCitations(page *types.WikiPage) {
+	if page == nil {
+		return
+	}
+	page.Content = stripWikiInlineChunkCitations(page.Content)
+	page.Summary = stripWikiInlineChunkCitations(page.Summary)
+}
+
+// wikiPageService implements the WikiPageService interface
+type wikiPageService struct {
+	repo            interfaces.WikiPageRepository
+	chunkRepo       interfaces.ChunkRepository
+	kbService       interfaces.KnowledgeBaseService
+	taskPendingRepo interfaces.TaskPendingOpsRepository
+	redisClient     *redis.Client
+}
+
+// NewWikiPageService creates a new wiki page service
+func NewWikiPageService(
+	repo interfaces.WikiPageRepository,
+	chunkRepo interfaces.ChunkRepository,
+	kbService interfaces.KnowledgeBaseService,
+	taskPendingRepo interfaces.TaskPendingOpsRepository,
+	redisClient *redis.Client,
+) interfaces.WikiPageService {
+	return &wikiPageService{
+		repo:            repo,
+		chunkRepo:       chunkRepo,
+		kbService:       kbService,
+		taskPendingRepo: taskPendingRepo,
+		redisClient:     redisClient,
+	}
+}
+
+// CreatePage creates a new wiki page
+func (s *wikiPageService) CreatePage(ctx context.Context, page *types.WikiPage) (*types.WikiPage, error) {
+	if page.ID == "" {
+		page.ID = uuid.New().String()
+	}
+	if page.Slug == "" {
+		return nil, errors.New("wiki page slug is required")
+	}
+	if page.KnowledgeBaseID == "" {
+		return nil, errors.New("knowledge_base_id is required")
+	}
+	if page.Status == "" {
+		page.Status = types.WikiPageStatusPublished
+	}
+	if page.Version == 0 {
+		page.Version = 1
+	}
+	page.LastEditSource = types.WikiEditSourceFromContext(ctx)
+	page.LastEditorID, _ = types.UserIDFromContext(ctx)
+	stripWikiPageInlineChunkCitations(page)
+
+	// Parse outbound links from content
+	page.OutLinks = s.parseOutLinks(page.Content)
+	if err := s.applyFolderToPage(ctx, page); err != nil {
+		return nil, err
+	}
+	normalizeWikiHierarchy(page)
+
+	now := time.Now()
+	page.CreatedAt = now
+	page.UpdatedAt = now
+
+	if err := s.repo.Create(ctx, page); err != nil {
+		return nil, fmt.Errorf("create wiki page: %w", err)
+	}
+
+	// Update inbound links on target pages
+	s.updateInLinks(ctx, page.KnowledgeBaseID, page.Slug, page.OutLinks)
+
+	return page, nil
+}
+
+// UpdatePage updates an existing wiki page.
+//
+// Version bump policy: the `version` column is intended to track the user-
+// visible content revision, not every row rewrite. We therefore bump it only
+// when at least one of the user-facing fields actually changes — title,
+// content, summary, page_type, or status. Bookkeeping-only writes (refreshing
+// source_refs after re-ingest when the body is identical, rebuilding the index
+// page with the same directory, cross-link injection that ends up replacing
+// nothing, etc.) still persist through `UpdateMeta` but leave `version`
+// untouched so consumers can treat a bump as a real edit signal.
+func (s *wikiPageService) UpdatePage(ctx context.Context, page *types.WikiPage) (*types.WikiPage, error) {
+	existing, err := s.repo.GetBySlug(ctx, page.KnowledgeBaseID, page.Slug)
+	if err != nil {
+		return nil, fmt.Errorf("get existing page: %w", err)
+	}
+	stripWikiPageInlineChunkCitations(page)
+
+	oldOutLinks := existing.OutLinks
+
+	// Snapshot user-visible fields BEFORE mutation so we can decide whether
+	// this is a real content change or just bookkeeping.
+	contentChanged := existing.Title != page.Title ||
+		existing.Content != page.Content ||
+		existing.Summary != page.Summary ||
+		existing.PageType != page.PageType ||
+		existing.Status != page.Status ||
+		!slices.Equal(existing.Aliases, page.Aliases)
+
+	// Keep an unmutated copy of the version being replaced: it becomes the
+	// revision snapshot when this turns out to be a real content change.
+	prev := *existing
+
+	existing.Title = page.Title
+	existing.Content = page.Content
+	existing.Summary = page.Summary
+	existing.PageType = page.PageType
+	existing.Aliases = append(types.StringArray(nil), page.Aliases...)
+	existing.SourceRefs = page.SourceRefs
+	existing.ChunkRefs = page.ChunkRefs
+	existing.PageMetadata = page.PageMetadata
+	existing.ParentSlug = page.ParentSlug
+	existing.FolderID = page.FolderID
+	existing.SortOrder = page.SortOrder
+	existing.Status = page.Status
+	existing.UpdatedAt = time.Now()
+
+	// CategoryPath is a derived cache of FolderID — recompute it from the
+	// folder chain rather than trusting whatever the caller sent.
+	if err := s.applyFolderToPage(ctx, existing); err != nil {
+		return nil, err
+	}
+
+	// Outbound links are a pure derivative of content, so they only shift
+	// when content shifts. Re-parse unconditionally to stay consistent with
+	// the stored body.
+	existing.OutLinks = s.parseOutLinks(existing.Content)
+	normalizeWikiHierarchy(existing)
+
+	if contentChanged {
+		// The new version is authored by whoever is driving this write.
+		existing.LastEditSource = types.WikiEditSourceFromContext(ctx)
+		existing.LastEditorID, _ = types.UserIDFromContext(ctx)
+
+		// Snapshot the superseded version and write the new one atomically,
+		// so the content of every past version is preserved and a failed
+		// update leaves no snapshot behind.
+		if err := s.repo.UpdateWithRevision(ctx, existing, revisionFromPage(&prev)); err != nil {
+			return nil, fmt.Errorf("update wiki page: %w", err)
+		}
+		// Bound per-page history; best-effort — a failed prune only means
+		// slightly more storage until the next content change.
+		s.pruneRevisions(ctx, existing.ID, existing.Version)
+	} else {
+		// No user-visible change — persist bookkeeping fields but preserve
+		// the version so downstream consumers can rely on it.
+		if err := s.repo.UpdateMeta(ctx, existing); err != nil {
+			return nil, fmt.Errorf("update wiki page meta: %w", err)
+		}
+	}
+
+	// Update inbound links: remove old, add new. If content didn't change,
+	// oldOutLinks == existing.OutLinks and these calls are effectively no-ops.
+	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+
+	return existing, nil
+}
+
+// UpdatePageMeta updates only metadata (status, source_refs) without version bump or link re-parse.
+func (s *wikiPageService) UpdatePageMeta(ctx context.Context, page *types.WikiPage) error {
+	normalizeWikiHierarchy(page)
+	page.UpdatedAt = time.Now()
+	return s.repo.UpdateMeta(ctx, page)
+}
+
+// UpdateAutoLinkedContent persists content produced by machine-only link
+// decorators (cross-link injection / dead-link cleanup) without bumping
+// `version`. Out-links are re-parsed from the new body and bidirectional
+// in-link references on target pages are refreshed so link navigation stays
+// consistent — only the user-facing revision counter is preserved.
+func (s *wikiPageService) UpdateAutoLinkedContent(ctx context.Context, page *types.WikiPage) error {
+	existing, err := s.repo.GetBySlug(ctx, page.KnowledgeBaseID, page.Slug)
+	if err != nil {
+		return fmt.Errorf("get existing page: %w", err)
+	}
+
+	oldOutLinks := existing.OutLinks
+
+	existing.Content = stripWikiInlineChunkCitations(page.Content)
+	existing.OutLinks = s.parseOutLinks(existing.Content)
+	existing.UpdatedAt = time.Now()
+
+	if err := s.repo.UpdateAutoLinkedContent(ctx, existing); err != nil {
+		return fmt.Errorf("update auto-linked content: %w", err)
+	}
+
+	s.removeInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, oldOutLinks)
+	s.updateInLinks(ctx, existing.KnowledgeBaseID, existing.Slug, existing.OutLinks)
+
+	return nil
+}
+
+// revisionFromPage builds the immutable snapshot row for the given page
+// state. EditSource on the snapshot is the author of THAT version — the
+// page's provenance columns as they stood while the version was current —
+// not whoever is performing the write that supersedes it.
+func revisionFromPage(p *types.WikiPage) *types.WikiPageRevision {
+	return &types.WikiPageRevision{
+		ID:              uuid.New().String(),
+		TenantID:        p.TenantID,
+		KnowledgeBaseID: p.KnowledgeBaseID,
+		PageID:          p.ID,
+		Slug:            p.Slug,
+		Version:         p.Version,
+		Title:           p.Title,
+		PageType:        p.PageType,
+		Status:          p.Status,
+		Content:         p.Content,
+		Summary:         p.Summary,
+		Aliases:         append(types.StringArray(nil), p.Aliases...),
+		EditSource:      types.NormalizeWikiEditSource(p.LastEditSource),
+		EditorID:        p.LastEditorID,
+		EditedAt:        p.UpdatedAt,
+		CreatedAt:       time.Now(),
+	}
+}
+
+// pruneRevisions bounds one page's snapshot history after it advanced to
+// currentVersion. Machine-authored snapshots are dropped once they fall out
+// of the recent window; human/agent/revert ones survive until the hard cap,
+// so pipeline churn on a hot page cannot evict the edits users care about.
+func (s *wikiPageService) pruneRevisions(ctx context.Context, pageID string, currentVersion int) {
+	req := types.WikiRevisionPruneRequest{
+		PageID:              pageID,
+		KeepFromVersion:     currentVersion - types.WikiMaxRevisionsPerPage,
+		PrunableSources:     types.WikiPrunableEditSources,
+		HardKeepFromVersion: currentVersion - types.WikiMaxRevisionsHardCap,
+	}
+	if req.KeepFromVersion <= 0 && req.HardKeepFromVersion <= 0 {
+		return
+	}
+	if err := s.repo.PruneRevisions(ctx, req); err != nil {
+		logger.Warnf(ctx, "prune wiki page revisions for %s failed: %v", pageID, err)
+	}
+}
+
+// ErrWikiRevertToCurrentVersion is returned when a revert targets the version
+// the page is already on — a client-side mistake (usually a stale history
+// list), not a server fault, so handlers map it to 400.
+var ErrWikiRevertToCurrentVersion = errors.New("cannot revert to the current version")
+
+// ListRevisions returns the stored historical snapshots for a page (newest
+// first, content omitted) plus the page's current version.
+func (s *wikiPageService) ListRevisions(
+	ctx context.Context, kbID string, slug string, limit int, offset int,
+) (*types.WikiPageRevisionListResponse, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return nil, err
+	}
+	revs, total, err := s.repo.ListRevisions(ctx, kbID, page.ID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("list wiki page revisions: %w", err)
+	}
+	return &types.WikiPageRevisionListResponse{
+		Revisions:      revs,
+		Total:          total,
+		CurrentVersion: page.Version,
+	}, nil
+}
+
+// GetRevision returns one historical snapshot with content.
+func (s *wikiPageService) GetRevision(
+	ctx context.Context, kbID string, slug string, version int,
+) (*types.WikiPageRevision, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return nil, err
+	}
+	return s.repo.GetRevision(ctx, kbID, page.ID, version)
+}
+
+// RevertPageToVersion rolls the page back to a stored revision by applying
+// that revision's content fields as a regular edit: the pre-revert state is
+// snapshotted, version advances, links are re-parsed. Placement (folder,
+// sort order) and provenance refs keep their current values — a revert is
+// about content, not about undoing directory moves.
+func (s *wikiPageService) RevertPageToVersion(
+	ctx context.Context, kbID string, slug string, version int,
+) (*types.WikiPage, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return nil, err
+	}
+	if version == page.Version {
+		return nil, ErrWikiRevertToCurrentVersion
+	}
+	rev, err := s.repo.GetRevision(ctx, kbID, page.ID, version)
+	if err != nil {
+		return nil, err
+	}
+
+	target := *page
+	target.Title = rev.Title
+	target.Content = rev.Content
+	target.Summary = rev.Summary
+	target.PageType = rev.PageType
+	target.Status = rev.Status
+	target.Aliases = append(types.StringArray(nil), rev.Aliases...)
+
+	return s.UpdatePage(types.WithWikiEditSource(ctx, types.WikiEditSourceRevert), &target)
+}
+
+// GetPageBySlug retrieves a wiki page by its slug
+func (s *wikiPageService) GetPageBySlug(ctx context.Context, kbID string, slug string) (*types.WikiPage, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return nil, err
+	}
+	stripWikiPageInlineChunkCitations(page)
+	return page, nil
+}
+
+// GetPageByID retrieves a wiki page by its ID
+func (s *wikiPageService) GetPageByID(ctx context.Context, id string) (*types.WikiPage, error) {
+	page, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	stripWikiPageInlineChunkCitations(page)
+	return page, nil
+}
+
+// ListPages lists wiki pages with optional filtering and pagination
+func (s *wikiPageService) ListPages(ctx context.Context, req *types.WikiPageListRequest) (*types.WikiPageListResponse, error) {
+	pages, total, err := s.repo.List(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	for _, page := range pages {
+		stripWikiPageInlineChunkCitations(page)
+		normalizeWikiHierarchy(page)
+	}
+
+	pageSize := req.PageSize
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	page := req.Page
+	if page < 1 {
+		page = 1
+	}
+	totalPages := int(total) / pageSize
+	if int(total)%pageSize > 0 {
+		totalPages++
+	}
+
+	return &types.WikiPageListResponse{
+		Pages:      pages,
+		Total:      total,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalPages: totalPages,
+	}, nil
+}
+
+// DeletePage soft-deletes a wiki page
+func (s *wikiPageService) DeletePage(ctx context.Context, kbID string, slug string) error {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return err
+	}
+
+	// Remove inbound link references from pages this page links to
+	s.removeInLinks(ctx, kbID, slug, page.OutLinks)
+
+	// Delete the page
+	if err := s.repo.Delete(ctx, kbID, slug); err != nil {
+		return err
+	}
+
+	// Drop the snapshot history too: the page is gone from every read path,
+	// so its revisions are unreachable rows holding full content bodies.
+	// Best-effort — the page is already deleted and cannot be rolled back.
+	if err := s.repo.DeleteRevisionsByPage(ctx, page.ID); err != nil {
+		logger.Warnf(ctx, "delete wiki page revisions for %s failed: %v", page.ID, err)
+	}
+
+	// Delete synced chunk
+	s.deleteChunkForPage(ctx, page)
+
+	return nil
+}
+
+// GetIndex returns the index page for a knowledge base
+func (s *wikiPageService) GetIndex(ctx context.Context, kbID string) (*types.WikiPage, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, "index")
+	if err != nil {
+		if errors.Is(err, repository.ErrWikiPageNotFound) {
+			// Create default index page
+			return s.createDefaultPage(ctx, kbID, "index", "Index", types.WikiPageTypeIndex,
+				"# Wiki Index\n\nThis is the index page. It will be automatically updated as pages are added.\n")
+		}
+		return nil, err
+	}
+	return page, nil
+}
+
+// wikiIndexContentPageTypes enumerates the page types that make up a wiki's
+// user-visible directory. The index page is excluded; any
+// LLM-created type we do not recognize surfaces under a generic "other"
+// bucket.
+var wikiIndexContentPageTypes = []string{
+	types.WikiPageTypeSummary,
+	types.WikiPageTypeEntity,
+	types.WikiPageTypeConcept,
+	types.WikiPageTypeSynthesis,
+	types.WikiPageTypeComparison,
+}
+
+// GetIndexView builds the structured index response without ever
+// materializing a multi-MB directory markdown string. Intro is read from
+// the index wiki_page row (which now carries only intro text — see
+// rebuildIndexPage). Each requested page_type is paginated independently
+// with ListByTypeLight so reads stay O(page_size) rather than O(total
+// pages in the KB).
+//
+// `pageTypes` narrows which groups to include; empty = all content types.
+// `limit` is the per-group window size (defaults to 50, capped at 200).
+// `cursor` is an opaque offset string; currently we use the stringified
+// offset so clients can resume where they left off. Because different
+// page_types paginate independently, `cursor` applies uniformly to every
+// group — if the caller wants per-group cursors it should request one
+// type at a time via `pageTypes`. That simplifies the wire format and
+// matches the frontend's tabbed UX.
+func (s *wikiPageService) GetIndexView(
+	ctx context.Context,
+	kbID string,
+	pageTypes []string,
+	limit int,
+	cursor string,
+) (*types.WikiIndexResponse, error) {
+	indexPage, err := s.GetIndex(ctx, kbID)
+	if err != nil {
+		return nil, fmt.Errorf("load index page: %w", err)
+	}
+
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset := 0
+	if cursor != "" {
+		v, parseErr := strconv.Atoi(cursor)
+		if parseErr != nil || v < 0 {
+			return nil, fmt.Errorf("invalid cursor %q", cursor)
+		}
+		offset = v
+	}
+
+	// Default to every known content type when the caller passes no
+	// filter. Any unknown request-time type is passed through verbatim so
+	// future page types (declared in types/wiki_page.go) start showing
+	// up in the index the moment the LLM starts creating them, without a
+	// handler change.
+	selected := pageTypes
+	if len(selected) == 0 {
+		selected = append([]string{}, wikiIndexContentPageTypes...)
+	}
+
+	groups := make([]types.WikiIndexGroup, 0, len(selected))
+	for _, pt := range selected {
+		entries, total, listErr := s.repo.ListByTypeLight(ctx, kbID, pt, limit, offset)
+		if listErr != nil {
+			return nil, fmt.Errorf("list %s pages: %w", pt, listErr)
+		}
+		if entries == nil {
+			entries = []types.WikiIndexEntry{}
+		}
+		for i := range entries {
+			normalizeWikiIndexEntryHierarchy(&entries[i], pt)
+		}
+		next := ""
+		// Only emit a cursor when a full page was returned AND more rows
+		// remain past `offset + limit`. A short page or one that exactly
+		// consumed the remainder should signal end-of-feed.
+		if len(entries) == limit && int64(offset+len(entries)) < total {
+			next = strconv.Itoa(offset + limit)
+		}
+		groups = append(groups, types.WikiIndexGroup{
+			Type:       pt,
+			Total:      total,
+			Items:      entries,
+			NextCursor: next,
+		})
+	}
+
+	// The intro used to be stored on indexPage.Summary while
+	// indexPage.Content held intro + directory markdown. After the
+	// directory was lifted out of wiki_pages the content column holds
+	// only the intro. Fall back to Summary for KBs that haven't been
+	// re-ingested since the change so the response is never blank.
+	intro := indexPage.Content
+	if strings.TrimSpace(intro) == "" {
+		intro = indexPage.Summary
+	}
+
+	return &types.WikiIndexResponse{
+		Intro:   intro,
+		Version: indexPage.Version,
+		Groups:  groups,
+	}, nil
+}
+
+// GetGraph returns a slice of the wiki link graph for visualization.
+//
+// Two modes are supported:
+//
+//   - WikiGraphModeOverview (default): returns the top `Limit` pages sorted
+//     by link_count (in+out), plus every edge that connects two surviving
+//     nodes. This is what the frontend fetches on the first graph open —
+//     4万-page wikis would otherwise ship ~30MB of JSON and crash the
+//     browser trying to render 100k SVG elements.
+//
+//   - WikiGraphModeEgo: returns the BFS neighborhood of `Center` up to
+//     `Depth` undirected hops, capped at `Limit` total nodes. The
+//     frontend uses this to drill down when the user clicks / searches a
+//     node in the overview.
+//
+// `Types` is an optional page_type allow-list applied to both the candidate
+// node set and (in ego mode) the frontier expansion. Leaving it empty means
+// no type filter.
+//
+// `Limit <= 0` disables the cap entirely and is reserved for internal
+// callers like the lint service that need to walk every page. The HTTP
+// handler always clamps Limit into a safe range so external traffic can
+// never opt out of truncation.
+//
+// Implementation note: pages are still fetched via repo.ListAll. At 4万
+// pages that's ~10MB of rows + deserialization, which is already on the
+// expensive side but still tractable and keeps the repository interface
+// unchanged. Pushing the filter/top-N down into SQL is a follow-up step
+// (cache layer + DB-side projection) — see CLAUDE.md plan.
+func (s *wikiPageService) GetGraph(ctx context.Context, req *types.WikiGraphRequest) (*types.WikiGraphData, error) {
+	if req == nil {
+		return nil, errors.New("wiki graph request is required")
+	}
+
+	pages, err := s.repo.ListAll(ctx, req.KnowledgeBaseID)
+	if err != nil {
+		return nil, err
+	}
+	return computeGraphSubset(pages, req)
+}
+
+// computeGraphSubset is the pure I/O-free core of GetGraph. It takes the
+// full page list and a request description and returns the subgraph the
+// caller asked for. Extracted from GetGraph so tests can exercise the
+// mode/limit/type-filter behavior without plumbing a full repository mock.
+func computeGraphSubset(pages []*types.WikiPage, req *types.WikiGraphRequest) (*types.WikiGraphData, error) {
+	mode := req.Mode
+	if mode == "" {
+		mode = types.WikiGraphModeOverview
+	}
+
+	// Pre-compute link_count and the type allow-list used for candidate
+	// filtering. We keep the full page list around so ego mode can still
+	// traverse through neighbors whose type is in the allow-list.
+	typeAllow := make(map[string]bool, len(req.Types))
+	for _, t := range req.Types {
+		if t != "" {
+			typeAllow[t] = true
+		}
+	}
+	hasTypeFilter := len(typeAllow) > 0
+
+	pageBySlug := make(map[string]*types.WikiPage, len(pages))
+	linkCount := make(map[string]int, len(pages))
+	for _, p := range pages {
+		pageBySlug[p.Slug] = p
+		linkCount[p.Slug] = len(p.InLinks) + len(p.OutLinks)
+	}
+
+	// Select the node slug set for the requested slice.
+	var selected map[string]struct{}
+	switch mode {
+	case types.WikiGraphModeEgo:
+		if req.Center == "" {
+			return nil, errors.New("ego graph requires a center slug")
+		}
+		if _, ok := pageBySlug[req.Center]; !ok {
+			return nil, fmt.Errorf("ego center slug %q not found", req.Center)
+		}
+		depth := req.Depth
+		if depth < 1 {
+			depth = 1
+		}
+		selected = bfsEgoSlugs(pageBySlug, req.Center, depth, typeAllow, req.Limit)
+	default:
+		// overview: keep only type-allowed candidates, sort by link_count desc, cap.
+		candidates := make([]*types.WikiPage, 0, len(pages))
+		for _, p := range pages {
+			if hasTypeFilter && !typeAllow[p.PageType] {
+				continue
+			}
+			candidates = append(candidates, p)
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			li := linkCount[candidates[i].Slug]
+			lj := linkCount[candidates[j].Slug]
+			if li != lj {
+				return li > lj
+			}
+			// Stable tiebreaker keeps the API deterministic between calls.
+			return candidates[i].Slug < candidates[j].Slug
+		})
+		if req.Limit > 0 && len(candidates) > req.Limit {
+			candidates = candidates[:req.Limit]
+		}
+		selected = make(map[string]struct{}, len(candidates))
+		for _, p := range candidates {
+			selected[p.Slug] = struct{}{}
+		}
+	}
+
+	// Build nodes from the selected set.
+	nodes := make([]types.WikiGraphNode, 0, len(selected))
+	for slug := range selected {
+		p := pageBySlug[slug]
+		nodes = append(nodes, types.WikiGraphNode{
+			Slug:      p.Slug,
+			Title:     p.Title,
+			PageType:  p.PageType,
+			LinkCount: linkCount[slug],
+		})
+	}
+	// Deterministic node ordering — the map iteration above is random.
+	sort.Slice(nodes, func(i, j int) bool {
+		if nodes[i].LinkCount != nodes[j].LinkCount {
+			return nodes[i].LinkCount > nodes[j].LinkCount
+		}
+		return nodes[i].Slug < nodes[j].Slug
+	})
+
+	// Build edges, keeping only edges whose endpoints both survived selection.
+	var edges []types.WikiGraphEdge
+	for _, p := range pages {
+		if _, ok := selected[p.Slug]; !ok {
+			continue
+		}
+		for _, target := range p.OutLinks {
+			if _, ok := selected[target]; !ok {
+				continue
+			}
+			edges = append(edges, types.WikiGraphEdge{
+				Source: p.Slug,
+				Target: target,
+			})
+		}
+	}
+
+	// total is the count of candidate nodes before truncation — i.e. the
+	// population the frontend would need to fetch if it asked for the
+	// whole graph. For overview this respects the type filter; for ego
+	// it is the total KB page count (the user still sees "X of Y" based
+	// on the full wiki, not a filtered denominator).
+	total := len(pages)
+	if mode == types.WikiGraphModeOverview && hasTypeFilter {
+		total = 0
+		for _, p := range pages {
+			if typeAllow[p.PageType] {
+				total++
+			}
+		}
+	}
+
+	meta := types.WikiGraphMeta{
+		Mode:      mode,
+		Total:     total,
+		Returned:  len(nodes),
+		Truncated: len(nodes) < total,
+	}
+	if mode == types.WikiGraphModeEgo {
+		meta.Center = req.Center
+		meta.Depth = req.Depth
+		if meta.Depth < 1 {
+			meta.Depth = 1
+		}
+	}
+
+	return &types.WikiGraphData{
+		Nodes: nodes,
+		Edges: edges,
+		Meta:  meta,
+	}, nil
+}
+
+// bfsEgoSlugs computes the undirected BFS neighborhood of `center` up to
+// `depth` hops using both inbound and outbound links. Type-filtered pages
+// are excluded from the result but are also NOT traversed through — so a
+// filter that hides "index" pages will not leak the whole wiki via the
+// index. The caller guarantees center exists in pageBySlug.
+func bfsEgoSlugs(
+	pageBySlug map[string]*types.WikiPage,
+	center string,
+	depth int,
+	typeAllow map[string]bool,
+	limit int,
+) map[string]struct{} {
+	hasTypeFilter := len(typeAllow) > 0
+	centerPage, ok := pageBySlug[center]
+	if !ok {
+		return map[string]struct{}{}
+	}
+	// If the center itself fails the type filter we honor the filter and
+	// return an empty set — the handler will surface Returned=0.
+	if hasTypeFilter && !typeAllow[centerPage.PageType] {
+		return map[string]struct{}{}
+	}
+
+	visited := map[string]struct{}{center: {}}
+	frontier := []string{center}
+
+	for hop := 0; hop < depth; hop++ {
+		if limit > 0 && len(visited) >= limit {
+			break
+		}
+		next := make([]string, 0, len(frontier))
+		for _, slug := range frontier {
+			p, ok := pageBySlug[slug]
+			if !ok {
+				continue
+			}
+			neighbors := make([]string, 0, len(p.OutLinks)+len(p.InLinks))
+			neighbors = append(neighbors, p.OutLinks...)
+			neighbors = append(neighbors, p.InLinks...)
+			for _, nb := range neighbors {
+				if _, seen := visited[nb]; seen {
+					continue
+				}
+				np, exists := pageBySlug[nb]
+				if !exists {
+					continue
+				}
+				if hasTypeFilter && !typeAllow[np.PageType] {
+					continue
+				}
+				visited[nb] = struct{}{}
+				next = append(next, nb)
+				if limit > 0 && len(visited) >= limit {
+					break
+				}
+			}
+			if limit > 0 && len(visited) >= limit {
+				break
+			}
+		}
+		frontier = next
+		if len(frontier) == 0 {
+			break
+		}
+	}
+
+	return visited
+}
+
+// GetStats returns aggregate statistics about the wiki
+func (s *wikiPageService) GetStats(ctx context.Context, kbID string) (*types.WikiStats, error) {
+	counts, err := s.repo.CountByType(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+
+	var total int64
+	for _, c := range counts {
+		total += c
+	}
+
+	orphans, err := s.repo.CountOrphans(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Count total links
+	pages, err := s.repo.ListAll(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	var totalLinks int64
+	for _, p := range pages {
+		totalLinks += int64(len(p.OutLinks))
+	}
+
+	// Get recent updates (last 10)
+	listReq := &types.WikiPageListRequest{
+		KnowledgeBaseID: kbID,
+		Page:            1,
+		PageSize:        10,
+		SortBy:          "updated_at",
+		SortOrder:       "desc",
+	}
+	recentPages, _, err := s.repo.List(ctx, listReq)
+	if err != nil {
+		return nil, err
+	}
+
+	var pendingTasks int64
+	var pendingIssues int64
+	var isActive bool
+	if s.taskPendingRepo != nil {
+		// Pending wiki ingest ops live in task_pending_ops keyed by
+		// (task_type="wiki:ingest", scope="knowledge_base", scope_id=kbID).
+		pendingTasks, _ = s.taskPendingRepo.PendingCount(ctx, wikiTaskType, wikiTaskScope, kbID)
+	}
+	if s.redisClient != nil {
+		// The "active batch in progress" flag is still a Redis-only
+		// short-lived signal (per-process lock with TTL renew); not
+		// worth migrating since it carries no durable state.
+		activeFlag, _ := s.redisClient.Exists(ctx, "wiki:active:"+kbID).Result()
+		isActive = activeFlag > 0
+	}
+
+	issues, _ := s.ListIssues(ctx, kbID, "", "pending")
+	pendingIssues = int64(len(issues))
+
+	return &types.WikiStats{
+		TotalPages:    total,
+		PagesByType:   counts,
+		TotalLinks:    totalLinks,
+		OrphanCount:   orphans,
+		RecentUpdates: recentPages,
+		PendingTasks:  pendingTasks,
+		PendingIssues: pendingIssues,
+		IsActive:      isActive,
+	}, nil
+}
+
+// RebuildLinks re-parses all pages and rebuilds bidirectional link references
+func (s *wikiPageService) RebuildLinks(ctx context.Context, kbID string) error {
+	pages, err := s.repo.ListAll(ctx, kbID)
+	if err != nil {
+		return err
+	}
+
+	// Build slug-to-page map
+	pageMap := make(map[string]*types.WikiPage)
+	for _, p := range pages {
+		pageMap[p.Slug] = p
+	}
+
+	// Clear all inbound links first
+	for _, p := range pages {
+		p.InLinks = types.StringArray{}
+	}
+
+	// Re-parse outbound links and rebuild inbound links
+	for _, p := range pages {
+		p.OutLinks = s.parseOutLinks(p.Content)
+		for _, target := range p.OutLinks {
+			if tp, exists := pageMap[target]; exists {
+				tp.InLinks = append(tp.InLinks, p.Slug)
+			}
+		}
+	}
+
+	// Save all pages (link rebuild is metadata-only, no version bump)
+	for _, p := range pages {
+		p.UpdatedAt = time.Now()
+		if err := s.repo.UpdateMeta(ctx, p); err != nil {
+			logger.Warnf(ctx, "wiki: failed to update links for page %s: %v", p.Slug, err)
+		}
+	}
+
+	return nil
+}
+
+// ListAllPages retrieves all wiki pages without pagination.
+func (s *wikiPageService) ListAllPages(ctx context.Context, kbID string) ([]*types.WikiPage, error) {
+	return s.repo.ListAll(ctx, kbID)
+}
+
+// ListByType returns every wiki page of a given type for a KB. Exposed so
+// callers like intro regeneration can load only the page type they need
+// (summaries) instead of paying for the full ListAll scan.
+func (s *wikiPageService) ListByType(ctx context.Context, kbID string, pageType string) ([]*types.WikiPage, error) {
+	return s.repo.ListByType(ctx, kbID, pageType)
+}
+
+// ListPagesBySourceRef exposes the repository's source-ref lookup so higher
+// layers (delete flow, retract reconciliation) can re-query the current wiki
+// state without depending on a stale caller-captured slug list.
+func (s *wikiPageService) ListPagesBySourceRef(ctx context.Context, kbID string, knowledgeID string) ([]*types.WikiPage, error) {
+	return s.repo.ListBySourceRef(ctx, kbID, knowledgeID)
+}
+
+// ListSlugsBySourceRef returns just the slugs of pages that cite the given
+// knowledge id. Backed by the source_refs GIN index added in migration
+// 000041 — the wiki ingest pipeline uses it as a cheap "before" snapshot
+// when reconciling old vs new extraction sets.
+func (s *wikiPageService) ListSlugsBySourceRef(ctx context.Context, kbID string, knowledgeID string) ([]string, error) {
+	return s.repo.ListSlugsBySourceRef(ctx, kbID, knowledgeID)
+}
+
+// ListBySlugs is the lazy fetcher used by wiki ingest's batch context.
+// Returns lightweight projections (no content / source_refs / chunk_refs)
+// for the requested slugs, in a single IN query. Used in place of the
+// pre-batch ListAllPages dump that historically pulled hundreds of MB
+// for KBs in the tens of thousands of pages.
+func (s *wikiPageService) ListBySlugs(ctx context.Context, kbID string, slugs []string) (map[string]*types.WikiPageLite, error) {
+	return s.repo.ListBySlugs(ctx, kbID, slugs)
+}
+
+// ListSummariesByKnowledgeIDs is the lazy fetcher for the retract /
+// reparse branches of reduceSlugUpdates. Returns the content of each
+// surviving summary page keyed by its source knowledge id.
+func (s *wikiPageService) ListSummariesByKnowledgeIDs(ctx context.Context, kbID string, kids []string) (map[string]string, error) {
+	return s.repo.ListSummariesByKnowledgeIDs(ctx, kbID, kids)
+}
+
+// ExistsSlugs reports which of the given slugs are live (non-archived,
+// non-deleted) in the KB. Used by cleanDeadLinks to validate out-link
+// targets before stripping them.
+func (s *wikiPageService) ExistsSlugs(ctx context.Context, kbID string, slugs []string) (map[string]bool, error) {
+	return s.repo.ExistsSlugs(ctx, kbID, slugs)
+}
+
+// ListAllSlugs returns every non-archived slug in the KB. Used by lint
+// to compute the live-slug set without paying for ListAll's full row
+// materialization.
+func (s *wikiPageService) ListAllSlugs(ctx context.Context, kbID string) ([]string, error) {
+	return s.repo.ListAllSlugs(ctx, kbID)
+}
+
+// ListPagesCursor is the lint-side cursor pagination over wiki_pages.
+func (s *wikiPageService) ListPagesCursor(ctx context.Context, kbID string, cursor string, limit int) ([]*types.WikiPage, string, error) {
+	return s.repo.ListPagesCursor(ctx, kbID, cursor, limit)
+}
+
+// ListByTypeRecent caps the page count for first-time index intro
+// generation so the LLM prompt stays bounded on large KBs.
+func (s *wikiPageService) ListByTypeRecent(ctx context.Context, kbID string, pageType string, limit int) ([]types.WikiIndexEntry, error) {
+	return s.repo.ListByTypeRecent(ctx, kbID, pageType, limit)
+}
+
+// FindSimilarPages performs a pg_trgm similarity search; used by the
+// dedup pre-filter to surface candidate merge targets.
+func (s *wikiPageService) FindSimilarPages(ctx context.Context, kbID string, query string, pageTypes []string, limit int) ([]*types.WikiPageLite, error) {
+	return s.repo.FindSimilarPages(ctx, kbID, query, pageTypes, limit)
+}
+
+// ListDistinctCategoryPaths returns the existing wiki folder paths. Used by
+// wiki ingest's taxonomy planner to ground folder reuse.
+func (s *wikiPageService) ListDistinctCategoryPaths(ctx context.Context, kbID string, maxPaths int) ([][]string, error) {
+	return s.repo.ListDistinctCategoryPaths(ctx, kbID, maxPaths)
+}
+
+// CountByType is a service-layer pass-through over the repo. Used by
+// the index intro path to frame the LLM prompt's "showing N of M" hint.
+func (s *wikiPageService) CountByType(ctx context.Context, kbID string) (map[string]int64, error) {
+	return s.repo.CountByType(ctx, kbID)
+}
+
+// SearchPages performs full-text search over wiki pages
+func (s *wikiPageService) SearchPages(ctx context.Context, kbID string, query string, limit int) ([]*types.WikiPage, error) {
+	return s.repo.Search(ctx, kbID, query, limit)
+}
+
+// --- Internal helpers ---
+
+// parseOutLinks extracts [[wiki-link]] slugs from markdown content
+func (s *wikiPageService) parseOutLinks(content string) types.StringArray {
+	matches := wikiLinkRegex.FindAllStringSubmatch(content, -1)
+	seen := make(map[string]bool)
+	var links types.StringArray
+
+	for _, match := range matches {
+		if len(match) > 1 {
+			slug := strings.TrimSpace(match[1])
+			// Handle [[slug|display name]] format — slug is the first part
+			if parts := strings.SplitN(slug, "|", 2); len(parts) == 2 {
+				slug = strings.TrimSpace(parts[0])
+			}
+			slug = normalizeSlug(slug)
+			if slug != "" && !seen[slug] {
+				seen[slug] = true
+				links = append(links, slug)
+			}
+		}
+	}
+	return links
+}
+
+// normalizeSlug normalizes a wiki link slug
+func normalizeSlug(slug string) string {
+	slug = strings.ToLower(strings.TrimSpace(slug))
+	slug = strings.ReplaceAll(slug, " ", "-")
+	return slug
+}
+
+// slugNamespace returns the prefix of a slug up to (but excluding) the first
+// '/', e.g. "summary/abc" -> "summary". Slugs without a '/' map to "".
+func slugNamespace(slug string) string {
+	if i := strings.IndexByte(slug, '/'); i >= 0 {
+		return slug[:i]
+	}
+	return ""
+}
+
+// rewriteDeadWikiLinks walks every [[slug]] / [[slug|display]] occurrence in
+// content and lets `resolve` decide, per link, whether to rewrite the slug.
+// `resolve` receives the normalized slug and its display text and returns the
+// replacement slug plus true to rewrite, or ("", false) to leave the link
+// untouched. Display text is preserved verbatim. This is a pure helper — the
+// resolution policy lives entirely in the callback.
+func rewriteDeadWikiLinks(content string, resolve func(normSlug, display string) (string, bool)) (string, bool) {
+	changed := false
+	out := wikiLinkRegex.ReplaceAllStringFunc(content, func(match string) string {
+		inner := match[2 : len(match)-2]
+		rawSlug := inner
+		display := ""
+		if parts := strings.SplitN(inner, "|", 2); len(parts) == 2 {
+			rawSlug = parts[0]
+			display = strings.TrimSpace(parts[1])
+		}
+		norm := normalizeSlug(rawSlug)
+		if norm == "" {
+			return match
+		}
+		newSlug, ok := resolve(norm, display)
+		if !ok || newSlug == "" || newSlug == norm {
+			return match
+		}
+		changed = true
+		if display != "" {
+			return "[[" + newSlug + "|" + display + "]]"
+		}
+		return "[[" + newSlug + "]]"
+	})
+	return out, changed
+}
+
+// RepairContentLinks rewrites [[slug]] / [[slug|display]] references in
+// `content` whose target does not exist in the KB but is almost certainly a
+// mangled form of a real page. The canonical case: an LLM re-typed a summary
+// page's UUID-based slug and inserted/dropped a hex digit
+// (summary/…06fb5d5b5b5e → summary/…06fb14d5b14b14e), producing a link that
+// 404s and can never be recovered by exact lookup.
+//
+// Unlike stripDeadWikiLinks (the ingest cleanup pass), this method is
+// REWRITE-ONLY: a dead link is corrected only when a confident live candidate
+// exists; otherwise it is left completely untouched. It NEVER strips a link to
+// plain text, so it is safe on any write path — including writes whose targets
+// legitimately do not exist yet (those simply stay as-is until they do).
+//
+// The candidate pool for each dead link is scoped to live slugs that share the
+// same namespace prefix (a dead `summary/<uuid>` only resolves against live
+// `summary/*` slugs). Scoping keeps the bigram-similarity lever safe: distinct
+// high-entropy UUIDs in one namespace don't collide, while a one-character
+// mangle stays comfortably above threshold against its true source.
+//
+// Returns the possibly-updated content and whether any rewrite happened.
+// Errors are only returned for hard repo failures; callers may treat repair as
+// best-effort and ignore them.
+func (s *wikiPageService) RepairContentLinks(
+	ctx context.Context, kbID, selfSlug, content string,
+) (string, bool, error) {
+	if strings.TrimSpace(content) == "" {
+		return content, false, nil
+	}
+	outLinks := s.parseOutLinks(content)
+	if len(outLinks) == 0 {
+		return content, false, nil
+	}
+
+	existMap, err := s.repo.ExistsSlugs(ctx, kbID, outLinks)
+	if err != nil {
+		return content, false, err
+	}
+	deadPrefixes := make(map[string]struct{})
+	for _, l := range outLinks {
+		if l == selfSlug || existMap[l] {
+			continue
+		}
+		deadPrefixes[slugNamespace(l)] = struct{}{}
+	}
+	if len(deadPrefixes) == 0 {
+		return content, false, nil
+	}
+
+	allSlugs, err := s.repo.ListAllSlugs(ctx, kbID)
+	if err != nil {
+		return content, false, err
+	}
+	liveByPrefix := make(map[string]map[string]struct{})
+	var candidateSlugs []string
+	for _, sl := range allSlugs {
+		ns := slugNamespace(sl)
+		if _, want := deadPrefixes[ns]; !want {
+			continue
+		}
+		set, ok := liveByPrefix[ns]
+		if !ok {
+			set = make(map[string]struct{})
+			liveByPrefix[ns] = set
+		}
+		set[sl] = struct{}{}
+		candidateSlugs = append(candidateSlugs, sl)
+	}
+	if len(candidateSlugs) == 0 {
+		return content, false, nil
+	}
+
+	// Build a title -> slug reverse lookup for candidate pages so the
+	// display-text lever (the safest, most precise one) can fire. Bounded to
+	// the relevant namespaces so this stays cheap even on large KBs.
+	titleToSlug := make(map[string]string)
+	if lites, lerr := s.repo.ListBySlugs(ctx, kbID, candidateSlugs); lerr == nil {
+		for _, lp := range lites {
+			if lp != nil && lp.Title != "" {
+				titleToSlug[lp.Title] = lp.Slug
+			}
+		}
+	}
+
+	resolveCache := make(map[string]string)
+	newContent, changed := rewriteDeadWikiLinks(content, func(norm, display string) (string, bool) {
+		if norm == selfSlug || existMap[norm] {
+			return "", false
+		}
+		key := norm + "\x00" + display
+		if cached, ok := resolveCache[key]; ok {
+			return cached, cached != ""
+		}
+		resolved, ok := resolveDeadSlug(norm, display, liveByPrefix[slugNamespace(norm)], titleToSlug)
+		if !ok || resolved == norm {
+			resolveCache[key] = ""
+			return "", false
+		}
+		resolveCache[key] = resolved
+		return resolved, true
+	})
+	return newContent, changed, nil
+}
+
+// updateInLinks adds the source slug to the in_links of target pages
+func (s *wikiPageService) updateInLinks(ctx context.Context, kbID string, sourceSlug string, targets types.StringArray) {
+	for _, targetSlug := range targets {
+		targetPage, err := s.repo.GetBySlug(ctx, kbID, targetSlug)
+		if err != nil {
+			continue // target page may not exist yet
+		}
+		if !containsString(targetPage.InLinks, sourceSlug) {
+			targetPage.InLinks = append(targetPage.InLinks, sourceSlug)
+			targetPage.UpdatedAt = time.Now()
+			if err := s.repo.UpdateMeta(ctx, targetPage); err != nil {
+				logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
+			}
+		}
+	}
+}
+
+// removeInLinks removes the source slug from the in_links of target pages
+func (s *wikiPageService) removeInLinks(ctx context.Context, kbID string, sourceSlug string, targets types.StringArray) {
+	for _, targetSlug := range targets {
+		targetPage, err := s.repo.GetBySlug(ctx, kbID, targetSlug)
+		if err != nil {
+			continue
+		}
+		newInLinks := removeString(targetPage.InLinks, sourceSlug)
+		if len(newInLinks) != len(targetPage.InLinks) {
+			targetPage.InLinks = newInLinks
+			targetPage.UpdatedAt = time.Now()
+			if err := s.repo.UpdateMeta(ctx, targetPage); err != nil {
+				logger.Warnf(ctx, "wiki: failed to update in_links for %s: %v", targetSlug, err)
+			}
+		}
+	}
+}
+
+// deleteChunkForPage removes the synced chunk for a wiki page. Chunk sync is
+// optional wiring, so a service built without a chunk repository just skips
+// it rather than taking the delete down with it.
+func (s *wikiPageService) deleteChunkForPage(ctx context.Context, page *types.WikiPage) {
+	if s.chunkRepo == nil {
+		return
+	}
+	chunkID := "wp-" + page.ID
+	if err := s.chunkRepo.DeleteChunk(ctx, page.TenantID, chunkID); err != nil {
+		logger.Warnf(ctx, "wiki: failed to delete chunk for page %s: %v", page.Slug, err)
+	}
+}
+
+// createDefaultPage creates the default index page.
+func (s *wikiPageService) createDefaultPage(ctx context.Context, kbID string, slug string, title string, pageType string, content string) (*types.WikiPage, error) {
+	// Get KB to get tenant ID
+	kb, err := s.kbService.GetKnowledgeBaseByIDOnly(ctx, kbID)
+	if err != nil {
+		return nil, fmt.Errorf("get knowledge base: %w", err)
+	}
+
+	page := &types.WikiPage{
+		ID:              uuid.New().String(),
+		TenantID:        kb.TenantID,
+		KnowledgeBaseID: kbID,
+		Slug:            slug,
+		Title:           title,
+		PageType:        pageType,
+		Status:          types.WikiPageStatusPublished,
+		Content:         content,
+		Summary:         title,
+		Version:         1,
+	}
+	normalizeWikiHierarchy(page)
+
+	if err := s.repo.Create(ctx, page); err != nil {
+		return nil, fmt.Errorf("create default %s page: %w", slug, err)
+	}
+	return page, nil
+}
+
+func normalizeWikiHierarchy(page *types.WikiPage) {
+	if page == nil {
+		return
+	}
+	page.ParentSlug = strings.TrimSpace(page.ParentSlug)
+
+	cleanPath := types.StringArray(types.CleanWikiCategoryPath(page.CategoryPath))
+	page.CategoryPath = cleanPath
+	page.Depth = len(cleanPath)
+
+	display := strings.TrimSpace(page.Title)
+	if display == "" {
+		display = strings.TrimSpace(page.Slug)
+	}
+	page.WikiPath = buildWikiPath(page.PageType, cleanPath, display)
+}
+
+func normalizeWikiIndexEntryHierarchy(entry *types.WikiIndexEntry, pageType string) {
+	if entry == nil {
+		return
+	}
+
+	cleanPath := types.StringArray(types.CleanWikiCategoryPath(entry.CategoryPath))
+	entry.CategoryPath = cleanPath
+	entry.Depth = len(cleanPath)
+
+	display := strings.TrimSpace(entry.Title)
+	if display == "" {
+		display = strings.TrimSpace(entry.Slug)
+	}
+	entry.WikiPath = buildWikiPath(pageType, cleanPath, display)
+}
+
+// buildWikiPath assembles the normalized, sortable "page_type/cat.../title"
+// breadcrumb used for directory ordering. Empty segments are skipped.
+func buildWikiPath(pageType string, categoryPath []string, display string) string {
+	parts := make([]string, 0, len(categoryPath)+2)
+	if pt := strings.TrimSpace(pageType); pt != "" {
+		parts = append(parts, pt)
+	}
+	parts = append(parts, categoryPath...)
+	if display != "" {
+		parts = append(parts, display)
+	}
+	return strings.Join(parts, "/")
+}
+
+// containsString checks if a string slice contains a given string
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// removeString removes a string from a slice
+func removeString(slice []string, s string) types.StringArray {
+	result := make(types.StringArray, 0, len(slice))
+	for _, v := range slice {
+		if v != s {
+			result = append(result, v)
+		}
+	}
+	return result
+}
+
+// CreateIssue logs a new issue for a wiki page
+func (s *wikiPageService) CreateIssue(ctx context.Context, issue *types.WikiPageIssue) (*types.WikiPageIssue, error) {
+	if issue.ID == "" {
+		issue.ID = uuid.New().String()
+	}
+	if err := s.repo.CreateIssue(ctx, issue); err != nil {
+		return nil, fmt.Errorf("create wiki page issue: %w", err)
+	}
+	return issue, nil
+}
+
+// ListIssues retrieves issues for a knowledge base
+func (s *wikiPageService) ListIssues(ctx context.Context, kbID string, slug string, status string) ([]*types.WikiPageIssue, error) {
+	return s.repo.ListIssues(ctx, kbID, slug, status)
+}
+
+// UpdateIssueStatus updates an issue's status
+func (s *wikiPageService) UpdateIssueStatus(ctx context.Context, issueID string, status string) error {
+	return s.repo.UpdateIssueStatus(ctx, issueID, status)
+}
+
+// --- Folder tree (wiki_folders) ---
+
+// wikiFolderSegments splits a materialized folder path ("AI/RAG") into cleaned
+// segments. Empty/blank path yields nil (the wiki root).
+func wikiFolderSegments(path string) []string {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	return types.CleanWikiCategoryPath(strings.Split(path, "/"))
+}
+
+// applyFolderToPage refreshes a page's derived category_path cache from its
+// authoritative FolderID. Root ("") clears the path. A folder id that does not
+// resolve is treated as a hard error so we never silently misplace a page.
+func (s *wikiPageService) applyFolderToPage(ctx context.Context, page *types.WikiPage) error {
+	if page == nil {
+		return nil
+	}
+	if strings.TrimSpace(page.FolderID) == "" {
+		page.FolderID = ""
+		page.CategoryPath = nil
+		return nil
+	}
+	folder, err := s.repo.GetFolderByID(ctx, page.KnowledgeBaseID, page.FolderID)
+	if err != nil {
+		if errors.Is(err, repository.ErrWikiFolderNotFound) {
+			return fmt.Errorf("wiki page references unknown folder %q", page.FolderID)
+		}
+		return fmt.Errorf("resolve page folder: %w", err)
+	}
+	page.CategoryPath = types.StringArray(wikiFolderSegments(folder.Path))
+	return nil
+}
+
+// GetFolder retrieves a single folder by id.
+func (s *wikiPageService) GetFolder(ctx context.Context, kbID string, id string) (*types.WikiFolder, error) {
+	return s.repo.GetFolderByID(ctx, kbID, id)
+}
+
+// ListChildFolders returns the direct children of parentID for a tree view
+// scoped to pageTypes. PageCount is recursive (the folder's whole subtree) so
+// a parent reflects everything filed beneath it. A folder is shown when its
+// subtree holds a page matching pageTypes. Wholly-empty folders (no pages of
+// any type underneath) are only listed when multiple types are requested —
+// the merged knowledge view — so single-type tabs like summary do not surface
+// empty containers.
+func (s *wikiPageService) ListChildFolders(
+	ctx context.Context, kbID string, parentID string, pageTypes []string,
+) ([]types.WikiFolderNode, error) {
+	all, err := s.repo.ListAllFolders(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	scopedDirect, err := s.repo.CountPagesByFolder(ctx, kbID, pageTypes)
+	if err != nil {
+		return nil, err
+	}
+	allDirect := scopedDirect
+	if len(pageTypes) > 0 {
+		allDirect, err = s.repo.CountPagesByFolder(ctx, kbID, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	recScoped := recursiveFolderCounts(all, scopedDirect)
+	recAll := recursiveFolderCounts(all, allDirect)
+	showEmptyFolders := len(pageTypes) > 1
+	// A folder belongs in this view if it (recursively) contains a page of the
+	// requested types, or — only in the merged knowledge view — if it is a
+	// completely empty container with no pages of any type underneath.
+	relevant := func(id string) bool {
+		if recScoped[id] > 0 {
+			return true
+		}
+		if showEmptyFolders {
+			return recAll[id] == 0
+		}
+		return false
+	}
+
+	out := make([]types.WikiFolderNode, 0)
+	for _, f := range all {
+		if f.ParentID != parentID || !relevant(f.ID) {
+			continue
+		}
+		hasChildren := false
+		for _, g := range all {
+			if g.ParentID == f.ID && relevant(g.ID) {
+				hasChildren = true
+				break
+			}
+		}
+		out = append(out, types.WikiFolderNode{
+			WikiFolder:  *f,
+			PageCount:   recScoped[f.ID],
+			HasChildren: hasChildren,
+		})
+	}
+	return out, nil
+}
+
+// recursiveFolderCounts maps each folder id to the sum of `direct` page counts
+// over the folder and all of its descendants, using the materialized path so a
+// single pass over the (navigation-sized) folder set suffices.
+func recursiveFolderCounts(all []*types.WikiFolder, direct map[string]int64) map[string]int64 {
+	res := make(map[string]int64, len(all))
+	for _, f := range all {
+		sum := direct[f.ID]
+		prefix := f.Path + "/"
+		for _, g := range all {
+			if g.ID != f.ID && strings.HasPrefix(g.Path, prefix) {
+				sum += direct[g.ID]
+			}
+		}
+		res[f.ID] = sum
+	}
+	return res
+}
+
+// validateFolderName trims and rejects blank names or names carrying directory
+// separators (a folder name is a single tree level).
+func validateFolderName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errors.New("folder name is required")
+	}
+	if strings.ContainsAny(name, "/｜|／") {
+		return "", fmt.Errorf("folder name %q must not contain a path separator", name)
+	}
+	return name, nil
+}
+
+// CreateFolder creates a new empty folder under parentID.
+func (s *wikiPageService) CreateFolder(
+	ctx context.Context, kbID string, tenantID uint64, parentID string, name string,
+) (*types.WikiFolder, error) {
+	name, err := validateFolderName(name)
+	if err != nil {
+		return nil, err
+	}
+
+	parentPath := ""
+	depth := 1
+	if parentID != types.WikiFolderRootID {
+		parent, err := s.repo.GetFolderByID(ctx, kbID, parentID)
+		if err != nil {
+			return nil, err
+		}
+		parentPath = parent.Path
+		depth = parent.Depth + 1
+	}
+
+	if _, err := s.repo.GetChildFolderByName(ctx, kbID, parentID, name); err == nil {
+		return nil, repository.ErrWikiFolderConflict
+	} else if !errors.Is(err, repository.ErrWikiFolderNotFound) {
+		return nil, err
+	}
+
+	path := name
+	if parentPath != "" {
+		path = parentPath + "/" + name
+	}
+	now := time.Now()
+	folder := &types.WikiFolder{
+		ID:              uuid.New().String(),
+		TenantID:        tenantID,
+		KnowledgeBaseID: kbID,
+		ParentID:        parentID,
+		Name:            name,
+		Path:            path,
+		Depth:           depth,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := s.repo.CreateFolder(ctx, folder); err != nil {
+		return nil, fmt.Errorf("create wiki folder: %w", err)
+	}
+	return folder, nil
+}
+
+// FindOrCreateFolderPath resolves a category path to a leaf folder id, creating
+// any missing intermediate folders along the way. Concurrency-safe against the
+// unique (kb, parent, name) constraint via a re-fetch on create conflict.
+func (s *wikiPageService) FindOrCreateFolderPath(
+	ctx context.Context, kbID string, tenantID uint64, path []string,
+) (string, []string, error) {
+	clean := types.CleanWikiCategoryPath(path)
+	if len(clean) == 0 {
+		return types.WikiFolderRootID, nil, nil
+	}
+	parentID := types.WikiFolderRootID
+	parentPath := ""
+	for depth, name := range clean {
+		child, err := s.repo.GetChildFolderByName(ctx, kbID, parentID, name)
+		if err != nil {
+			if !errors.Is(err, repository.ErrWikiFolderNotFound) {
+				return "", nil, err
+			}
+			fp := name
+			if parentPath != "" {
+				fp = parentPath + "/" + name
+			}
+			now := time.Now()
+			child = &types.WikiFolder{
+				ID:              uuid.New().String(),
+				TenantID:        tenantID,
+				KnowledgeBaseID: kbID,
+				ParentID:        parentID,
+				Name:            name,
+				Path:            fp,
+				Depth:           depth + 1,
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			}
+			if cerr := s.repo.CreateFolder(ctx, child); cerr != nil {
+				// Lost a create race (or unique violation): the sibling must
+				// now exist — re-fetch it rather than failing the whole plan.
+				child, err = s.repo.GetChildFolderByName(ctx, kbID, parentID, name)
+				if err != nil {
+					return "", nil, fmt.Errorf("create wiki folder %q: %w", fp, cerr)
+				}
+			}
+		}
+		parentID = child.ID
+		parentPath = child.Path
+	}
+	return parentID, clean, nil
+}
+
+// MovePage relocates a page into folderID ("" = root) and refreshes its cached
+// category path. Bookkeeping-only write (no version bump).
+func (s *wikiPageService) MovePage(
+	ctx context.Context, kbID string, slug string, folderID string,
+) (*types.WikiPage, error) {
+	page, err := s.repo.GetBySlug(ctx, kbID, slug)
+	if err != nil {
+		return nil, err
+	}
+	page.FolderID = strings.TrimSpace(folderID)
+	if err := s.applyFolderToPage(ctx, page); err != nil {
+		return nil, err
+	}
+	page.UpdatedAt = time.Now()
+	normalizeWikiHierarchy(page)
+	if err := s.repo.UpdateMeta(ctx, page); err != nil {
+		return nil, fmt.Errorf("move wiki page: %w", err)
+	}
+	return page, nil
+}
+
+// RenameOrMoveFolder renames and/or reparents a folder, then recomputes the
+// materialized path/depth of the entire subtree and the cached category path of
+// every page underneath. Guards against cycles (moving a folder into itself or
+// one of its descendants) and sibling name collisions.
+func (s *wikiPageService) RenameOrMoveFolder(
+	ctx context.Context, kbID string, id string, newName string, newParentID string, moveParent bool,
+) (*types.WikiFolder, error) {
+	folder, err := s.repo.GetFolderByID(ctx, kbID, id)
+	if err != nil {
+		return nil, err
+	}
+
+	name := folder.Name
+	if strings.TrimSpace(newName) != "" {
+		if name, err = validateFolderName(newName); err != nil {
+			return nil, err
+		}
+	}
+
+	targetParent := folder.ParentID
+	if moveParent {
+		targetParent = newParentID
+	}
+
+	parentPath := ""
+	depthBase := 0
+	if targetParent != types.WikiFolderRootID {
+		if targetParent == folder.ID {
+			return nil, errors.New("cannot move a folder into itself")
+		}
+		parent, err := s.repo.GetFolderByID(ctx, kbID, targetParent)
+		if err != nil {
+			return nil, err
+		}
+		if parent.Path == folder.Path || strings.HasPrefix(parent.Path, folder.Path+"/") {
+			return nil, errors.New("cannot move a folder into its own descendant")
+		}
+		parentPath = parent.Path
+		depthBase = parent.Depth
+	}
+
+	if existing, err := s.repo.GetChildFolderByName(ctx, kbID, targetParent, name); err == nil {
+		if existing.ID != folder.ID {
+			return nil, repository.ErrWikiFolderConflict
+		}
+	} else if !errors.Is(err, repository.ErrWikiFolderNotFound) {
+		return nil, err
+	}
+
+	oldPath := folder.Path
+	newPath := name
+	if parentPath != "" {
+		newPath = parentPath + "/" + name
+	}
+	if newPath == oldPath && targetParent == folder.ParentID {
+		return folder, nil // no-op
+	}
+
+	all, err := s.repo.ListAllFolders(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	affected := make([]string, 0)
+	var updated *types.WikiFolder
+	for _, f := range all {
+		switch {
+		case f.ID == folder.ID:
+			f.ParentID = targetParent
+			f.Name = name
+			f.Path = newPath
+			f.Depth = depthBase + 1
+		case strings.HasPrefix(f.Path, oldPath+"/"):
+			f.Path = newPath + f.Path[len(oldPath):]
+			f.Depth = len(wikiFolderSegments(f.Path))
+		default:
+			continue
+		}
+		f.UpdatedAt = now
+		if err := s.repo.UpdateFolder(ctx, f); err != nil {
+			return nil, err
+		}
+		affected = append(affected, f.ID)
+		if f.ID == folder.ID {
+			updated = f
+		}
+	}
+
+	if err := s.recomputePagesForFolders(ctx, kbID, affected); err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		updated = folder
+	}
+	return updated, nil
+}
+
+// recomputePagesForFolders refreshes the cached category_path/wiki_path/depth of
+// every page filed under any of the given folder ids (used after a folder
+// subtree is moved/renamed). Bookkeeping-only writes (no version bump).
+func (s *wikiPageService) recomputePagesForFolders(ctx context.Context, kbID string, folderIDs []string) error {
+	if len(folderIDs) == 0 {
+		return nil
+	}
+	pages, err := s.repo.ListPagesByFolderIDs(ctx, kbID, folderIDs)
+	if err != nil {
+		return err
+	}
+	for _, page := range pages {
+		if err := s.applyFolderToPage(ctx, page); err != nil {
+			return err
+		}
+		page.UpdatedAt = time.Now()
+		normalizeWikiHierarchy(page)
+		if err := s.repo.UpdateMeta(ctx, page); err != nil {
+			logger.Warnf(ctx, "wiki: recompute folder path for page %s failed: %v", page.Slug, err)
+		}
+	}
+	return nil
+}
+
+// DeleteFolder removes a folder that has no pages and no child folders. The UI
+// must relocate contents first; this keeps deletion non-destructive.
+func (s *wikiPageService) DeleteFolder(ctx context.Context, kbID string, id string) error {
+	if _, err := s.repo.GetFolderByID(ctx, kbID, id); err != nil {
+		return err
+	}
+	children, err := s.repo.ListChildFolders(ctx, kbID, id)
+	if err != nil {
+		return err
+	}
+	if len(children) > 0 {
+		return repository.ErrWikiFolderNotEmpty
+	}
+	pages, err := s.repo.ListPagesByFolderIDs(ctx, kbID, []string{id})
+	if err != nil {
+		return err
+	}
+	if len(pages) > 0 {
+		return repository.ErrWikiFolderNotEmpty
+	}
+	return s.repo.DeleteFolder(ctx, kbID, id)
+}
+
+// PruneEmptyFolderChains removes folders that became empty after retracting a
+// document, followed by any ancestors made empty by those removals. It only
+// considers the supplied folder chains, so intentionally-empty folders
+// elsewhere in the wiki are preserved. Callers must wait for the KB's ingest
+// queue to drain before invoking this method: taxonomy planning creates a
+// folder before reduce writes the page that will reference it.
+func (s *wikiPageService) PruneEmptyFolderChains(
+	ctx context.Context, kbID string, folderIDs []string,
+) ([]string, error) {
+	if len(folderIDs) == 0 {
+		return nil, nil
+	}
+	all, err := s.repo.ListAllFolders(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]*types.WikiFolder, len(all))
+	for _, folder := range all {
+		if folder != nil {
+			byID[folder.ID] = folder
+		}
+	}
+
+	candidates := make(map[string]*types.WikiFolder)
+	for _, id := range folderIDs {
+		seen := make(map[string]struct{})
+		for id != types.WikiFolderRootID {
+			if _, cycle := seen[id]; cycle {
+				break
+			}
+			seen[id] = struct{}{}
+			folder := byID[id]
+			if folder == nil {
+				break
+			}
+			candidates[id] = folder
+			id = folder.ParentID
+		}
+	}
+
+	ordered := make([]*types.WikiFolder, 0, len(candidates))
+	for _, folder := range candidates {
+		ordered = append(ordered, folder)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Depth == ordered[j].Depth {
+			return ordered[i].Path > ordered[j].Path
+		}
+		return ordered[i].Depth > ordered[j].Depth
+	})
+
+	deleted := make([]string, 0, len(ordered))
+	for _, folder := range ordered {
+		children, err := s.repo.ListChildFolders(ctx, kbID, folder.ID)
+		if err != nil {
+			return deleted, err
+		}
+		if len(children) > 0 {
+			continue
+		}
+		pages, err := s.repo.ListPagesByFolderIDs(ctx, kbID, []string{folder.ID})
+		if err != nil {
+			return deleted, err
+		}
+		if len(pages) > 0 {
+			continue
+		}
+		if err := s.repo.DeleteFolder(ctx, kbID, folder.ID); err != nil {
+			if errors.Is(err, repository.ErrWikiFolderNotFound) ||
+				errors.Is(err, repository.ErrWikiFolderNotEmpty) {
+				continue
+			}
+			return deleted, err
+		}
+		deleted = append(deleted, folder.ID)
+	}
+	return deleted, nil
+}
+
+// InjectCrossLinks scans affected pages and injects [[wiki-links]] for mentions
+// of other wiki page titles in the content. Pure text replacement, no LLM call.
+// Shares the linkifyContent helper with the ingest pipeline so both paths honor
+// the same code-block / existing-link / word-boundary rules.
+func (s *wikiPageService) InjectCrossLinks(ctx context.Context, kbID string, affectedSlugs []string) {
+	allPages, err := s.ListAllPages(ctx, kbID)
+	if err != nil || len(allPages) < 2 {
+		return
+	}
+
+	refs := collectLinkRefs(allPages)
+	if len(refs) == 0 {
+		return
+	}
+
+	affectedSet := make(map[string]bool, len(affectedSlugs))
+	for _, slug := range affectedSlugs {
+		affectedSet[slug] = true
+	}
+
+	var updated int
+	for _, p := range allPages {
+		if !affectedSet[p.Slug] {
+			continue
+		}
+		if p.PageType == types.WikiPageTypeIndex {
+			continue
+		}
+
+		newContent, changed := linkifyContent(p.Content, refs, p.Slug)
+		if !changed {
+			continue
+		}
+		p.Content = newContent
+		if err := s.UpdateAutoLinkedContent(ctx, p); err != nil {
+			logger.Warnf(ctx, "wiki: cross-link injection failed for %s: %v", p.Slug, err)
+			continue
+		}
+		updated++
+	}
+
+	if updated > 0 {
+		logger.Infof(ctx, "wiki: injected cross-links in %d pages", updated)
+	}
+}
+
+// RebuildIndexPage was historically called by agent write/rename tools to
+// refresh the index page's directory listing after a page mutation.
+//
+// The directory is no longer persisted in wiki_pages.content — it is
+// assembled on demand by GetIndexView from the lightweight ListByTypeLight
+// projection, so individual page writes don't need to redo O(N) string
+// concatenation and rewrite a multi-MB TEXT column anymore. Keeping the
+// method name lets existing agent tool call sites (wiki_write_page,
+// wiki_rename_page) compile unchanged; the body is now intentionally a
+// no-op.
+//
+// The intro that still lives on the index row is managed separately by
+// the ingest pipeline (see wikiIngestService.rebuildIndexPage) on batch
+// completion, which is where we actually have the LLM + change description
+// context needed to rewrite it.
+func (s *wikiPageService) RebuildIndexPage(ctx context.Context, kbID string) error {
+	_ = ctx
+	_ = kbID
+	return nil
+}

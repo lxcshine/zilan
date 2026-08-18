@@ -1,0 +1,445 @@
+// Legacy Markdown styles for non-chat document/editor surfaces that render
+// `.md-content`. Chat answer Markdown must use `chat-markdown.less` only.
+:deep(.md-content) {
+    box-sizing: border-box !important;
+
+    img {
+        max-width: 444px;
+        cursor: pointer;
+    }
+
+    // Mermaid 图表样式
+    .mermaid {
+        margin: 16px 0;
+        padding: 16px;
+        background: var(--td-bg-color-secondarycontainer);
+        border-radius: 8px;
+        overflow-x: auto;
+        text-align: center;
+
+        svg {
+            max-width: 100%;
+            height: auto;
+        }
+    }
+
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+        margin-top: 5px;
+        font-weight: bold;
+        color: var(--td-text-color-primary);
+        font-family: var(--app-font-family);
+        transition: all 0.2s ease-out;
+        font-size: 20px;
+    }
+
+    .hljs-title,
+    .hljs-title.class_,
+    .hljs-title.class_.inherited__,
+    .hljs-title.function_ {
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+
+    .proto {
+        word-break: break-all;
+        white-space: pre-wrap;
+    }
+
+    h1 tt,
+    h1 code {
+        font-size: inherit !important;
+    }
+
+    h2 tt,
+    h2 code {
+        font-size: inherit !important;
+    }
+
+    h3 tt,
+    h3 code {
+        font-size: inherit !important;
+    }
+
+    h4 tt,
+    h4 code {
+        font-size: inherit !important;
+    }
+
+    h5 tt,
+    h5 code {
+        font-size: inherit !important;
+    }
+
+    h6 tt,
+    h6 code {
+        font-size: inherit !important;
+    }
+
+    h2 a,
+    h3 a {
+        color: var(--td-text-color-primary);
+    }
+
+    p,
+    blockquote,
+    ul,
+    ol,
+    dl,
+    table {
+        font-size: 14px;
+        margin: 10px 0;
+        font-family: var(--app-font-family);
+    }
+
+    h2 {
+        font-size: 18px;
+    }
+
+    h3 {
+        font-size: 16px;
+        font-weight: 500;
+    }
+
+    summary {
+        font-size: 14px;
+        cursor: pointer;
+    }
+
+    li>ol,
+    li>ul {
+        margin: 0 0;
+    }
+
+    hr {
+        padding: 0;
+        margin: 24px 0;
+        height: 1px;
+        border: none;
+        background: var(--td-component-stroke);
+        overflow: hidden;
+        box-sizing: content-box;
+    }
+
+    body>h2:first-child {
+        margin-top: 0;
+        padding-top: 0;
+    }
+
+    body>h1:first-child {
+        margin-top: 0;
+        padding-top: 0;
+    }
+
+    body>h1:first-child+h2 {
+        margin-top: 0;
+        padding-top: 0;
+    }
+
+    body>h3:first-child,
+    body>h4:first-child,
+    body>h5:first-child,
+    body>h6:first-child {
+        margin-top: 0;
+        padding-top: 0;
+    }
+
+    a:first-child h1,
+    a:first-child h2,
+    a:first-child h3,
+    a:first-child h4,
+    a:first-child h5,
+    a:first-child h6 {
+        margin-top: 0;
+        padding-top: 0;
+    }
+
+    p {
+        margin: 0;
+    }
+
+    code {
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+
+    h1 p,
+    h2 p,
+    h3 p,
+    h4 p,
+    h5 p,
+    h6 p {
+        margin-top: 0;
+    }
+
+    li p.first {
+        display: inline-block;
+    }
+
+    ul,
+    ol {
+        padding-left: 30px;
+    }
+
+    ul:first-child,
+    ol:first-child {
+        margin-top: 0;
+    }
+
+    ul:last-child,
+    ol:last-child {
+        margin-bottom: 0;
+    }
+
+    blockquote {
+        padding: 0.8em 1.4rem;
+        margin: 1em 0;
+        font-weight: 400;
+        border-left: 4px solid var(--td-brand-color);
+        background-color: var(--td-brand-color)21;
+        border-radius: 0px 8px 8px 0px;
+        box-shadow: rgb(149 149 149 / 13%) 0px 5px 10px;
+    }
+
+    table {
+        padding: 0;
+        word-break: initial;
+        /* border-radius: 4px; */
+        border-collapse: collapse;
+        border-spacing: 0;
+        width: 100%;
+    }
+
+    table tr {
+        border-top: 1px solid var(--td-brand-color-focus);
+        margin: 0;
+        padding: 0;
+    }
+
+    table tr:nth-child(2n),
+    thead {
+        background-color: var(--td-bg-color-secondarycontainer);
+    }
+
+    table tr th {
+        font-weight: bold;
+        border: 1px solid var(--td-component-stroke);
+        border-bottom: 0;
+        text-align: left;
+        margin: 0;
+        padding: 6px 13px;
+    }
+
+    table tr td {
+        border: 1px solid var(--td-component-stroke);
+        text-align: left;
+        margin: 0;
+        padding: 6px 13px;
+    }
+
+    table tr th:first-child,
+    table tr td:first-child {
+        margin-top: 0;
+    }
+
+    table tr th:last-child,
+    table tr td:last-child {
+        margin-bottom: 0;
+    }
+
+
+    tt {
+        margin: 0 2px;
+    }
+
+    figure {
+        border-radius: 8px;
+        margin-left: 0;
+        margin-right: 0;
+        background: var(--td-bg-color-container);
+    }
+
+
+
+    .md-task-list-item>input {
+        margin-left: -1.3em;
+    }
+
+    @media print {
+        html {
+            font-size: 13px;
+        }
+
+        table,
+        pre {
+            page-break-inside: avoid;
+        }
+
+        pre {
+            word-wrap: break-word;
+        }
+    }
+
+    .md-fences {
+        background-color: var(--td-bg-color-secondarycontainer);
+    }
+
+    .md-diagram-panel {
+        position: static !important;
+    }
+
+
+    .mathjax-block>.code-tooltip {
+        bottom: 0.375rem;
+    }
+
+    h3.md-focus:before,
+    h4.md-focus:before,
+    h5.md-focus:before,
+    h6.md-focus:before {
+        border: 0px;
+        position: unset;
+        padding: 0px;
+        font-size: unset;
+        line-height: unset;
+        float: unset;
+    }
+
+    .md-image>.md-meta {
+        border-radius: 3px;
+        font-family: var(--app-font-family-mono);
+        padding: 2px 0 0 4px;
+        font-size: 0.9em;
+        color: inherit;
+    }
+
+    .md-tag {
+        color: inherit;
+    }
+
+    .md-toc {
+        margin-top: 20px;
+        padding-bottom: 20px;
+    }
+
+    .sidebar-tabs {
+        border-bottom: none;
+    }
+
+
+    /** focus mode */
+
+    .on-focus-mode blockquote {
+        border-left-color: rgba(85, 85, 85, 0.12);
+    }
+
+    header,
+    .context-menu,
+    .megamenu-content,
+    footer {
+        font-family: var(--app-font-family);
+    }
+
+    .file-node-content:hover .file-node-icon,
+    .file-node-content:hover .file-node-open-state {
+        visibility: visible;
+    }
+
+    .mac-seamless-mode #typora-sidebar {
+        background-color: var(--side-bar-bg-color);
+    }
+
+    .md-lang {
+        color: var(--td-warning-color);
+    }
+
+    .html-for-mac .context-menu {
+        --item-hover-bg-color: var(--td-brand-color-light);
+    }
+
+    .pin-outline #outline-content .outline-active strong,
+    .pin-outline .outline-active {
+        color: var(--td-brand-color);
+    }
+
+    .code-tooltip {
+        border-radius: 4px;
+        border: 1px solid var(--td-component-stroke);
+        background-color: var(--td-bg-color-secondarycontainer);
+    }
+
+    .cm-s-inner .cm-comment,
+    .cm-s-inner.cm-comment {
+        color: var(--td-success-color);
+        font-style: italic;
+        /* font-family: 'PingFang'; */
+    }
+
+    h1.md-end-block.md-heading:after,
+    h2.md-end-block.md-heading:after,
+    h3.md-end-block.md-heading:after,
+    h4.md-end-block.md-heading:after,
+    h5.md-end-block.md-heading:after,
+    h6.md-end-block.md-heading:after {
+        color: var(--td-text-color-disabled) !important;
+        border: 1px solid;
+        border-radius: 4px;
+        position: absolute;
+        left: -2.5rem;
+        float: left;
+        font-size: 14px;
+        padding-left: 4px;
+        padding-right: 5px;
+        vertical-align: bottom;
+        font-weight: 400;
+        line-height: normal;
+        opacity: 0;
+    }
+
+    h1.md-end-block.md-heading:hover:after,
+    h2.md-end-block.md-heading:hover:after,
+    h3.md-end-block.md-heading:hover:after,
+    h4.md-end-block.md-heading:hover:after,
+    h5.md-end-block.md-heading:hover:after,
+    h6.md-end-block.md-heading:hover:after {
+        opacity: 1;
+    }
+
+    h1.md-end-block.md-heading:hover:after {
+        content: "h1";
+        top: 1.1rem;
+    }
+
+    h2.md-end-block.md-heading:hover:after {
+        content: "h2";
+        top: 0.63rem;
+    }
+
+    h3.md-end-block.md-heading:hover:after {
+        content: "h3";
+        top: 0.55rem;
+    }
+
+    h4.md-end-block.md-heading:hover:after {
+        content: "h4";
+        top: 0.3rem;
+    }
+
+    h5.md-end-block.md-heading:hover:after {
+        content: "h5";
+        top: 0.18rem;
+    }
+
+    h6.md-end-block.md-heading:hover:after {
+        content: "h6";
+        top: 0.16rem;
+    }
+
+    .outline-label {
+        font-family: var(--app-font-family);
+    }
+}
