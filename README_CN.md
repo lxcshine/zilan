@@ -134,6 +134,19 @@ conversation:
   </tr>
 </table>
 
+### 🖥️ 真实产品页面截图
+
+<table>
+  <tr>
+    <td width="50%" align="center"><b>💬 新对话</b><br/><img src="./images/1.jpg" alt="新对话" width="100%"></td>
+    <td width="50%" align="center"><b>📚 知识库</b><br/><img src="./images/2.jpg" alt="知识库" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><b>🤖 智能体</b><br/><img src="./images/3.jpg" alt="智能体" width="100%"></td>
+    <td width="50%" align="center"><b>👥 共享空间</b><br/><img src="./images/4.jpg" alt="共享空间" width="100%"></td>
+  </tr>
+</table>
+
 ## 🏗️ 架构设计
 
 ![zilan-architecture](./docs/images/architecture.png)
