@@ -21,7 +21,7 @@ func prepareMessagesWithModelContext(
 	if chatManage == nil {
 		return nil, registry
 	}
-	messages := prepareMessagesWithHistory(chatManage)
+	messages := prepareMessagesWithHistory(ctx, chatManage)
 	if len(messages) > 0 {
 		messages[0].Content = strings.TrimRight(messages[0].Content, " \t\r\n") + registry.ProtocolPrompt()
 	}

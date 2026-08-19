@@ -104,6 +104,11 @@ type ConversationConfig struct {
 	EnableQueryExpansion bool           `yaml:"enable_query_expansion"           json:"enable_query_expansion"`
 	EnableRerank         bool           `yaml:"enable_rerank"                    json:"enable_rerank"`
 	Summary              *SummaryConfig `yaml:"summary"                          json:"summary"`
+	// ContextManager holds deployment-wide defaults for the five-layer
+	// context architecture (L0-L4 budgeting, smart history compression,
+	// retrieval tiering). A tenant's own ContextConfig (DB jsonb) takes
+	// precedence field-by-field; this section is the global fallback.
+	ContextManager *ContextManagerConfig `yaml:"context_manager"                json:"context_manager"`
 
 	// Prompt template ID fields — resolved to text by backfillConversationDefaults
 	FallbackPromptID             string `yaml:"fallback_prompt_id"                json:"fallback_prompt_id"`
@@ -133,6 +138,25 @@ type ConversationConfig struct {
 	// IntentSystemPrompts maps intent values (e.g. "greeting", "chitchat") to
 	// system prompt text. Populated by backfill from IntentPrompts templates.
 	IntentSystemPrompts map[string]string `yaml:"-" json:"-"`
+}
+
+// ContextManagerConfig holds global defaults for the five-layer context
+// architecture. Fields mirror types.ContextConfig; kept as a separate struct
+// so config stays YAML-only and types stays persistence-only.
+type ContextManagerConfig struct {
+	// MaxTokens is the explicit context window budget. 0 means auto-resolve
+	// from the chat model's vendor metadata.
+	MaxTokens int `yaml:"max_tokens"          json:"max_tokens"`
+	// CompressionStrategy: "sliding_window" (default) or "smart" (five-layer
+	// budgeting + Map-Reduce history compression + retrieval tiering).
+	CompressionStrategy string `yaml:"compression_strategy" json:"compression_strategy"`
+	// RecentMessageCount is the number of recent rounds kept verbatim under
+	// the smart strategy (default: max_rounds).
+	RecentMessageCount int `yaml:"recent_message_count" json:"recent_message_count"`
+	// SummarizeThreshold is the deep fetch window for smart compression —
+	// rounds beyond RecentMessageCount up to this limit are Map-Reduce
+	// summarized (default: 3x the recent window).
+	SummarizeThreshold int `yaml:"summarize_threshold"  json:"summarize_threshold"`
 }
 
 // SummaryConfig 摘要配置

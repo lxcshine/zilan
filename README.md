@@ -89,6 +89,28 @@ Toward a more personal, context-aware knowledge assistant, Zilan is building a t
 
 Supporting mechanics: memory is **extracted asynchronously** after each session via the Asynq task queue (fact triples / to-dos / emotional feedback); injection scores each memory as `score = semantic similarity × time decay × (1 + log(access count))` and loads the Top-K into the system prompt; high-value conversations (favorited or heavily followed-up) auto-distill into Wiki pages linked back to the source session; and users can **view, edit, and delete** everything the AI remembers — GDPR / privacy compliant.
 
+### 🧠 Context Management · IMA-Grade Five-Layer Intelligent Architecture
+
+Zilan completely rethinks how conversation context is organized, moving beyond a naive sliding window to a **precise token budget + five-layer context architecture**, so every answer spends its budget where it matters:
+
+- **Precise multi-vendor token counting** — built-in `tiktoken` (OpenAI), `qwen` (Tongyi Qianwen), and `glm` (Zhipu GLM) tokenizers with calibration factors; no more character-count guesswork
+- **Five-layer token budget (L0-L4)** — System (fixed) → Memory (fixed 10%) → Retrieval (elastic 30-50%) → History (elastic 20-40%) → Query (fixed), each layer with its own overflow strategy
+- **Intent-based dynamic allocation** — budget shifts by query intent: code/technical questions favor the retrieval layer, casual/creative ones favor history, and summarize/analyze balances both
+- **Smart history compression** — restored & enhanced `Summary`: Map-Reduce incremental summarization, sticky turns (decisions/numbers/deadlines/favorites) permanently preserved, and auto alias compression for long entity names (e.g. "Tencent Cloud Vector DB" → "TCVDB")
+- **Retrieval context optimization** — relevance-tiered rendering (high-relevance full text / mid first half / low title+summary), embedding-cosine semantic dedup, and full section-path citation tracing
+- **Agent context governance** — oversized tool results are Inner-Summarized before injection, ReAct scratchpad checkpoint compression on a cadence, and structured JSON tool-output normalization — saving tokens and sharpening reasoning on long contexts
+
+Enabled globally via `config/config.yaml`, and customizable per tenant:
+
+```yaml
+conversation:
+  context_manager:
+    max_tokens: 0                  # 0 = resolve the model's window automatically
+    compression_strategy: "smart"  # "sliding_window" (default) or "smart" (five-layer)
+    recent_message_count: 0        # 0 = use the system default recent rounds
+    summarize_threshold: 0         # 0 = 3x the recent window (deep fetch for summarization)
+```
+
 ### 🔐 Independent Brand · Independent Protocol
 
 Product name, UI marks, browser titles, storage keys, JWT audience, webhook signature header, and embed SDK are unified under the Zilan namespace — a fully self-owned product identity.
@@ -209,6 +231,38 @@ Add `--profile` flags to enable additional components. Multiple profiles can be 
 Combine profiles: `docker compose --profile neo4j --profile minio up -d`
 
 Stop services: `docker compose down`
+
+### 🛠 Local Binary Build & Launch (without Docker)
+
+If you prefer to compile and run the backend binary directly on your Linux host, follow these steps.
+
+**1. Install dependencies** (SQLite C headers are required — otherwise CGO compilation fails with a missing `sqlite3.h`):
+
+```bash
+sudo apt-get update && sudo apt-get install -y libsqlite3-dev build-essential
+```
+
+**2. Compile the backend binary `Zilan`**:
+
+```bash
+CGO_ENABLED=1 go build -o Zilan ./cmd/server
+```
+
+> To rename the binary, adjust `BINARY_NAME` in the `Makefile`, or just use `make build` which compiles under that name.
+
+**3. Export environment variables and launch**:
+
+```bash
+set -a && source .env && set +a && ./Zilan
+```
+
+**4. Start development infrastructure** (PostgreSQL / Redis / Neo4j and other dependencies for development/debugging):
+
+```bash
+docker compose -f docker-compose.dev.yml --profile neo4j up -d
+```
+
+> On the first dev start, if you hit a `WeKnora-*` container-name conflict, clear the leftover container with `docker rm -f WeKnora-neo4j-dev`.
 
 ### 🌐 Service URLs
 

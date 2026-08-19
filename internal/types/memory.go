@@ -122,11 +122,11 @@ type MemoryFact struct {
 	TripleHash string `json:"-" gorm:"type:varchar(64)"`
 	// Content is the canonical human-readable rendering ("用户负责 Project X"),
 	// used as the embedding input and for prompt injection / display.
-	Content    string     `json:"content"`
-	Confidence float64    `json:"confidence"`
-	Importance float64    `json:"importance"`
-	Status     string     `json:"status" gorm:"type:varchar(16)"`
-	AccessCount int       `json:"access_count"`
+	Content        string     `json:"content"`
+	Confidence     float64    `json:"confidence"`
+	Importance     float64    `json:"importance"`
+	Status         string     `json:"status" gorm:"type:varchar(16)"`
+	AccessCount    int        `json:"access_count"`
 	LastAccessedAt *time.Time `json:"last_accessed_at,omitempty"`
 	// DueAt is the deadline for todo-category facts; nil otherwise.
 	DueAt     *time.Time `json:"due_at,omitempty"`
@@ -162,16 +162,16 @@ func ComputeTripleHash(category, subject, predicate, object string) string {
 // rolling LLM summary plus key topics, recalled with semantic similarity and
 // time decay.
 type MemorySessionSummary struct {
-	ID           string      `json:"id"         gorm:"type:varchar(36);primaryKey"`
-	TenantID     uint64      `json:"tenant_id"  gorm:"index"`
-	UserID       string      `json:"user_id"    gorm:"type:varchar(512)"`
-	SessionID    string      `json:"session_id" gorm:"type:varchar(36);index"`
-	Title        string      `json:"title"`
-	Summary      string      `json:"summary"`
-	KeyTopics    StringArray `json:"key_topics,omitempty" gorm:"type:jsonb"`
-	MessageCount int         `json:"message_count"`
-	Embedding    VectorBlob  `json:"-"           gorm:"type:jsonb"`
-	LastMessageAt *time.Time `json:"last_message_at,omitempty"`
+	ID            string      `json:"id"         gorm:"type:varchar(36);primaryKey"`
+	TenantID      uint64      `json:"tenant_id"  gorm:"index"`
+	UserID        string      `json:"user_id"    gorm:"type:varchar(512)"`
+	SessionID     string      `json:"session_id" gorm:"type:varchar(36);index"`
+	Title         string      `json:"title"`
+	Summary       string      `json:"summary"`
+	KeyTopics     StringArray `json:"key_topics,omitempty" gorm:"type:jsonb"`
+	MessageCount  int         `json:"message_count"`
+	Embedding     VectorBlob  `json:"-"           gorm:"type:jsonb"`
+	LastMessageAt *time.Time  `json:"last_message_at,omitempty"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
@@ -200,13 +200,13 @@ type MemoryFactQuery struct {
 
 // MemoryRecallParams controls L2+L3 recall for prompt injection.
 type MemoryRecallParams struct {
-	Query          string
-	QueryEmbedding []float32 // pre-computed by the caller (embedder may be async)
-	Limit          int       // 0 -> DefaultMemoryRecallLimit
-	Categories     []string  // empty = all
-	FactHalfLife   time.Duration
+	Query           string
+	QueryEmbedding  []float32 // pre-computed by the caller (embedder may be async)
+	Limit           int       // 0 -> DefaultMemoryRecallLimit
+	Categories      []string  // empty = all
+	FactHalfLife    time.Duration
 	SummaryHalfLife time.Duration
-	Now            time.Time // injectable for tests; zero -> time.Now()
+	Now             time.Time // injectable for tests; zero -> time.Now()
 }
 
 // RecalledMemory is one scored memory ready for prompt injection.

@@ -23,10 +23,10 @@ import (
 // The plugin never fails the pipeline: on any uncertainty it falls back to the
 // factual default profile, preserving legacy behavior.
 type PluginRouteRetrieval struct {
-	cfgProvider     retrievalConfigProvider
-	kbService       interfaces.KnowledgeBaseService
+	cfgProvider      retrievalConfigProvider
+	kbService        interfaces.KnowledgeBaseService
 	knowledgeService interfaces.KnowledgeService
-	chunkRepo       interfaces.ChunkRepository
+	chunkRepo        interfaces.ChunkRepository
 }
 
 // retrievalConfigProvider abstracts access to the tenant's RetrievalConfig so
@@ -47,9 +47,9 @@ func NewPluginRouteRetrieval(eventManager *EventManager,
 			}
 			return tenant.RetrievalConfig
 		},
-		kbService:       kbService,
+		kbService:        kbService,
 		knowledgeService: knowledgeService,
-		chunkRepo:       chunkRepo,
+		chunkRepo:        chunkRepo,
 	}
 	eventManager.Register(res)
 	return res

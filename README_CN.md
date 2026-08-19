@@ -89,6 +89,28 @@
 
 配套机制：会话结束后经 Asynq 任务队列**异步抽取**记忆（事实三元组 / 待办任务 / 情感反馈）；记忆注入采用评分公式 `score = 语义相似度 × 时间衰减 × (1 + log(访问次数))` 取 Top-K 注入系统提示；高价值对话（用户收藏或多轮追问）自动沉淀为 Wiki 知识页并与源会话互链；用户可在设置中**查看、编辑、删除** AI 记住的全部内容，满足 GDPR / 个人信息保护合规。
 
+### 🧠 上下文管理优化 · 对标 IMA 级五层智能架构
+
+知澜对对话上下文的组织方式进行彻底重构，告别简单的滑动窗口，引入**精确 Token 预算 + 五层上下文架构**，让每一次回答都"把预算花在刀刃上"：
+
+- **多厂商精确 Token 计数** — 内置 `tiktoken`（OpenAI）、`qwen`（通义千问）、`glm`（智谱 GLM）分词器与校准因子，拒绝字符数估算，按厂商特性精确计量
+- **五层上下文预算（L0-L4）** — 系统层（固定）→ 记忆层（固定 10%）→ 检索层（弹性 30-50%）→ 历史层（弹性 20-40%）→ 查询层（固定），各层超限按不同溢出策略处理
+- **意图动态分配** — 根据 query 意图实时调剂预算：代码/技术问题侧重检索层，闲聊/创意侧重历史层，摘要/分析则均衡分配
+- **智能历史压缩** — 恢复增强 `Summary` 能力：Map-Reduce 增量摘要、Sticky 关键对话（决策/数字/Deadline/点赞）永久保留、长实体名自动别名压缩（如"腾讯云向量数据库"→"TVDB"）
+- **检索上下文优化** — 相关性分层渲染（高相关全文 / 中相关前一半 / 低相关仅标题摘要）、基于 Embedding 余弦相似度的语义去重、完整章节路径引用溯源
+- **Agent 上下文治理** — 超限工具结果先做 Inner Summary 再注入、ReAct Scratchpad 周期检查点压缩、结构化 JSON 工具输出规整，Long-context 场景更省 token、更准推理
+
+可在 `config/config.yaml` 中全局开启，也支持按租户定制：
+
+```yaml
+conversation:
+  context_manager:
+    max_tokens: 0                  # 0 = 根据当前模型自动解析上下文上限
+    compression_strategy: "smart"  # "sliding_window"(默认) 或 "smart"(五层智能架构)
+    recent_message_count: 0        # 0 = 使用系统默认轮数
+    summarize_threshold: 0         # 0 = 3 倍 recent 窗口（智能摘要深取窗口）
+```
+
 ### 🔐 自主品牌 · 协议独立
 
 产品名、界面标识、浏览器标题、存储键、JWT audience、Webhook 签名头、嵌入 SDK 全栈统一为知澜 / Zilan 命名空间，构成完全自主的产品身份。
@@ -209,6 +231,38 @@ docker compose up -d   # 启动核心服务
 组合示例：`docker compose --profile neo4j --profile minio up -d`
 
 停止服务：`docker compose down`
+
+### 🛠 本地二进制构建启动（不使用 Docker）
+
+如果你希望直接在本机（Linux 等）编译并运行后端二进制，请按以下步骤操作。
+
+**1. 安装依赖**（编译需 SQLite C 头文件，否则 CGO 编译会报 `sqlite3.h` 找不到）：
+
+```bash
+sudo apt-get update && sudo apt-get install -y libsqlite3-dev build-essential
+```
+
+**2. 编译后端二进制 `Zilan`**：
+
+```bash
+CGO_ENABLED=1 go build -o Zilan ./cmd/server
+```
+
+> 如需修改二进制产物名称，可调整 `Makefile` 中的 `BINARY_NAME`，或直接使用 `make build` 按该名称编译。
+
+**3. 导出环境变量并启动**：
+
+```bash
+set -a && source .env && set +a && ./Zilan
+```
+
+**4. 启动开发基础设施**（PostgreSQL / Redis / Neo4j 等依赖服务，开发或本地调试时用）：
+
+```bash
+docker compose -f docker-compose.dev.yml --profile neo4j up -d
+```
+
+> 首次启动 dev 环境后若遇到 `WeKnora-*` 容器名冲突，可先 `docker rm -f WeKnora-neo4j-dev` 清理遗留容器。
 
 ### 🌐 服务地址
 

@@ -16,10 +16,10 @@ import (
 // MaxSim over dot products. Here we provide a deterministic, CPU-only
 // approximation that preserves the core intuition:
 //
-//   1. Tokenize query and passage into normalized term sets.
-//   2. For every query term, find its best match inside the passage terms
-//      (exact match > prefix match > substring match > no match).
-//   3. Sum the per-term best scores and normalize by query length.
+//  1. Tokenize query and passage into normalized term sets.
+//  2. For every query term, find its best match inside the passage terms
+//     (exact match > prefix match > substring match > no match).
+//  3. Sum the per-term best scores and normalize by query length.
 //
 // This produces a fine-grained relevance signal in [0, 1] that is especially
 // useful for long chunks where the embedding vector may dilute local matches.

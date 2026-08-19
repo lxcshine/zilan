@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/common"
+	"github.com/Tencent/WeKnora/internal/contextx"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/searchutil"
@@ -73,6 +74,11 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		logger.Errorf(ctx, "Failed to get chat model: %v", err)
 		return nil, nil, err
 	}
+	// Stash the resolved model name so downstream context budgeting can pick
+	// the correct vendor tokenizer and default context window.
+	if chatModel != nil {
+		chatManage.ChatModelName = chatModel.GetModelName()
+	}
 
 	opt := &chat.ChatOptions{
 		Temperature:         chatManage.SummaryConfig.Temperature,
@@ -96,7 +102,15 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 // prepareMessagesWithHistory prepare complete messages including history.
 // When SystemPromptOverride is set (e.g. by intent-specific prompt logic),
 // it takes precedence over the default SummaryConfig.Prompt.
-func prepareMessagesWithHistory(chatManage *types.ChatManage) []chat.Message {
+//
+// When the tenant opts into the smart compression strategy, message assembly
+// goes through the five-layer context-budget architecture (see
+// prepareMessagesFiveLayer) instead of naive concatenation.
+func prepareMessagesWithHistory(ctx context.Context, chatManage *types.ChatManage) []chat.Message {
+	if smartCompressionEnabled(ctx, chatManage) {
+		return prepareMessagesFiveLayer(ctx, chatManage)
+	}
+
 	base := chatManage.SummaryConfig.Prompt
 	if chatManage.SystemPromptOverride != "" {
 		base = chatManage.SystemPromptOverride
@@ -123,6 +137,119 @@ func prepareMessagesWithHistory(chatManage *types.ChatManage) []chat.Message {
 	}
 	chatMessages = append(chatMessages, userMsg)
 
+	return chatMessages
+}
+
+// prepareMessagesFiveLayer assembles the prompt under the five-layer
+// context-budget architecture (ima-grade):
+//
+//	L0 system    — base prompt; retrieval placeholder rendered empty (L2 owns
+//	               retrieval content, single-injected into the user turn)
+//	L1 memory    — long-term memory block, relevance-truncated to its share
+//	L2 retrieval — tiered contexts; shrunk by relevance tiering when over budget
+//	L3 history   — sticky + recent rounds + running summary of older rounds
+//	L4 query     — current user content (retrieval block excluded, re-attached
+//	               after budgeting so the registry replacement still matches)
+//
+// The resolved per-layer spend is recorded in chatManage.ContextDiagnostics.
+func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage) []chat.Message {
+	counter := contextx.CounterForModel(chatManage.ChatModelName, "", "")
+	vendor := contextx.VendorFromStrings(chatManage.ChatModelName, "", "")
+
+	explicitWindow := 0
+	if cc := contextConfigFromContext(ctx, chatManage); cc != nil {
+		explicitWindow = cc.MaxTokens
+	}
+	window := contextx.ResolveContextWindow(explicitWindow, nil, vendor, chatManage.ChatModelName)
+
+	// L0 system — retrieval placeholder intentionally empty in smart mode.
+	base := chatManage.SummaryConfig.Prompt
+	if chatManage.SystemPromptOverride != "" {
+		base = chatManage.SystemPromptOverride
+	}
+	systemPrompt := types.RenderPromptPlaceholders(base, types.PlaceholderValues{
+		"query":    chatManage.Query,
+		"language": chatManage.Language,
+		"contexts": "",
+	})
+	systemPrompt = appendRetrievedImageOutputRequirement(systemPrompt, chatManage.RenderedContexts)
+
+	// L2/L4 split: the retrieval block was injected into UserContent by
+	// INTO_CHAT_MESSAGE; separate it so each layer is budgeted independently.
+	retrieval := chatManage.RenderedContexts
+	query := chatManage.UserContent
+	if retrieval != "" {
+		query = strings.TrimSpace(strings.Replace(query, retrieval, "", 1))
+	}
+
+	// L3 history turns.
+	turns := make([]contextx.Turn, 0, len(chatManage.History))
+	for i, h := range chatManage.History {
+		if h == nil {
+			continue
+		}
+		turns = append(turns, contextx.Turn{User: h.Query, Assistant: h.Answer, Ref: i})
+	}
+
+	asm := contextx.NewAssembler(counter)
+	result := asm.Assemble(contextx.Input{
+		System:         systemPrompt,
+		Memory:         chatManage.MemoryContext,
+		Retrieval:      retrieval,
+		History:        turns,
+		HistorySummary: chatManage.HistorySummary,
+		Query:          query,
+		Intent:         intentClassFor(chatManage.Intent),
+		Window:         window,
+		ReserveOutput:  reserveOutputFor(chatManage),
+		ShrinkRetrieval: func(budgetTokens int) string {
+			shrinker := &contextx.ShrinkRetrievalFromResults{
+				Results:    searchResultsToTierResults(ctx, chatManage.MergeResult),
+				Thresholds: contextx.DefaultTierThresholds(),
+				Format:     contextx.CitationFormat{IncludeHeadingPath: true},
+			}
+			return shrinker.Shrink(ctx, budgetTokens, counter)
+		},
+	})
+
+	// Keep RenderedContexts in sync with the budgeted retrieval block so the
+	// downstream modelcontext registry replacement matches exactly.
+	chatManage.RenderedContexts = result.Retrieval
+	chatManage.ContextDiagnostics = diagToTypes(result.Diag)
+
+	// Render the final message list: system = L0 + L1, user = L2 + L4.
+	systemFinal := appendMemoryContext(result.System, result.Memory)
+	userFinal := result.Query
+	if result.Retrieval != "" {
+		if userFinal != "" {
+			userFinal = result.Retrieval + "\n\n" + userFinal
+		} else {
+			userFinal = result.Retrieval
+		}
+	}
+
+	chatMessages := []chat.Message{{Role: "system", Content: systemFinal}}
+	for _, t := range result.History {
+		if strings.TrimSpace(t.User) != "" {
+			chatMessages = append(chatMessages, chat.Message{Role: "user", Content: t.User})
+		}
+		if strings.TrimSpace(t.Assistant) != "" {
+			chatMessages = append(chatMessages, chat.Message{Role: "assistant", Content: t.Assistant})
+		}
+	}
+	userMsg := chat.Message{Role: "user", Content: userFinal}
+	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
+		userMsg.Images = chatManage.Images
+	}
+	chatMessages = append(chatMessages, userMsg)
+
+	pipelineInfo(ctx, "ContextBudget", "assembled", map[string]interface{}{
+		"session_id": chatManage.SessionID,
+		"window":     result.Diag.Window,
+		"usable":     result.Diag.Usable,
+		"intent":     string(result.Diag.Intent),
+		"actions":    len(result.Diag.Actions),
+	})
 	return chatMessages
 }
 

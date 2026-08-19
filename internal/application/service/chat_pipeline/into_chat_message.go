@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/contextx"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -146,14 +147,14 @@ func (p *PluginIntoChatMessage) OnEvent(ctx context.Context,
 		if len(docResults) > 0 {
 			contextsBuilder.WriteString("<source type=\"document\" priority=\"supplementary\">\n")
 			for i, result := range docResults {
-				passage := getEnrichedPassageForChat(ctx, result)
+				passage := p.passageForResult(ctx, chatManage, result)
 				contextsBuilder.WriteString(fmt.Sprintf("<context id=\"DOC-%d\">%s</context>\n", i+1, passage))
 			}
 			contextsBuilder.WriteString("</source>")
 		}
 	} else {
 		for i, result := range chatManage.MergeResult {
-			passage := getEnrichedPassageForChat(ctx, result)
+			passage := p.passageForResult(ctx, chatManage, result)
 			if i > 0 {
 				contextsBuilder.WriteString("\n")
 			}
@@ -169,6 +170,14 @@ func (p *PluginIntoChatMessage) OnEvent(ctx context.Context,
 		"contexts": chatManage.RenderedContexts,
 		"language": chatManage.Language,
 	})
+
+	// Smart mode: the system prompt no longer carries retrieval content (L2
+	// lives with the user turn), so guarantee the contexts are present exactly
+	// once in the user message regardless of the tenant's template.
+	if smartCompressionEnabled(ctx, chatManage) && chatManage.RenderedContexts != "" &&
+		!strings.Contains(userContent, chatManage.RenderedContexts) {
+		userContent = chatManage.RenderedContexts + "\n\n" + userContent
+	}
 
 	// Append image description as text fallback only when the chat model cannot
 	// process images directly. Vision-capable models see images via MultiContent.
@@ -300,6 +309,35 @@ func getEnrichedPassageForChat(ctx context.Context, result *types.SearchResult) 
 
 	// 处理图片信息并与内容合并
 	return enrichContentWithImageInfo(ctx, result.Content, result.ImageInfo)
+}
+
+// passageForResult renders one chunk for the prompt. In smart mode the
+// relevance tier decides how much of the passage survives:
+//
+//	high (rerank score >= 0.8) — full content
+//	mid  (score >= 0.55)       — first half, cut at a paragraph boundary
+//	low  (score < 0.55)        — heading path + 1-2 sentence teaser
+//
+// High/mid passages additionally carry their full section path as a citation
+// prefix so the model can reference "1.2 安装指南 > 1.2.3 Docker 部署"
+// precisely. Legacy (sliding-window) tenants get the unmodified passage.
+func (p *PluginIntoChatMessage) passageForResult(ctx context.Context, chatManage *types.ChatManage, result *types.SearchResult) string {
+	passage := getEnrichedPassageForChat(ctx, result)
+	if !smartCompressionEnabled(ctx, chatManage) || result == nil {
+		return passage
+	}
+	tiered := contextx.TieredRender([]*contextx.TierResult{{
+		ID:          result.ID,
+		KnowledgeID: result.KnowledgeID,
+		Content:     passage,
+		Title:       firstPipelineTitle(result),
+		HeadingPath: headingPathOf(result),
+		Score:       result.Score,
+	}}, contextx.DefaultTierThresholds())
+	if len(tiered) == 0 {
+		return passage
+	}
+	return contextx.RenderCitation(tiered[0], contextx.CitationFormat{IncludeHeadingPath: true})
 }
 
 // enrichContentWithImageInfo delegates to the shared searchutil implementation.

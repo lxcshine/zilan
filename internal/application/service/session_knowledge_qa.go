@@ -10,6 +10,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/common"
+	appconfig "github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
@@ -137,6 +138,7 @@ func (s *sessionService) KnowledgeQA(
 			ChatModelSupportsVision: chatModelSupportsVision,
 			Attachments:             req.Attachments,
 			Language:                types.LanguageNameFromContext(ctx),
+			GlobalContextConfig:     contextConfigFromYAML(s.cfg.Conversation.ContextManager),
 		},
 		PipelineState: types.PipelineState{
 			RewriteQuery:     req.Query,
@@ -1090,8 +1092,20 @@ func buildFallbackMessages(chatManage *types.ChatManage, promptContent string) [
 	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
 		userMsg.Images = chatManage.Images
 	}
+	messages = append(messages, userMsg)
+	return messages
+}
 
-	return append(messages, userMsg)
+func contextConfigFromYAML(cfg *appconfig.ContextManagerConfig) *types.ContextConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &types.ContextConfig{
+		MaxTokens:           cfg.MaxTokens,
+		CompressionStrategy: types.ContextCompressionStrategy(cfg.CompressionStrategy),
+		RecentMessageCount:  cfg.RecentMessageCount,
+		SummarizeThreshold:  cfg.SummarizeThreshold,
+	}
 }
 
 // renderFallbackPrompt renders the fallback prompt template with query and image context.

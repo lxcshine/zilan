@@ -13,6 +13,7 @@ import (
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/common"
 	appconfig "github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/contextx"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
@@ -33,24 +34,26 @@ const langfuseQueryPreview = 2000
 // engine therefore does not maintain its own cache, system-prompt store, or
 // cross-turn buffer.
 type AgentEngine struct {
-	config               *types.AgentConfig
-	toolRegistry         *agenttools.ToolRegistry
-	chatModel            chat.Chat
-	eventBus             *event.EventBus
-	knowledgeBasesInfo   []*KnowledgeBaseInfo      // Detailed knowledge base information for prompt
-	selectedDocs         []*SelectedDocumentInfo   // User-selected documents (via @ mention)
-	pinnedMCPServices    []*PinnedMCPServiceInfo   // User @mentioned MCP services for this turn
-	pinnedSkills         []*PinnedSkillInfo        // User @mentioned skills for this turn
-	sessionID            string                    // Session ID for logging and event emission
-	systemPromptTemplate string                    // System prompt template (optional, uses default if empty)
-	skillsManager        *skills.Manager           // Skills manager for Progressive Disclosure (optional)
-	appConfig            *appconfig.Config         // Application config for prompt template resolution (optional)
-	imageDescriber       ImageDescriberFunc        // VLM function for describing images in tool results (optional)
-	tokenEstimator       *agenttoken.Estimator     // Token estimator for context window management
-	memoryConsolidator   *agentmemory.Consolidator // Memory consolidator for LLM-powered summarization (optional)
-	lastUsage            types.TokenUsage          // Token usage from the most recent LLM call
-	lastSentMsgCount     int                       // Number of messages sent in the most recent LLM call
-	modelContext         *modelcontext.Registry    // single request-local boundary for every model handle
+	config                   *types.AgentConfig
+	toolRegistry             *agenttools.ToolRegistry
+	chatModel                chat.Chat
+	eventBus                 *event.EventBus
+	knowledgeBasesInfo       []*KnowledgeBaseInfo      // Detailed knowledge base information for prompt
+	selectedDocs             []*SelectedDocumentInfo   // User-selected documents (via @ mention)
+	pinnedMCPServices        []*PinnedMCPServiceInfo   // User @mentioned MCP services for this turn
+	pinnedSkills             []*PinnedSkillInfo        // User @mentioned skills for this turn
+	sessionID                string                    // Session ID for logging and event emission
+	systemPromptTemplate     string                    // System prompt template (optional, uses default if empty)
+	skillsManager            *skills.Manager           // Skills manager for Progressive Disclosure (optional)
+	appConfig                *appconfig.Config         // Application config for prompt template resolution (optional)
+	imageDescriber           ImageDescriberFunc        // VLM function for describing images in tool results (optional)
+	tokenEstimator           *agenttoken.Estimator     // Token estimator for context window management
+	memoryConsolidator       *agentmemory.Consolidator // Memory consolidator for LLM-powered summarization (optional)
+	lastUsage                types.TokenUsage          // Token usage from the most recent LLM call
+	lastSentMsgCount         int                       // Number of messages sent in the most recent LLM call
+	modelContext             *modelcontext.Registry    // single request-local boundary for every model handle
+	govTokenCounter          *contextx.Counter         // vendor-calibrated counter for context governance (lazy)
+	lastScratchpadCompressAt int                       // tool-step count at the last scratchpad compression
 }
 
 // ImageDescriberFunc generates a text description of an image.
@@ -648,6 +651,15 @@ func (e *AgentEngine) runReActIteration(
 	// 4. Observe: Add tool results to messages and write to context
 	state.RoundSteps = append(state.RoundSteps, step)
 	*messagesPtr = e.appendToolResults(*messagesPtr, step)
+	// Context governance (ima-grade P1): JSON-normalize and inner-summarize
+	// oversized fresh tool results before they enter the window, then
+	// checkpoint-compress the scratchpad on the configured cadence.
+	if toolCallCount > 0 {
+		*messagesPtr = e.governToolResults(ctx, *messagesPtr,
+			len(*messagesPtr)-toolCallCount, query)
+	}
+	*messagesPtr = e.maybeCompressScratchpad(ctx, *messagesPtr, query,
+		countTotalToolCalls(state.RoundSteps))
 	common.PipelineInfo(ctx, "Agent", "round_end", map[string]interface{}{
 		"iteration":   state.CurrentRound,
 		"round":       round,

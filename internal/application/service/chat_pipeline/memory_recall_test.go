@@ -124,7 +124,7 @@ func TestPrepareMessagesInjectsMemoryContext(t *testing.T) {
 			MemoryContext: "## 关于用户的长期记忆\n- 用户负责 Project X（截止 2026-08-20）",
 		},
 	}
-	messages := prepareMessagesWithHistory(chatManage)
+	messages := prepareMessagesWithHistory(context.Background(), chatManage)
 	require.NotEmpty(t, messages)
 	require.Equal(t, "system", messages[0].Role)
 	require.Contains(t, messages[0].Content, "You are a helpful assistant.")
@@ -138,7 +138,7 @@ func TestPrepareMessagesWithoutMemoryUnchanged(t *testing.T) {
 			SummaryConfig: types.SummaryConfig{Prompt: "base prompt"},
 		},
 	}
-	messages := prepareMessagesWithHistory(chatManage)
+	messages := prepareMessagesWithHistory(context.Background(), chatManage)
 	require.Equal(t, "base prompt", messages[0].Content)
 }
 

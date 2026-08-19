@@ -39,6 +39,16 @@ conversation:
   memory_extraction_prompt_id: "default_memory_extraction"          # from prompt_templates/memory_extraction.yaml
   session_precipitation_prompt_id: "default_session_precipitation"  # from prompt_templates/session_precipitation.yaml
   session_wiki_prompt_id: "default_session_wiki"                    # from prompt_templates/session_precipitation.yaml
+  # Five-layer context architecture (ima-grade). Global default; a tenant's
+  # own context_config (set via tenant API) takes precedence field-by-field.
+  # compression_strategy: "sliding_window" (legacy, default) | "smart"
+  # ("smart" enables L0-L4 token budgeting, Map-Reduce history compression,
+  # sticky turns, entity-alias compression and retrieval relevance tiering).
+  context_manager:
+    max_tokens: 0                 # 0 = auto-resolve from the chat model's vendor metadata
+    compression_strategy: "sliding_window"
+    recent_message_count: 0       # 0 = use max_rounds
+    summarize_threshold: 0        # 0 = 3x the recent window (smart mode deep fetch)
 
 # Knowledge base configuration
 knowledge_base:

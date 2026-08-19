@@ -65,7 +65,7 @@ help:
 	@echo "  package-mac-app   构建并打包 macOS 桌面应用 (.app)"
 
 # Go related variables
-BINARY_NAME=WeKnora
+BINARY_NAME=Zilan
 MAIN_PATH=./cmd/server
 
 # SQLite dev headers: prefer system libsqlite3-dev, fall back to /tmp/sqlite_shim

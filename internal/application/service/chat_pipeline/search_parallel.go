@@ -440,11 +440,11 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 	chatManage.SearchResult = fused
 
 	pipelineInfo(ctx, "SearchParallel", "complete", map[string]interface{}{
-		"session_id":     chatManage.SessionID,
-		"channel_count":  len(lists),
-		"fused_results":  len(fused),
-		"error_count":    len(errs),
-		"mode":           "multi_channel",
+		"session_id":    chatManage.SessionID,
+		"channel_count": len(lists),
+		"fused_results": len(fused),
+		"error_count":   len(errs),
+		"mode":          "multi_channel",
 	})
 
 	if len(chatManage.SearchResult) == 0 {

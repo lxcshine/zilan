@@ -73,6 +73,11 @@ type PipelineRequest struct {
 	WebFetchEnabled     bool   `json:"-"` // Auto-fetch full page content for web search results after rerank
 	WebFetchTopN        int    `json:"-"` // Max pages to fetch (default 3)
 	Language            string `json:"-"`
+	// GlobalContextConfig carries the deployment-wide context-management
+	// default (config.yaml conversation.context_manager). The tenant's own
+	// ContextConfig (DB) takes precedence field-by-field; this is the
+	// fallback when the tenant has not configured one.
+	GlobalContextConfig *ContextConfig `json:"-"`
 }
 
 // CitationsEnabled returns the effective citation setting for this request.
@@ -164,6 +169,45 @@ type PipelineState struct {
 	// KBClasses holds the auto-detected document class of each in-scope
 	// knowledge base (see kb profiling). Populated by ROUTE_RETRIEVAL.
 	KBClasses []string `json:"-"`
+
+	// --- ima-grade five-layer context management state ---
+
+	// HistorySummary is the accumulated Map-Reduce summary of older
+	// conversation rounds produced by the smart compression strategy. It is
+	// prepended to the history layer so compressed context still carries
+	// continuity across turns.
+	HistorySummary string `json:"history_summary,omitempty"`
+	// ContextDiagnostics records how the five-layer context budget (L0-L4)
+	// was spent for this turn: per-layer budgets, actual usage, and every
+	// truncation/compression action taken. Nil when budgeting is disabled.
+	ContextDiagnostics *ContextDiagnostics `json:"-"`
+	// ChatModelName is the resolved chat model name (not ID), stashed by
+	// prepareChatModel so the context assembler can pick the right vendor
+	// tokenizer and default context window without another model lookup.
+	ChatModelName string `json:"-"`
+}
+
+// ContextLayerBudget is the resolved per-layer token budget of the
+// five-layer context architecture (L0-L4).
+type ContextLayerBudget struct {
+	System    int `json:"system"`    // L0 system prompt + instructions
+	Memory    int `json:"memory"`    // L1 user profile + long-term memory
+	Retrieval int `json:"retrieval"` // L2 RAG retrieval results
+	History   int `json:"history"`   // L3 conversation history
+	Query     int `json:"query"`     // L4 current query + tool results
+}
+
+// ContextDiagnostics mirrors contextx.Diagnostics with plain string keys so
+// it stays JSON-serializable without importing the contextx package (which
+// would create an import cycle via models/chat).
+type ContextDiagnostics struct {
+	Window         int                `json:"window"`
+	Usable         int                `json:"usable"`
+	ReservedOutput int                `json:"reserved_output"`
+	Intent         string             `json:"intent"`
+	Budget         ContextLayerBudget `json:"budget"`
+	Used           ContextLayerBudget `json:"used"`
+	Actions        []string           `json:"actions"`
 }
 
 // PipelineContext holds runtime context for the current pipeline execution.
@@ -277,6 +321,7 @@ func (c *ChatManage) Clone() *ChatManage {
 			WebFetchTopN:             c.WebFetchTopN,
 			Language:                 c.Language,
 			IntentPromptOverrides:    maps.Clone(c.IntentPromptOverrides),
+			GlobalContextConfig:      c.GlobalContextConfig,
 		},
 		PipelineState: PipelineState{
 			RewriteQuery:         c.RewriteQuery,
@@ -296,6 +341,9 @@ func (c *ChatManage) Clone() *ChatManage {
 			RetrievalFailure:     c.RetrievalFailure,
 			LLMRetrievalIntent:   c.LLMRetrievalIntent,
 			KBClasses:            append([]string(nil), c.KBClasses...),
+			HistorySummary:       c.HistorySummary,
+			ContextDiagnostics:   c.ContextDiagnostics,
+			ChatModelName:        c.ChatModelName,
 		},
 	}
 }

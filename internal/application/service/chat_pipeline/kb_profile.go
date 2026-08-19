@@ -91,12 +91,12 @@ func profileKnowledgeBase(
 	}
 
 	pipelineInfo(ctx, "KBProfile", "classified", map[string]interface{}{
-		"kb_id":           kbID,
-		"document_class":  class,
-		"sample_count":    stats.SampleCount,
-		"heading_density": stats.HeadingDensity,
-		"table_ratio":     stats.TableRatio,
-		"faq_ratio":       stats.FAQRatio,
+		"kb_id":            kbID,
+		"document_class":   class,
+		"sample_count":     stats.SampleCount,
+		"heading_density":  stats.HeadingDensity,
+		"table_ratio":      stats.TableRatio,
+		"faq_ratio":        stats.FAQRatio,
 		"regulation_ratio": stats.RegulationRatio,
 	})
 	return class, nil

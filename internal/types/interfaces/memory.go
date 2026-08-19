@@ -50,7 +50,6 @@ type MemoryService interface {
 	IsEnabled(ctx context.Context, userID string) bool
 }
 
-
 // MemoryRepository persists L3 facts and L2 session summaries.
 // All read/write paths are scoped by (tenantID, userID): memories are
 // strictly per-user and must never leak across users or tenants.

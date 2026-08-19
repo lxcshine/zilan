@@ -71,6 +71,36 @@ type AgentConfig struct {
 	// Whether to execute independent tool calls in parallel (default: false).
 	// When enabled and the LLM returns multiple tool calls, they run concurrently via errgroup.
 	ParallelToolCalls bool `json:"parallel_tool_calls,omitempty"`
+
+	// ContextGovernance tunes agent-loop context governance (ima-grade P1):
+	// oversized tool results are inner-summarized before entering the context,
+	// and the ReAct scratchpad is checkpoint-compressed every N executed steps.
+	// Nil means enabled with defaults.
+	ContextGovernance *ContextGovernanceConfig `json:"context_governance,omitempty"`
+}
+
+// ContextGovernanceConfig holds the knobs for agent-loop context governance.
+// Zero-valued fields fall back to ima-grade defaults (see contextx.DefaultToolGovConfig).
+type ContextGovernanceConfig struct {
+	// Enabled toggles governance. Nil defaults to true.
+	Enabled *bool `json:"enabled,omitempty"`
+	// InnerSummaryThreshold is the token count above which a tool result is
+	// inner-summarized before entering the context (default 4000).
+	InnerSummaryThreshold int `json:"inner_summary_threshold,omitempty"`
+	// InnerSummaryBudget is the target token size of an inner summary (default 800).
+	InnerSummaryBudget int `json:"inner_summary_budget,omitempty"`
+	// ScratchpadCompressEvery triggers mid-run scratchpad compression after
+	// this many executed tool steps (default 6).
+	ScratchpadCompressEvery int `json:"scratchpad_compress_every,omitempty"`
+	// KeepRecentToolResults keeps the newest K tool results verbatim during
+	// scratchpad compression (default 2).
+	KeepRecentToolResults int `json:"keep_recent_tool_results,omitempty"`
+}
+
+// GovernanceEnabled reports whether context governance is active.
+// Nil receiver / nil Enabled means enabled (opt-out semantics).
+func (c *ContextGovernanceConfig) GovernanceEnabled() bool {
+	return c == nil || c.Enabled == nil || *c.Enabled
 }
 
 // CitationsEnabled preserves citation output for legacy runtime configs that

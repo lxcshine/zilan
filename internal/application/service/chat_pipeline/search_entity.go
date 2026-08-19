@@ -113,7 +113,7 @@ func (p *PluginSearchEntity) OnEvent(ctx context.Context,
 				defer wg.Done()
 
 				graph, err := p.graphRepo.SearchSubgraph(ctx, types.NameSpace{KnowledgeBase: knowledgeBaseID},
-				entity, types.GraphSubgraphMaxLevel, types.GraphSubgraphMaxNodes)
+					entity, types.GraphSubgraphMaxLevel, types.GraphSubgraphMaxNodes)
 				if err != nil {
 					logger.Errorf(ctx, "Failed to search entity in KB %s: %v", knowledgeBaseID, err)
 					return

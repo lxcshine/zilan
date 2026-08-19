@@ -13,13 +13,22 @@ import (
 type PluginMerge struct {
 	chunkRepo    interfaces.ChunkRepository
 	chunkService interfaces.ChunkService // for parent chunk resolution
+	modelService interfaces.ModelService
+	kbService    interfaces.KnowledgeBaseService
 }
 
 // NewPluginMerge creates and registers a new PluginMerge instance
-func NewPluginMerge(eventManager *EventManager, chunkRepo interfaces.ChunkRepository, chunkService interfaces.ChunkService) *PluginMerge {
+func NewPluginMerge(eventManager *EventManager,
+	chunkRepo interfaces.ChunkRepository,
+	chunkService interfaces.ChunkService,
+	modelService interfaces.ModelService,
+	kbService interfaces.KnowledgeBaseService,
+) *PluginMerge {
 	res := &PluginMerge{
 		chunkRepo:    chunkRepo,
 		chunkService: chunkService,
+		modelService: modelService,
+		kbService:    kbService,
 	}
 	eventManager.Register(res)
 	return res
@@ -91,6 +100,12 @@ func (p *PluginMerge) OnEvent(ctx context.Context,
 	// Step 8: Final dedup — catches exact duplicates plus partial content overlaps
 	mergedChunks = p.dedup(ctx, "final_dedup", mergedChunks)
 	mergedChunks = removePartialOverlaps(ctx, mergedChunks)
+
+	// Step 8.5: Semantic dedup (smart mode) — embedding cosine-similarity
+	// dedup catches paraphrased duplicates that string overlap misses.
+	if smartCompressionEnabled(ctx, chatManage) {
+		mergedChunks = p.semanticDedup(ctx, mergedChunks)
+	}
 
 	chatManage.MergeResult = mergedChunks
 	return next()
