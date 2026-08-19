@@ -4,7 +4,7 @@
 
 **Where knowledge converges into waves — bring every document to life**
 
-Minimalist aesthetics × Deep parsing × Autonomous reasoning — the next-generation enterprise knowledge hub
+Minimalist aesthetics × Deep parsing × Autonomous reasoning — an intelligent knowledge hub
 
 </div>
 
@@ -35,21 +35,21 @@ Minimalist aesthetics × Deep parsing × Autonomous reasoning — the next-gener
   </h4>
 </p>
 
-# 💡 Zilan — Where Knowledge Converges: a Minimalist Enterprise Knowledge Hub Unifying RAG, Agent Reasoning, and Auto-Wiki
+# 💡 Zilan — Where Knowledge Converges: a Minimalist Knowledge Hub Unifying RAG, Agent Reasoning, and Auto-Wiki
 
 ## 📌 Overview
 
-**Zilan (知澜)** is an LLM-powered enterprise knowledge management and intelligent Q&A platform, engineered toward an *ima-class* minimalist product experience that unifies **RAG quick Q&A**, **ReAct agent reasoning**, and **auto-generated Wiki knowledge distillation**.
+**Zilan (知澜)** is an LLM-powered knowledge management and intelligent Q&A platform with a minimalist product experience that unifies **RAG quick Q&A**, **ReAct agent reasoning**, and **auto-generated Wiki knowledge distillation**.
 
 Zilan is a thorough re-imagination built on a battle-tested open-source knowledge framework, carrying product genes entirely its own:
 
 - **🎨 A brand-new minimalist design language** — no clutter, no visual noise: a dark monochrome brand color (#333 family), large rounded corners, feather-light shadows, and pure solid backgrounds; one consistent visual system from the login page through chat streams to the settings center — quiet, restrained, and content-first
 - **📄 A deep document parsing pipeline** — structured PDF table extraction, mathematical formula recognition, and dual-column layout awareness; **automatic routing** selects parsing engine intensity per document profile, low-scoring results are retried with heavier engines, and stubborn documents land in a human review queue
 - **🕸️ GraphRAG-enhanced retrieval** — entity-relation storage on Neo4j; **community summaries + local subgraph retrieval** complement dense/sparse vector recall, widening coverage and explainability for complex multi-hop questions
-- **🧠 Memory & knowledge distillation system (work in progress)** — an ima-aligned three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; users can view, edit, and delete everything the AI remembers — GDPR-compliant by design
+- **🧠 Memory & knowledge distillation system (work in progress)** — a three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; users can view, edit, and delete everything the AI remembers — GDPR-compliant by design
 - **🔐 An independent identity and protocol stack** — a fully self-owned namespace across branding, JWT audience (`aud=zilan`), webhook signature (`X-Zilan-Signature`), and embed SDK (`zilan-widget.js`) — zero upstream traces
 
-On top of that, Zilan inherits enterprise-grade engineering capabilities proven at scale: multi-source ingestion (Feishu / Notion / Yuque / RSS, and growing), 20+ LLM provider integrations, a dozen IM channels, website embed widgets, a 4-tier RBAC role matrix with workspace audit logs, AES-256-GCM credential encryption at rest, full-stack Langfuse observability plus a runtime task-queue governance dashboard, and a fully self-hostable modular architecture — LLMs, vector databases, and storage backends are all swappable, keeping data sovereignty entirely yours.
+On top of that, Zilan inherits engineering capabilities proven through large-scale production use: multi-source ingestion (Feishu / Notion / Yuque / RSS, and growing), 20+ LLM provider integrations, a dozen IM channels, website embed widgets, a 4-tier RBAC role matrix with workspace audit logs, AES-256-GCM credential encryption at rest, full-stack Langfuse observability plus a runtime task-queue governance dashboard, and a fully self-hostable modular architecture — LLMs, vector databases, and storage backends are all swappable, keeping data sovereignty entirely yours.
 
 ## ✨ Highlights
 
@@ -81,7 +81,7 @@ Entities and relations are extracted into Neo4j at ingest time to build a knowle
 
 ### 🧠 Memory & Knowledge Distillation (Work in Progress)
 
-Toward an ima-class personal knowledge assistant, Zilan is building a three-layer memory architecture:
+Toward a more personal, context-aware knowledge assistant, Zilan is building a three-layer memory architecture:
 
 - **L1 working memory** — full context and intermediate state of the current conversation
 - **L2 short-term memory** — vectorized summaries of the last N conversations (pgvector), recalled by relevance at session start
