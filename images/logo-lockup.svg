@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 160" role="img" aria-label="知澜 Zilan">
-  <g transform="translate(12 20) scale(0.75)">
+  <g transform="translate(34 32) scale(0.609)">
     <circle cx="64" cy="46" r="13" fill="#333333"/>
     <path d="M22 100 C48 74 76 74 100 100 C118 118 140 118 148 102" fill="none" stroke="#333333" stroke-width="14" stroke-linecap="round"/>
   </g>
-  <text x="168" y="110" font-family="-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="64" font-weight="700" fill="#333333">知澜</text>
-  <text x="316" y="110" font-family="-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="44" font-weight="400" letter-spacing="2" fill="#333333">Zilan</text>
+  <text x="159" y="100" font-family="-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="56" font-weight="700" fill="#333333">知澜</text>
+  <text x="293" y="100" font-family="-apple-system,'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans SC',sans-serif" font-size="56" font-weight="400" letter-spacing="3" fill="#333333">Zilan</text>
 </svg>
