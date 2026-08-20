@@ -46,7 +46,7 @@ Zilan is a thorough re-imagination built on a battle-tested open-source knowledg
 - **🎨 A brand-new minimalist design language** — no clutter, no visual noise: a dark monochrome brand color (#333 family), large rounded corners, feather-light shadows, and pure solid backgrounds; one consistent visual system from the login page through chat streams to the settings center — quiet, restrained, and content-first
 - **📄 A deep document parsing pipeline** — structured PDF table extraction, mathematical formula recognition, and dual-column layout awareness; **automatic routing** selects parsing engine intensity per document profile, low-scoring results are retried with heavier engines, and stubborn documents land in a human review queue
 - **🕸️ GraphRAG-enhanced retrieval** — entity-relation storage on Neo4j; **community summaries + local subgraph retrieval** complement dense/sparse vector recall, widening coverage and explainability for complex multi-hop questions
-- **🧠 Memory & knowledge distillation system** — a three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; the dedicated **My Memory** page lets users view, edit, and delete everything the AI remembers — GDPR-compliant by design
+- **🧠 Memory & knowledge distillation system** — a three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; long-term memory is further structured into **four semantic modules — Soul / User / Memory / Agent** (persona directives, user profile, memory stream, distilled skills), each with its own view on the **My Memory** page where users can view, edit, and delete everything the AI remembers — GDPR-compliant by design
 - **🔐 An independent identity and protocol stack** — a fully self-owned namespace across branding, JWT audience (`aud=zilan`), webhook signature (`X-Zilan-Signature`), and embed SDK (`zilan-widget.js`) — zero upstream traces
 
 On top of that, Zilan inherits engineering capabilities proven through large-scale production use: multi-source ingestion (Feishu / Notion / Yuque / RSS, and growing), 20+ LLM provider integrations, a dozen IM channels, website embed widgets, a 4-tier RBAC role matrix with workspace audit logs, AES-256-GCM credential encryption at rest, full-stack Langfuse observability plus a runtime task-queue governance dashboard, and a fully self-hostable modular architecture — LLMs, vector databases, and storage backends are all swappable, keeping data sovereignty entirely yours.
@@ -97,6 +97,25 @@ The dedicated **My Memory** page makes long-term memory fully transparent and co
 - **Global switch** — pause memory extraction & recall anytime; stored memories are kept and can be re-enabled later
 
 All operations are isolated per user and available in four languages (zh-CN / en-US / ru-RU / ko-KR) — GDPR / privacy compliant by design.
+
+#### 🗂️ Four Structured Memory Modules (Soul / User / Memory / Agent)
+
+Beyond a flat fact list, long-term memory is organized into four semantic modules — so the assistant not only remembers *facts*, but also knows *who it should be*, *who you are*, and *how to work best with you*:
+
+| Module | What it holds | What you see |
+|--------|---------------|--------------|
+| **Soul** | Read-only global persona + your style directives ("call me Zhang Gong", "answer in bullet points") | Persona card + directive list; directives are auto-extracted from chat and injected into every answer |
+| **User** | Stable attributes about you (identity / role / preferences) | Profile card with grouped sections, a completeness meter, and drill-down into the memory stream |
+| **Memory** | The full memory stream: all facts, to-dos, feedback, plus L2 session summaries | The original category-filtered list (as above) |
+| **Agent** | Distilled skills — reusable know-how learned from your feedback | Skill cards + a feedback wall showing which feedback has been upgraded into a skill |
+
+How it works:
+
+- **Extraction** — two new memory categories (`soul`, `skill`) are extracted alongside the existing ones; a `skill` is only produced from explicit feedback/instructions (confidence ≥ 0.7) to avoid hallucinated "tips"
+- **Feedback → skill upgrade** — when you criticize an answer ("too verbose"), the raw feedback is archived **and** distilled into an actionable skill ("keep answers in bullet points"); the feedback wall links the two together
+- **Module-aware injection** — recalled memories are rendered as four labeled blocks in a fixed order (style directives → user profile → relevant memories → assistant skills), each with its own budget: soul directives inject in full, profile takes the top 4 by importance, skills take the top 3 by importance × confidence; soul directives also get a ×1.5 semantic-weight boost so persona-level instructions are never crowded out by topical matches
+
+Zero schema change: the modules are a code-level mapping over the existing `memory_facts` table, so all existing memory management (edit / delete / clear / switch) applies unchanged.
 
 ### 🧠 Context Management · IMA-Grade Five-Layer Intelligent Architecture
 
@@ -181,7 +200,7 @@ Fully modular pipeline from document parsing, vectorization, and retrieval to LL
 | Temporary Attachments | Session-scoped image / document uploads with async parsing for one-off Q&A, with a combined image + attachment limit |
 | Citations & RAG Progress | Inline citation popovers and a references drawer (web / KB source distinction), shared markdown rendering, and stage-by-stage RAG pipeline progress in chat |
 | Session Management | Filter and group sidebar sessions by source (Web / IM / Embed), with inline session-title rename |
-| Memory & Personalization | Three-layer memory architecture (see [Highlights](#-memory--knowledge-distillation)): async fact extraction, scored recall injection, and a dedicated My Memory page for browsing / editing / deleting memories with a global memory switch |
+| Memory & Personalization | Three-layer memory architecture (see [Highlights](#-memory--knowledge-distillation)): async fact extraction, scored recall injection, and a dedicated My Memory page structured into four modules (Soul / User / Memory / Agent) for browsing / editing / deleting memories with a global memory switch |
 
 **Knowledge Management**
 
