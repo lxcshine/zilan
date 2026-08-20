@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-label="知澜 Zilan">
+  <rect width="160" height="160" rx="36" fill="#181818"/>
+  <g transform="translate(85 79) scale(0.714) translate(-85 -79)">
+    <circle cx="64" cy="46" r="13" fill="#f5f5f5"/>
+    <path d="M22 100 C48 74 76 74 100 100 C118 118 140 118 148 102" fill="none" stroke="#f5f5f5" stroke-width="14" stroke-linecap="round"/>
+  </g>
+</svg>

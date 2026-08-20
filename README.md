@@ -1,6 +1,9 @@
 <div align="center">
 
-# Zilan · 知澜
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./images/logo-lockup-dark.svg">
+  <img src="./images/logo-lockup.svg" alt="Zilan 知澜" width="380">
+</picture>
 
 **Where knowledge converges into waves — bring every document to life**
 
