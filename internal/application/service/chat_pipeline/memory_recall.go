@@ -65,9 +65,25 @@ func (p *PluginMemoryRecall) OnEvent(ctx context.Context,
 	chatManage.MemoryContext = block
 
 	pipelineInfo(ctx, "MemoryRecall", "injected", map[string]interface{}{
-		"session_id":   chatManage.SessionID,
-		"memory_count": len(memories),
-		"block_chars":  len(block),
+		"session_id":         chatManage.SessionID,
+		"memory_count":       len(memories),
+		"block_chars":        len(block),
+		"block_chars_soul":   injectedCharsByModule(memories, types.MemoryCategorySoul),
+		"block_chars_user":   injectedCharsByModule(memories, types.MemoryCategoryProfile) + injectedCharsByModule(memories, types.MemoryCategoryFact),
+		"block_chars_memory": injectedCharsByModule(memories, types.MemoryCategoryPreference) + injectedCharsByModule(memories, types.MemoryCategoryTodo),
+		"block_chars_agent":  injectedCharsByModule(memories, types.MemoryCategorySkill),
 	})
 	return next()
+}
+
+// injectedCharsByModule sums the rendered content length of injected facts of
+// one category (module-level observability, PRD P0-2 §7).
+func injectedCharsByModule(memories []*types.RecalledMemory, category string) int {
+	chars := 0
+	for _, m := range memories {
+		if m.Kind == "fact" && m.Fact != nil && m.Fact.Category == category {
+			chars += len(m.Fact.Content)
+		}
+	}
+	return chars
 }

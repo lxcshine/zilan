@@ -189,6 +189,10 @@ func RegisterMemoryRoutes(r *gin.RouterGroup, memoryHandler *handler.MemoryHandl
 	memory := r.Group("/memory")
 	{
 		memory.GET("/status", memoryHandler.GetMemoryStatus)
+		memory.GET("/modules", memoryHandler.GetMemoryModules)
+		memory.GET("/soul", memoryHandler.GetSoulCard)
+		memory.GET("/profile", memoryHandler.GetProfileCard)
+		memory.GET("/agent-tips", memoryHandler.GetAgentTips)
 		memory.GET("/facts", memoryHandler.ListMemoryFacts)
 		memory.PUT("/facts/:id", memoryHandler.UpdateMemoryFact)
 		memory.DELETE("/facts/:id", memoryHandler.DeleteMemoryFact)

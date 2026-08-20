@@ -28,11 +28,11 @@ func NewMemoryHandler(memoryService interfaces.MemoryService) *MemoryHandler {
 
 // ListMemoryFacts godoc
 // @Summary      查看 AI 长期记忆
-// @Description  分页列出当前用户的长期记忆事实（画像/事实/偏好/待办/反馈），支持分类与关键词过滤
+// @Description  分页列出当前用户的长期记忆事实（画像/事实/偏好/待办/反馈/风格/技巧），支持分类与关键词过滤
 // @Tags         记忆
 // @Accept       json
 // @Produce      json
-// @Param        category  query     string  false  "分类过滤: profile|fact|preference|todo|feedback"
+// @Param        category  query     string  false  "分类过滤: profile|fact|preference|todo|feedback|soul|skill"
 // @Param        status    query     string  false  "状态过滤: active|done|archived|all (默认 active)"
 // @Param        keyword   query     string  false  "内容关键词"
 // @Param        page      query     int     false  "页码 (默认 1)"
@@ -234,5 +234,110 @@ func (h *MemoryHandler) GetMemoryStatus(c *gin.Context) {
 			"enabled":    enabled,
 			"fact_count": total,
 		},
+	})
+}
+
+// GetMemoryModules godoc
+// @Summary      记忆四模块总览
+// @Description  返回 Soul/User/Memory/Agent 四个模块各自的记忆条数（Memory 模块额外含 L2 会话摘要数），供记忆页导航徽标
+// @Tags         记忆
+// @Produce      json
+// @Success      200  {object}  map[string]interface{}  "模块计数列表"
+// @Failure      401  {object}  errors.AppError         "未授权"
+// @Security     Bearer
+// @Router       /memory/modules [get]
+func (h *MemoryHandler) GetMemoryModules(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	modules, err := h.memoryService.GetModuleOverview(ctx)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to get memory modules").WithDetails(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    gin.H{"modules": modules},
+	})
+}
+
+// GetSoulCard godoc
+// @Summary      Soul 灵魂卡
+// @Description  返回全局人设（只读）与用户的风格微调指令（category=soul），供 Soul 模块视图渲染
+// @Tags         记忆
+// @Produce      json
+// @Success      200  {object}  map[string]interface{}  "灵魂卡"
+// @Failure      401  {object}  errors.AppError         "未授权"
+// @Security     Bearer
+// @Router       /memory/soul [get]
+func (h *MemoryHandler) GetSoulCard(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	card, err := h.memoryService.GetSoulCard(ctx)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to get soul card").WithDetails(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    card,
+	})
+}
+
+// GetProfileCard godoc
+// @Summary      User 用户档案卡
+// @Description  将画像/事实/偏好记忆聚合为身份/职责/偏好/事实四个分组，返回分组条目与档案完整度
+// @Tags         记忆
+// @Produce      json
+// @Success      200  {object}  map[string]interface{}  "档案卡"
+// @Failure      401  {object}  errors.AppError         "未授权"
+// @Security     Bearer
+// @Router       /memory/profile [get]
+func (h *MemoryHandler) GetProfileCard(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	card, err := h.memoryService.GetProfileCard(ctx)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to get profile card").WithDetails(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    card,
+	})
+}
+
+// GetAgentTips godoc
+// @Summary      Agent 经验技巧卡
+// @Description  返回助手沉淀的技巧（category=skill）与原始反馈墙（category=feedback，含升级关联 skill ID），反馈支持分页
+// @Tags         记忆
+// @Produce      json
+// @Param        page      query     int     false  "反馈页码 (默认 1)"
+// @Param        page_size query     int     false  "反馈每页条数 (默认 20, 最大 100)"
+// @Success      200  {object}  map[string]interface{}  "技巧卡"
+// @Failure      401  {object}  errors.AppError         "未授权"
+// @Security     Bearer
+// @Router       /memory/agent-tips [get]
+func (h *MemoryHandler) GetAgentTips(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+
+	card, err := h.memoryService.GetAgentTipsCard(ctx, page, pageSize)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, nil)
+		c.Error(errors.NewInternalServerError("Failed to get agent tips").WithDetails(err.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    card,
 	})
 }

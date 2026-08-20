@@ -211,6 +211,39 @@ func (r *memoryRepository) CountActiveFacts(ctx context.Context, tenantID uint64
 	return count, err
 }
 
+// categoryCountRow is the grouped-count projection of
+// CountActiveFactsByCategory.
+type categoryCountRow struct {
+	Category string `gorm:"column:category"`
+	Count    int64  `gorm:"column:count"`
+}
+
+func (r *memoryRepository) CountActiveFactsByCategory(
+	ctx context.Context, tenantID uint64, userID string,
+) (map[string]int64, error) {
+	var rows []categoryCountRow
+	err := r.scopeUser(r.db.WithContext(ctx).Model(&types.MemoryFact{}), tenantID, userID).
+		Where("status = ?", types.MemoryStatusActive).
+		Select("category, COUNT(*) as count").
+		Group("category").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(rows))
+	for _, row := range rows {
+		out[row.Category] = row.Count
+	}
+	return out, nil
+}
+
+func (r *memoryRepository) CountSessionSummaries(ctx context.Context, tenantID uint64, userID string) (int64, error) {
+	var count int64
+	err := r.scopeUser(r.db.WithContext(ctx).Model(&types.MemorySessionSummary{}), tenantID, userID).
+		Count(&count).Error
+	return count, err
+}
+
 func (r *memoryRepository) ListLowestImportanceFacts(
 	ctx context.Context, tenantID uint64, userID string, limit int,
 ) ([]*types.MemoryFact, error) {

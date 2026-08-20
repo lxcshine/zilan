@@ -23,6 +23,23 @@ templates:
         optional deadline in due_at (ISO 8601, e.g. "2026-08-20").
       - feedback: explicit praise or criticism of the assistant's answers
         (e.g. "回答太啰嗦了"), so future answers can adapt.
+      - soul: an explicit user directive about how the ASSISTANT should
+        behave toward this user — how to address them ("以后叫我张工"),
+        reply language, tone, format, verbosity. The directive's target is
+        the assistant's behavior, not a property of the user. subject is
+        "用户", e.g. (用户, 称呼, 张工).
+      - skill: a behavioral lesson the assistant should apply in future
+        answers, distilled ONLY from the user's explicit feedback or
+        instructions (e.g. "太啰嗦了" → 回答要点式). subject is always
+        "assistant", e.g. (assistant, 回答风格, 先给结论再展开).
+
+      ## Category boundaries (soul vs preference vs skill)
+      - The directive targets the assistant's OWN behavior (addressing the
+        user, tone, format, language) → soul.
+      - It describes the user's own taste or tooling habits (likes Python,
+        deploys with Helm) → preference.
+      - It is a strategy the assistant should reuse when answering (learned
+        from explicit feedback/instruction) → skill.
 
       ## Requirements
       1. Output JSON only, matching this schema:
@@ -33,13 +50,17 @@ templates:
       2. Only extract what is explicitly stated or strongly implied by the
          user; never fabricate. Assistant statements are evidence about the
          topic, not about the user — do not record the assistant's opinions
-         as user facts.
+         as user facts. EXCEPTION: the user's explicit directives about and
+         evaluations of the assistant's behavior are legitimate soul / skill
+         / feedback memories.
       3. content is a single self-contained natural-language sentence (in
          the conversation's language) that still makes sense without the
          conversation, e.g. "用户负责 Project X 的交付".
       4. confidence: how certain the extraction is (0.5 tentative – 1.0
          explicit). importance: how valuable this memory is for future
-         answers (0.1 trivia – 1.0 critical identity/deadline).
+         answers (0.1 trivia – 1.0 critical identity/deadline). A skill is
+         only emitted when the evidence is explicit (confidence >= 0.7);
+         never invent skills the user did not ask for.
       5. Skip small talk, one-off questions, and anything already obvious
          from the current turn alone. Prefer fewer, higher-quality memories;
          at most 5 per turn. If nothing is worth remembering, return an
@@ -48,17 +69,25 @@ templates:
          in at most 3 sentences, merging the previous summary (if provided)
          with the latest turn. Write it in the conversation's language.
          key_topics: up to 5 short topic labels for the session.
-      7. Do not output any explanation or markdown fencing; output only the
+      7. When the user explicitly criticizes or prescribes an answer
+         behavior, emit BOTH the raw feedback (category=feedback, the user's
+         original wording) AND the distilled skill (category=skill, a
+         self-contained behavioral rule). The pair shares the same turn.
+      8. Do not output any explanation or markdown fencing; output only the
          JSON object.
 
       ## Example
       [Input]
       Previous summary: 用户在评估团队的监控方案。
-      user: 我下周三要给团队演示 Prometheus 的部署方案，我比较倾向用 Helm 管理。
-      assistant: 好的，演示可以按 values.yaml 分层覆盖的思路来组织……
+      user: 以后叫我张工。我下周三要给团队演示 Prometheus 的部署方案，我比较倾向用 Helm 管理。
+      assistant: 好的张工，演示可以按 values.yaml 分层覆盖的思路来组织……
+      user: 你回答得太啰嗦了，先给结论再展开。
 
       [Output]
       {"memories":[
+        {"category":"soul","subject":"用户","predicate":"称呼","object":"张工","content":"用户希望助手称呼他为张工","confidence":0.95,"importance":0.7,"due_at":""},
         {"category":"todo","subject":"用户","predicate":"需要完成","object":"向团队演示 Prometheus 部署方案","content":"用户需要向团队演示 Prometheus 的部署方案（截止下周三）","confidence":0.95,"importance":0.9,"due_at":""},
-        {"category":"preference","subject":"用户","predicate":"偏好","object":"用 Helm 管理部署","content":"用户偏好使用 Helm 来管理 Prometheus 部署","confidence":0.9,"importance":0.6,"due_at":""}
-      ],"session_summary":"用户正在准备向团队演示 Prometheus 部署方案，倾向用 Helm 管理，助手建议按 values.yaml 分层覆盖组织演示。","key_topics":["Prometheus","Helm","部署演示"]}
+        {"category":"preference","subject":"用户","predicate":"偏好","object":"用 Helm 管理部署","content":"用户偏好使用 Helm 来管理 Prometheus 部署","confidence":0.9,"importance":0.6,"due_at":""},
+        {"category":"feedback","subject":"用户","predicate":"评价","object":"回答太啰嗦","content":"用户反馈助手回答太啰嗦","confidence":0.95,"importance":0.7,"due_at":""},
+        {"category":"skill","subject":"assistant","predicate":"回答风格","object":"先给结论再展开","content":"给该用户的回答先给结论再展开，避免长段落","confidence":0.9,"importance":0.8,"due_at":""}
+      ],"session_summary":"用户（张工）正在准备向团队演示 Prometheus 部署方案，倾向用 Helm 管理；要求回答简洁、先给结论再展开。","key_topics":["Prometheus","Helm","部署演示","称呼偏好"]}

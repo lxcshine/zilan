@@ -48,6 +48,20 @@ type MemoryService interface {
 	// IsEnabled reports whether memory writes/recall are enabled for the
 	// user (per-user preference, default on).
 	IsEnabled(ctx context.Context, userID string) bool
+
+	// GetModuleOverview returns the four-module (soul/user/memory/agent)
+	// counts for the memory page navigation badges.
+	GetModuleOverview(ctx context.Context) ([]*types.MemoryModuleOverview, error)
+	// GetSoulCard returns the global persona plus the user's style
+	// directives (category=soul).
+	GetSoulCard(ctx context.Context) (*types.SoulCard, error)
+	// GetProfileCard returns the structured user profile with per-section
+	// grouping and a completeness score.
+	GetProfileCard(ctx context.Context) (*types.ProfileCard, error)
+	// GetAgentTipsCard returns distilled skills plus the raw feedback wall
+	// with feedback→skill upgrade links. The feedback wall is paged by
+	// (page, pageSize).
+	GetAgentTipsCard(ctx context.Context, page, pageSize int) (*types.AgentTipsCard, error)
 }
 
 // MemoryRepository persists L3 facts and L2 session summaries.
@@ -79,6 +93,12 @@ type MemoryRepository interface {
 	DeleteAllFacts(ctx context.Context, tenantID uint64, userID string) (int64, error)
 	// CountActiveFacts counts active facts for the per-user cap check.
 	CountActiveFacts(ctx context.Context, tenantID uint64, userID string) (int64, error)
+	// CountActiveFactsByCategory returns the active fact count per category
+	// for the four-module overview aggregation (one grouped query).
+	CountActiveFactsByCategory(ctx context.Context, tenantID uint64, userID string) (map[string]int64, error)
+	// CountSessionSummaries counts the user's active L2 session summaries
+	// for the memory-module overview badge.
+	CountSessionSummaries(ctx context.Context, tenantID uint64, userID string) (int64, error)
 	// ListLowestImportanceFacts returns the N lowest-importance active facts,
 	// used for eviction when the per-user cap is exceeded.
 	ListLowestImportanceFacts(ctx context.Context, tenantID uint64, userID string, limit int) ([]*types.MemoryFact, error)

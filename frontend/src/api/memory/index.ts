@@ -3,8 +3,15 @@
 // 所有操作按调用用户的 (tenant, user) 隔离，前端无需也无法跨用户访问。
 import { get, put, del } from '@/utils/request'
 
-/** 记忆分类：画像 / 事实 / 偏好 / 待办 / 反馈 */
-export type MemoryCategory = 'profile' | 'fact' | 'preference' | 'todo' | 'feedback'
+/** 记忆分类：画像 / 事实 / 偏好 / 待办 / 反馈 / 风格指令(soul) / 助手技巧(skill) */
+export type MemoryCategory =
+  | 'profile'
+  | 'fact'
+  | 'preference'
+  | 'todo'
+  | 'feedback'
+  | 'soul'
+  | 'skill'
 
 /** 记忆状态：生效中 / 已完成（todo）/ 已归档 */
 export type MemoryStatus = 'active' | 'done' | 'archived'
@@ -96,4 +103,84 @@ export async function deleteMemoryFact(id: string): Promise<void> {
 export async function deleteAllMemories(): Promise<number> {
   const res = await del('/api/v1/memory') as any
   return res?.data?.deleted ?? 0
+}
+
+// ---------------------------------------------------------------------------
+// 四模块聚合 API（P0-2：Soul / User / Memory / Agent）
+// ---------------------------------------------------------------------------
+
+/** 记忆模块键：灵魂 / 用户档案 / 记忆流 / 经验技巧 */
+export type MemoryModule = 'soul' | 'user' | 'memory' | 'agent'
+
+export interface MemoryModuleOverview {
+  module: MemoryModule
+  fact_count: number
+  /** 仅 memory 模块返回：L2 会话摘要条数 */
+  summary_count?: number
+}
+
+/** 全局人设（只读，来自系统提示词模板；未配置时为空对象） */
+export interface SoulPersona {
+  name?: string
+  description?: string
+  content?: string
+}
+
+export interface SoulCardData {
+  global_persona: SoulPersona
+  /** 用户的风格微调指令（category=soul） */
+  adjustments: MemoryFact[]
+}
+
+/** 档案分组键：身份 / 职责 / 偏好 / 事实 */
+export type MemoryProfileSectionKey = 'identity' | 'role' | 'preference' | 'fact'
+
+export interface MemoryProfileSection {
+  key: MemoryProfileSectionKey
+  items: MemoryFact[]
+}
+
+export interface ProfileCardData {
+  sections: MemoryProfileSection[]
+  /** 0-1，非空分组加权占比（identity/role 权重加倍） */
+  completeness: number
+}
+
+/** 反馈墙条目：原始反馈 + 升级关联的技巧 ID（同轮抽取产出） */
+export interface AgentFeedbackItem extends MemoryFact {
+  upgraded_to?: string
+}
+
+export interface AgentTipsCardData {
+  skills: MemoryFact[]
+  feedback: AgentFeedbackItem[]
+  feedback_total: number
+}
+
+/** 四模块总览（各模块记忆计数，memory 模块含摘要数） */
+export async function getMemoryModules(): Promise<MemoryModuleOverview[]> {
+  const res = await get('/api/v1/memory/modules') as any
+  return res?.data?.modules ?? []
+}
+
+/** Soul 灵魂卡：全局人设（只读）+ 用户风格微调指令 */
+export async function getSoulCard(): Promise<SoulCardData> {
+  const res = await get('/api/v1/memory/soul') as any
+  return res?.data ?? { global_persona: {}, adjustments: [] }
+}
+
+/** User 用户档案卡：身份/职责/偏好/事实分组 + 完整度 */
+export async function getProfileCard(): Promise<ProfileCardData> {
+  const res = await get('/api/v1/memory/profile') as any
+  return res?.data ?? { sections: [], completeness: 0 }
+}
+
+/** Agent 经验技巧卡：技巧列表 + 反馈墙（带升级关联）；反馈支持分页 */
+export async function getAgentTips(params: { page?: number; page_size?: number } = {}): Promise<AgentTipsCardData> {
+  const query = new URLSearchParams()
+  if (params.page) query.set('page', String(params.page))
+  if (params.page_size) query.set('page_size', String(params.page_size))
+  const qs = query.toString()
+  const res = await get(`/api/v1/memory/agent-tips${qs ? `?${qs}` : ''}`) as any
+  return res?.data ?? { skills: [], feedback: [], feedback_total: 0 }
 }

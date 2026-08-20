@@ -26,7 +26,89 @@ const (
 	// MemoryCategoryFeedback records explicit positive/negative feedback on
 	// answers, used to tune future answer style.
 	MemoryCategoryFeedback = "feedback"
+	// MemoryCategorySoul is a user directive about the assistant's own
+	// behavior: how to address the user, reply language, tone, format,
+	// verbosity ("以后叫我张工"). Injected as a style layer that overrides
+	// the default persona.
+	MemoryCategorySoul = "soul"
+	// MemoryCategorySkill is a behavioral lesson the assistant distilled
+	// from explicit user feedback or instructions ("回答先给结论再展开").
+	// The subject of a skill fact is always "assistant".
+	MemoryCategorySkill = "skill"
 )
+
+// Memory modules (four-module memory architecture, P0-2).
+const (
+	// MemoryModuleSoul aggregates the assistant persona: the global persona
+	// template plus user soul directives.
+	MemoryModuleSoul = "soul"
+	// MemoryModuleUser aggregates the structured user profile (identity,
+	// role, preference, fact).
+	MemoryModuleUser = "user"
+	// MemoryModuleMemory is the full memory stream (all facts + L2 session
+	// summaries), the default module view.
+	MemoryModuleMemory = "memory"
+	// MemoryModuleAgent aggregates reusable answer strategies: skills
+	// distilled from feedback.
+	MemoryModuleAgent = "agent"
+)
+
+// MemoryModuleOf maps one memory category to its owning module. This is the
+// single source of truth shared by the backend aggregation endpoints and the
+// frontend navigation (exposed via GET /memory/modules).
+func MemoryModuleOf(category string) string {
+	switch category {
+	case MemoryCategorySoul:
+		return MemoryModuleSoul
+	case MemoryCategoryProfile, MemoryCategoryFact, MemoryCategoryPreference:
+		return MemoryModuleUser
+	case MemoryCategorySkill, MemoryCategoryFeedback:
+		return MemoryModuleAgent
+	default:
+		// todo and anything else lives in the memory stream.
+		return MemoryModuleMemory
+	}
+}
+
+// MemoryProfileSectionKey identifies one section of the User profile card.
+const (
+	MemoryProfileSectionIdentity   = "identity"   // stable attributes (category=profile)
+	MemoryProfileSectionRole       = "role"       // duties/responsibilities (role-shaped facts)
+	MemoryProfileSectionPreference = "preference" // likes/dislikes (category=preference)
+	MemoryProfileSectionFact       = "fact"       // remaining facts
+)
+
+// rolePredicateKeywords marks fact triples that describe what the user is
+// responsible for, so they surface in the profile "role" section instead of
+// being buried in the generic fact list.
+var rolePredicateKeywords = []string{
+	"负责", "主导", "参与", "管理", "开发", "维护", "运营", "任职", "担任", "工作",
+	"responsible", "lead", "manage", "develop", "maintain", "operate", "work",
+	"owner", "member",
+}
+
+// MemoryProfileSectionOf maps one fact to its User-profile section key.
+func MemoryProfileSectionOf(fact *MemoryFact) string {
+	if fact == nil {
+		return MemoryProfileSectionFact
+	}
+	switch fact.Category {
+	case MemoryCategoryProfile:
+		return MemoryProfileSectionIdentity
+	case MemoryCategoryPreference:
+		return MemoryProfileSectionPreference
+	case MemoryCategoryFact:
+		p := strings.ToLower(fact.Predicate)
+		for _, kw := range rolePredicateKeywords {
+			if strings.Contains(p, kw) {
+				return MemoryProfileSectionRole
+			}
+		}
+		return MemoryProfileSectionFact
+	default:
+		return MemoryProfileSectionFact
+	}
+}
 
 // Memory fact statuses.
 const (
@@ -286,4 +368,60 @@ func MemoryRecallScore(semantic float64, reference time.Time, accessCount int, h
 	}
 	frequency := 1 + math.Log1p(float64(accessCount))
 	return semantic * decay * frequency
+}
+
+// ---------------------------------------------------------------------------
+// Four-module aggregation payloads (P0-2)
+// ---------------------------------------------------------------------------
+
+// MemoryModuleOverview is one row of GET /memory/modules: the module key plus
+// its active fact count, used by the frontend navigation badges. The memory
+// module additionally reports the L2 session summary count.
+type MemoryModuleOverview struct {
+	Module       string `json:"module"`
+	FactCount    int64  `json:"fact_count"`
+	SummaryCount int64  `json:"summary_count,omitempty"` // memory module only
+}
+
+// SoulPersona is the read-only global persona resolved from the system prompt
+// template; an empty struct when no template is configured.
+type SoulPersona struct {
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Content     string `json:"content,omitempty"`
+}
+
+// SoulCard is the GET /memory/soul payload: the global persona plus the
+// user's style directives (category=soul).
+type SoulCard struct {
+	GlobalPersona SoulPersona   `json:"global_persona"`
+	Adjustments   []*MemoryFact `json:"adjustments"`
+}
+
+// MemoryProfileSection is one grouped card of the User profile.
+type MemoryProfileSection struct {
+	Key   string        `json:"key"`
+	Items []*MemoryFact `json:"items"`
+}
+
+// ProfileCard is the GET /memory/profile payload. Completeness is the
+// weighted share of non-empty sections (identity/role weigh double).
+type ProfileCard struct {
+	Sections     []*MemoryProfileSection `json:"sections"`
+	Completeness float64                 `json:"completeness"`
+}
+
+// AgentFeedbackItem is one raw feedback fact annotated with the skill it was
+// upgraded into (matched by extraction turn: same session + message ID).
+type AgentFeedbackItem struct {
+	*MemoryFact
+	UpgradedTo string `json:"upgraded_to,omitempty"`
+}
+
+// AgentTipsCard is the GET /memory/agent-tips payload: distilled skills plus
+// the raw feedback wall.
+type AgentTipsCard struct {
+	Skills        []*MemoryFact        `json:"skills"`
+	Feedback      []*AgentFeedbackItem `json:"feedback"`
+	FeedbackTotal int64                `json:"feedback_total"`
 }

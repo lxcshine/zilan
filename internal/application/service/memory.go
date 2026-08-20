@@ -34,8 +34,13 @@ const memoryExtractionMaxContentChars = 2000
 // in config/prompt_templates/memory_extraction.yaml.
 const defaultMemoryExtractionPrompt = `You maintain the long-term memory of an AI assistant.
 Analyze the user-provided conversation excerpt and extract memories worth
-persisting (categories: profile, fact, preference, todo, feedback), plus a
-refreshed rolling session summary. Output JSON only:
+persisting (categories: profile, fact, preference, todo, feedback, soul,
+skill), plus a refreshed rolling session summary. soul = an explicit user
+directive about the assistant's own behavior (how to address the user, tone,
+format); skill = a behavioral rule distilled from explicit user feedback or
+instruction, subject "assistant", confidence >= 0.7 only. When the user
+criticizes or prescribes answer behavior, emit BOTH the raw feedback and the
+distilled skill. Output JSON only:
 {"memories":[{"category":"...","subject":"...","predicate":"...","object":"...","content":"...","confidence":0.0,"importance":0.0,"due_at":""}],"session_summary":"...","key_topics":["..."]}
 Never fabricate; at most 5 memories; empty array when nothing is worth remembering.`
 
@@ -398,6 +403,16 @@ func (s *memoryService) upsertExtractedFacts(
 		if content == "" {
 			continue
 		}
+		// Skills are high-leverage: a hallucinated "assistant lesson" would
+		// steer every future answer, so they require explicit evidence.
+		if item.Category == types.MemoryCategorySkill && item.Confidence < 0.7 {
+			continue
+		}
+		// Skills are always assistant-subject so they can never collide with
+		// user-fact triple hashes.
+		if item.Category == types.MemoryCategorySkill {
+			item.Subject = "assistant"
+		}
 		fact := &types.MemoryFact{
 			TenantID:   payload.TenantID,
 			UserID:     payload.UserID,
@@ -566,6 +581,15 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 		semantic := 0.0
 		if len(queryEmbedding) > 0 && len(fact.Embedding) > 0 {
 			semantic = types.Cosine(queryEmbedding, fact.Embedding)
+			// Soul directives are persona-level: they must inject even when
+			// topically unrelated to the current query, so their semantic
+			// signal is boosted (PRD P0-2 FR2).
+			if fact.Category == types.MemoryCategorySoul {
+				semantic *= 1.5
+				if semantic > 1 {
+					semantic = 1
+				}
+			}
 		}
 		reference := fact.UpdatedAt
 		if fact.LastAccessedAt != nil && fact.LastAccessedAt.After(reference) {
@@ -587,9 +611,7 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 	}
 
 	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
-	if len(scored) > limit {
-		scored = scored[:limit]
-	}
+	scored = selectRecalledWithSoulQuota(scored, limit)
 
 	// Bump access stats fire-and-forget so frequently recalled memories rank
 	// higher over time. Use WithoutCancel: the HTTP request may end first.
@@ -614,23 +636,98 @@ func recalledFactIDs(memories []*types.RecalledMemory) []string {
 	return ids
 }
 
-// FormatRecalledForPrompt renders recalled memories as a system-prompt block.
+// soulOverflowTolerance bounds how far the final recall set may exceed the
+// regular limit when soul directives are appended (PRD P0-2 FR2: total ≤
+// DefaultMemoryRecallLimit + 2).
+const soulOverflowTolerance = 2
+
+// soulQuotaMax is the defensive ceiling on soul directives in one recall
+// set. Soul directives are few by nature; the cap guards against runaway
+// persona memories, it is not an expected operating point.
+const soulQuotaMax = 4
+
+// selectRecalledWithSoulQuota picks the final recall set from the ranked
+// candidates: soul directives have their own quota (they are persona-level
+// and must not be pushed out by topical memories), everything else takes the
+// top `limit` by score. Total is bounded at limit + soulOverflowTolerance.
+func selectRecalledWithSoulQuota(ranked []*types.RecalledMemory, limit int) []*types.RecalledMemory {
+	souls := 0
+	others := 0
+	totalCap := limit + soulOverflowTolerance
+	selected := make([]*types.RecalledMemory, 0, totalCap)
+	for _, m := range ranked {
+		if others+souls >= totalCap {
+			// Total budget exhausted (PRD FR2: total ≤ limit + 2).
+			break
+		}
+		isSoul := m.Kind == "fact" && m.Fact != nil && m.Fact.Category == types.MemoryCategorySoul
+		if isSoul {
+			if souls >= soulQuotaMax {
+				continue
+			}
+			souls++
+		} else {
+			if others >= limit {
+				// Keep scanning: later soul directives can still fill the
+				// soul quota.
+				continue
+			}
+			others++
+		}
+		selected = append(selected, m)
+	}
+	return selected
+}
+
+// Per-module injection budgets (PRD P0-2 FR2). Soul directives are few and
+// stable, so they inject in full; the user profile takes its most important
+// rows; skills inject by importance x confidence.
+const (
+	// memoryInjectProfileMax bounds the 用户档案 block (identity/role rows).
+	memoryInjectProfileMax = 4
+	// memoryInjectSkillMax bounds the 助手经验 block.
+	memoryInjectSkillMax = 3
+)
+
+// factLine renders one fact as a prompt bullet; todos carry their deadline.
+func factLine(fact *types.MemoryFact) string {
+	line := "- " + fact.Content
+	if fact.Category == types.MemoryCategoryTodo && fact.DueAt != nil {
+		line += fmt.Sprintf("（截止 %s）", fact.DueAt.Format("2006-01-02"))
+	}
+	return line
+}
+
+// FormatRecalledForPrompt renders recalled memories as a system-prompt block,
+// grouped into the four memory modules with fixed section order and
+// per-module budgets (soul directives → user profile → memory stream →
+// assistant skills). Raw feedback is archived for audit but never injected —
+// only its distilled skill is.
 func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory) string {
 	if len(memories) == 0 {
 		return ""
 	}
-	var facts, summaries []string
+
+	var soul, profile, memoryFacts, skills, summaries []string
+	var profileFacts, skillFacts []*types.MemoryFact
 	for _, m := range memories {
 		switch m.Kind {
 		case "fact":
 			if m.Fact == nil {
 				continue
 			}
-			line := "- " + m.Fact.Content
-			if m.Fact.Category == types.MemoryCategoryTodo && m.Fact.DueAt != nil {
-				line += fmt.Sprintf("（截止 %s）", m.Fact.DueAt.Format("2006-01-02"))
+			switch m.Fact.Category {
+			case types.MemoryCategorySoul:
+				soul = append(soul, factLine(m.Fact))
+			case types.MemoryCategoryProfile, types.MemoryCategoryFact:
+				profileFacts = append(profileFacts, m.Fact)
+			case types.MemoryCategorySkill:
+				skillFacts = append(skillFacts, m.Fact)
+			case types.MemoryCategoryFeedback:
+				// Never injected: the distilled skill carries the lesson.
+			default:
+				memoryFacts = append(memoryFacts, factLine(m.Fact))
 			}
-			facts = append(facts, line)
 		case "session_summary":
 			if m.Summary == nil {
 				continue
@@ -638,26 +735,60 @@ func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory
 			summaries = append(summaries, "- "+m.Summary.Summary)
 		}
 	}
-	if len(facts) == 0 && len(summaries) == 0 {
+
+	// 用户档案: importance-ordered, bounded.
+	sort.SliceStable(profileFacts, func(i, j int) bool {
+		return profileFacts[i].Importance > profileFacts[j].Importance
+	})
+	if len(profileFacts) > memoryInjectProfileMax {
+		profileFacts = profileFacts[:memoryInjectProfileMax]
+	}
+	for _, f := range profileFacts {
+		profile = append(profile, factLine(f))
+	}
+
+	// 助手经验: importance × confidence, bounded (PRD FR2, M=3).
+	sort.SliceStable(skillFacts, func(i, j int) bool {
+		return skillFacts[i].Importance*skillFacts[i].Confidence > skillFacts[j].Importance*skillFacts[j].Confidence
+	})
+	if len(skillFacts) > memoryInjectSkillMax {
+		skillFacts = skillFacts[:memoryInjectSkillMax]
+	}
+	for _, f := range skillFacts {
+		skills = append(skills, factLine(f))
+	}
+
+	if len(soul)+len(profile)+len(memoryFacts)+len(skills)+len(summaries) == 0 {
 		return ""
 	}
+
+	writeSection := func(b *strings.Builder, title string, lines []string) {
+		if len(lines) == 0 {
+			return
+		}
+		b.WriteString("\n")
+		b.WriteString(title)
+		b.WriteString("\n")
+		for _, l := range lines {
+			b.WriteString(l)
+			b.WriteString("\n")
+		}
+	}
+
 	var b strings.Builder
 	b.WriteString("## 关于用户的长期记忆\n")
 	b.WriteString("以下来自历史对话的记忆可能与本问题相关，请在回答时自然地利用，不要逐字复述：\n")
-	if len(facts) > 0 {
-		b.WriteString("\n用户事实与偏好：\n")
-		for _, f := range facts {
-			b.WriteString(f)
-			b.WriteString("\n")
-		}
-	}
+	writeSection(&b, "### 助手风格指令（用户设定）", soul)
+	writeSection(&b, "### 用户档案", profile)
+	writeSection(&b, "### 相关长期记忆", memoryFacts)
 	if len(summaries) > 0 {
 		b.WriteString("\n相关历史对话摘要：\n")
-		for _, s := range summaries {
-			b.WriteString(s)
+		for _, l := range summaries {
+			b.WriteString(l)
 			b.WriteString("\n")
 		}
 	}
+	writeSection(&b, "### 助手经验", skills)
 	return b.String()
 }
 
@@ -674,6 +805,217 @@ func (s *memoryService) ListFacts(
 		return nil, 0, fmt.Errorf("memory scope unavailable")
 	}
 	return s.memoryRepo.ListFacts(ctx, tenantID, userID, q)
+}
+
+// ---------------------------------------------------------------------------
+// Four-module aggregation surface (P0-2)
+// ---------------------------------------------------------------------------
+
+// GetModuleOverview returns per-module active fact counts plus the L2
+// summary count on the memory module. Two DB round trips total.
+func (s *memoryService) GetModuleOverview(ctx context.Context) ([]*types.MemoryModuleOverview, error) {
+	tenantID, userID, ok := memoryScopeFromContext(ctx)
+	if !ok {
+		return nil, fmt.Errorf("memory scope unavailable")
+	}
+	byCategory, err := s.memoryRepo.CountActiveFactsByCategory(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+	summaryCount, err := s.memoryRepo.CountSessionSummaries(ctx, tenantID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	overview := make([]*types.MemoryModuleOverview, 0, 4)
+	var memoryCount int64
+	for _, module := range []string{
+		types.MemoryModuleSoul, types.MemoryModuleUser, types.MemoryModuleMemory, types.MemoryModuleAgent,
+	} {
+		var count int64
+		for category, n := range byCategory {
+			if types.MemoryModuleOf(category) == module {
+				count += n
+			}
+			if module == types.MemoryModuleMemory {
+				// The memory stream module covers every fact.
+				memoryCount += n
+			}
+		}
+		row := &types.MemoryModuleOverview{Module: module, FactCount: count}
+		if module == types.MemoryModuleMemory {
+			row.FactCount = memoryCount
+			row.SummaryCount = summaryCount
+		}
+		overview = append(overview, row)
+	}
+	return overview, nil
+}
+
+// resolveGlobalPersona loads the default system-prompt template as the
+// read-only global persona; empty when no template is configured (the Soul
+// card degrades to the adjustments list only).
+func (s *memoryService) resolveGlobalPersona() types.SoulPersona {
+	if s.cfg == nil || s.cfg.PromptTemplates == nil {
+		return types.SoulPersona{}
+	}
+	templates := s.cfg.PromptTemplates.SystemPrompt
+	var chosen *config.PromptTemplate
+	for i := range templates {
+		if templates[i].Default {
+			chosen = &templates[i]
+			break
+		}
+	}
+	if chosen == nil && len(templates) > 0 {
+		chosen = &templates[0]
+	}
+	if chosen == nil {
+		return types.SoulPersona{}
+	}
+	return types.SoulPersona{
+		Name:        chosen.Name,
+		Description: chosen.Description,
+		Content:     chosen.Content,
+	}
+}
+
+// GetSoulCard returns the global persona plus the user's style directives.
+func (s *memoryService) GetSoulCard(ctx context.Context) (*types.SoulCard, error) {
+	adjustments, _, err := s.ListFacts(ctx, &types.MemoryFactQuery{
+		Category: types.MemoryCategorySoul,
+		Page:     1,
+		PageSize: 100,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if adjustments == nil {
+		adjustments = []*types.MemoryFact{}
+	}
+	return &types.SoulCard{
+		GlobalPersona: s.resolveGlobalPersona(),
+		Adjustments:   adjustments,
+	}, nil
+}
+
+// profileSectionOrder is the fixed section order of the User profile card.
+var profileSectionOrder = []string{
+	types.MemoryProfileSectionIdentity,
+	types.MemoryProfileSectionRole,
+	types.MemoryProfileSectionPreference,
+	types.MemoryProfileSectionFact,
+}
+
+// GetProfileCard groups the user's profile/fact/preference memories into the
+// four profile sections (identity, role, preference, fact) and computes the
+// weighted completeness (identity/role weigh double).
+func (s *memoryService) GetProfileCard(ctx context.Context) (*types.ProfileCard, error) {
+	var facts []*types.MemoryFact
+	for _, category := range []string{
+		types.MemoryCategoryProfile, types.MemoryCategoryFact, types.MemoryCategoryPreference,
+	} {
+		items, _, err := s.ListFacts(ctx, &types.MemoryFactQuery{
+			Category: category,
+			Page:     1,
+			PageSize: 500,
+		})
+		if err != nil {
+			return nil, err
+		}
+		facts = append(facts, items...)
+	}
+
+	sections := make([]*types.MemoryProfileSection, 0, len(profileSectionOrder))
+	byKey := make(map[string]*types.MemoryProfileSection, len(profileSectionOrder))
+	for _, key := range profileSectionOrder {
+		section := &types.MemoryProfileSection{Key: key, Items: []*types.MemoryFact{}}
+		byKey[key] = section
+		sections = append(sections, section)
+	}
+	for _, fact := range facts {
+		key := types.MemoryProfileSectionOf(fact)
+		byKey[key].Items = append(byKey[key].Items, fact)
+	}
+
+	// Weighted completeness: identity/role weigh double (stable attributes
+	// define who the user is), preference/fact weigh 1.
+	completeness := 0.0
+	const totalWeight = 6.0
+	for _, section := range sections {
+		if len(section.Items) == 0 {
+			continue
+		}
+		switch section.Key {
+		case types.MemoryProfileSectionIdentity, types.MemoryProfileSectionRole:
+			completeness += 2
+		default:
+			completeness += 1
+		}
+	}
+	return &types.ProfileCard{Sections: sections, Completeness: completeness / totalWeight}, nil
+}
+
+// GetAgentTipsCard returns the distilled skills plus the raw feedback wall.
+// Feedback items are linked to the skill they were upgraded into via their
+// shared extraction turn (same session + message ID).
+func (s *memoryService) GetAgentTipsCard(ctx context.Context, page, pageSize int) (*types.AgentTipsCard, error) {
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	skills, _, err := s.ListFacts(ctx, &types.MemoryFactQuery{
+		Category: types.MemoryCategorySkill,
+		Page:     1,
+		PageSize: 200,
+	})
+	if err != nil {
+		return nil, err
+	}
+	feedback, feedbackTotal, err := s.ListFacts(ctx, &types.MemoryFactQuery{
+		Category: types.MemoryCategoryFeedback,
+		Page:     page,
+		PageSize: pageSize,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Upgrade linkage: a feedback and the skill distilled from it share the
+	// same extraction turn. When several skills share a turn, the strongest
+	// (highest importance) wins.
+	skillByTurn := make(map[string]*types.MemoryFact, len(skills))
+	for _, skill := range skills {
+		key := skill.SessionID + "|" + skill.MessageID
+		if existing, ok := skillByTurn[key]; ok && existing.Importance >= skill.Importance {
+			continue
+		}
+		skillByTurn[key] = skill
+	}
+
+	items := make([]*types.AgentFeedbackItem, 0, len(feedback))
+	for _, fb := range feedback {
+		item := &types.AgentFeedbackItem{MemoryFact: fb}
+		if skill, ok := skillByTurn[fb.SessionID+"|"+fb.MessageID]; ok && skill != nil && skill.ID != fb.ID {
+			item.UpgradedTo = skill.ID
+		}
+		items = append(items, item)
+	}
+
+	if skills == nil {
+		skills = []*types.MemoryFact{}
+	}
+	if items == nil {
+		items = []*types.AgentFeedbackItem{}
+	}
+	return &types.AgentTipsCard{
+		Skills:        skills,
+		Feedback:      items,
+		FeedbackTotal: feedbackTotal,
+	}, nil
 }
 
 // UpdateFact applies a user edit to one fact owned by the ctx user. Empty
@@ -840,7 +1182,9 @@ func validMemoryCategory(category string) bool {
 		types.MemoryCategoryFact,
 		types.MemoryCategoryPreference,
 		types.MemoryCategoryTodo,
-		types.MemoryCategoryFeedback:
+		types.MemoryCategoryFeedback,
+		types.MemoryCategorySoul,
+		types.MemoryCategorySkill:
 		return true
 	}
 	return false
