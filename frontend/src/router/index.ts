@@ -135,6 +135,12 @@ const router = createRouter({
           meta: { requiresInit: true, requiresAuth: true }
         },
         {
+          path: "memory",
+          name: "memoryList",
+          component: () => import("../views/memory/MemoryList.vue"),
+          meta: { requiresInit: true, requiresAuth: true }
+        },
+        {
           path: "integrations",
           redirect: (to) => ({
             path: "/platform/settings",

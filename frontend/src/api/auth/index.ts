@@ -99,6 +99,9 @@ export interface UserPreferences {
   // 偏好；后端在 Login / RefreshToken 时校验 membership 有效后才会沿用，
   // 否则回退到 home 并清掉这个字段。传 0 给 PATCH 表示「清除偏好」。
   last_active_tenant_id?: number | null
+  // memory_enabled 关闭长期记忆（停止抽取与召回注入）。nil = 未显式设置，
+  // 后端缺省视为开启（见 memoryService.IsEnabled）。
+  memory_enabled?: boolean | null
 }
 
 // 用户信息接口
