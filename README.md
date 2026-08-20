@@ -155,7 +155,8 @@ Product name, UI marks, browser titles, storage keys, JWT audience, webhook sign
     <td width="50%" align="center"><b>👥 Shared Space</b><br/><img src="./images/4.jpg" alt="Shared Space" width="100%"></td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><b>🧠 My Memory</b><br/><img src="./images/memory.jpg" alt="My Memory" width="100%"></td>
+    <td width="50%" align="center"><b>🧠 My Memory</b><br/><img src="./images/memory.jpg" alt="My Memory" width="100%"></td>
+    <td width="50%" align="center"><b>⚙️ System Settings</b><br/><img src="./images/settings.jpg" alt="System Settings" width="100%"></td>
   </tr>
 </table>
 

@@ -155,7 +155,8 @@ conversation:
     <td width="50%" align="center"><b>👥 共享空间</b><br/><img src="./images/4.jpg" alt="共享空间" width="100%"></td>
   </tr>
   <tr>
-    <td colspan="2" align="center"><b>🧠 我的记忆</b><br/><img src="./images/memory.jpg" alt="我的记忆" width="100%"></td>
+    <td width="50%" align="center"><b>🧠 我的记忆</b><br/><img src="./images/memory.jpg" alt="我的记忆" width="100%"></td>
+    <td width="50%" align="center"><b>⚙️ 系统设置</b><br/><img src="./images/settings.jpg" alt="系统设置" width="100%"></td>
   </tr>
 </table>
 
