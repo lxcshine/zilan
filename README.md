@@ -46,7 +46,7 @@ Zilan is a thorough re-imagination built on a battle-tested open-source knowledg
 - **🎨 A brand-new minimalist design language** — no clutter, no visual noise: a dark monochrome brand color (#333 family), large rounded corners, feather-light shadows, and pure solid backgrounds; one consistent visual system from the login page through chat streams to the settings center — quiet, restrained, and content-first
 - **📄 A deep document parsing pipeline** — structured PDF table extraction, mathematical formula recognition, and dual-column layout awareness; **automatic routing** selects parsing engine intensity per document profile, low-scoring results are retried with heavier engines, and stubborn documents land in a human review queue
 - **🕸️ GraphRAG-enhanced retrieval** — entity-relation storage on Neo4j; **community summaries + local subgraph retrieval** complement dense/sparse vector recall, widening coverage and explainability for complex multi-hop questions
-- **🧠 Memory & knowledge distillation system (work in progress)** — a three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; users can view, edit, and delete everything the AI remembers — GDPR-compliant by design
+- **🧠 Memory & knowledge distillation system** — a three-layer memory architecture: L1 working memory (current conversation), L2 short-term memory (vectorized summaries of recent conversations), L3 long-term memory (user profile + fact triples + to-dos); memories are extracted asynchronously after each session and injected into the system prompt scored by `semantic similarity × time decay × (1 + log(access count))`; the dedicated **My Memory** page lets users view, edit, and delete everything the AI remembers — GDPR-compliant by design
 - **🔐 An independent identity and protocol stack** — a fully self-owned namespace across branding, JWT audience (`aud=zilan`), webhook signature (`X-Zilan-Signature`), and embed SDK (`zilan-widget.js`) — zero upstream traces
 
 On top of that, Zilan inherits engineering capabilities proven through large-scale production use: multi-source ingestion (Feishu / Notion / Yuque / RSS, and growing), 20+ LLM provider integrations, a dozen IM channels, website embed widgets, a 4-tier RBAC role matrix with workspace audit logs, AES-256-GCM credential encryption at rest, full-stack Langfuse observability plus a runtime task-queue governance dashboard, and a fully self-hostable modular architecture — LLMs, vector databases, and storage backends are all swappable, keeping data sovereignty entirely yours.
@@ -79,7 +79,7 @@ On top of that, Zilan inherits engineering capabilities proven through large-sca
 
 Entities and relations are extracted into Neo4j at ingest time to build a knowledge graph; at query time, **community summaries** provide the global view while **local subgraph retrieval** supplies neighborhood detail — fused with BM25 / dense vector recall via RRF, markedly improving answers to multi-hop and cross-document aggregation questions.
 
-### 🧠 Memory & Knowledge Distillation (Work in Progress)
+### 🧠 Memory & Knowledge Distillation
 
 Toward a more personal, context-aware knowledge assistant, Zilan is building a three-layer memory architecture:
 
@@ -87,7 +87,16 @@ Toward a more personal, context-aware knowledge assistant, Zilan is building a t
 - **L2 short-term memory** — vectorized summaries of the last N conversations (pgvector), recalled by relevance at session start
 - **L3 long-term memory** — user profile, fact triples (subject-relation-object), and to-do items: structured tables + vector indexes + an optional image library
 
-Supporting mechanics: memory is **extracted asynchronously** after each session via the Asynq task queue (fact triples / to-dos / emotional feedback); injection scores each memory as `score = semantic similarity × time decay × (1 + log(access count))` and loads the Top-K into the system prompt; high-value conversations (favorited or heavily followed-up) auto-distill into Wiki pages linked back to the source session; and users can **view, edit, and delete** everything the AI remembers — GDPR / privacy compliant.
+Supporting mechanics: memory is **extracted asynchronously** after each session via the Asynq task queue (fact triples / to-dos / emotional feedback); injection scores each memory as `score = semantic similarity × time decay × (1 + log(access count))` and loads the Top-K into the system prompt; high-value conversations (favorited or heavily followed-up) auto-distill into Wiki pages linked back to the source session.
+
+The dedicated **My Memory** page makes long-term memory fully transparent and controllable:
+
+- **Browse & filter** — category tabs (profile / fact / preference / to-do / feedback) with per-category counts, keyword search, status filter (active / done / archived), and pagination; each card shows importance, confidence, recall count, and last-recall time
+- **Edit** — modify content, related object, importance, and status; content edits automatically re-embed the memory so recall follows the latest wording
+- **Delete & clear** — single-entry delete with confirmation, or clear everything behind a type-to-confirm guard (session rolling summaries cleared together, GDPR right-to-erasure)
+- **Global switch** — pause memory extraction & recall anytime; stored memories are kept and can be re-enabled later
+
+All operations are isolated per user and available in four languages (zh-CN / en-US / ru-RU / ko-KR) — GDPR / privacy compliant by design.
 
 ### 🧠 Context Management · IMA-Grade Five-Layer Intelligent Architecture
 
@@ -145,6 +154,9 @@ Product name, UI marks, browser titles, storage keys, JWT audience, webhook sign
     <td width="50%" align="center"><b>🤖 Agent</b><br/><img src="./images/3.jpg" alt="Agent" width="100%"></td>
     <td width="50%" align="center"><b>👥 Shared Space</b><br/><img src="./images/4.jpg" alt="Shared Space" width="100%"></td>
   </tr>
+  <tr>
+    <td colspan="2" align="center"><b>🧠 My Memory</b><br/><img src="./images/memory.jpg" alt="My Memory" width="100%"></td>
+  </tr>
 </table>
 
 ## 🏗️ Architecture
@@ -168,7 +180,7 @@ Fully modular pipeline from document parsing, vectorization, and retrieval to LL
 | Temporary Attachments | Session-scoped image / document uploads with async parsing for one-off Q&A, with a combined image + attachment limit |
 | Citations & RAG Progress | Inline citation popovers and a references drawer (web / KB source distinction), shared markdown rendering, and stage-by-stage RAG pipeline progress in chat |
 | Session Management | Filter and group sidebar sessions by source (Web / IM / Embed), with inline session-title rename |
-| Memory & Personalization | Three-layer memory architecture in progress (see [Highlights](#-memory--knowledge-distillation-work-in-progress)) targeting cross-session personalization and proactive knowledge distillation |
+| Memory & Personalization | Three-layer memory architecture (see [Highlights](#-memory--knowledge-distillation)): async fact extraction, scored recall injection, and a dedicated My Memory page for browsing / editing / deleting memories with a global memory switch |
 
 **Knowledge Management**
 
