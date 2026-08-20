@@ -1,8 +1,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./images/logo-lockup-dark.svg">
-  <img src="./images/logo-lockup.svg" alt="知澜 Zilan" width="380">
+  <source media="(prefers-color-scheme: dark)" srcset="./images/logo-lockup-dark.svg?v=2">
+  <img src="./images/logo-lockup.svg?v=2" alt="知澜 Zilan" width="380">
 </picture>
 
 **知识汇聚成澜，让每一份文档活起来**
