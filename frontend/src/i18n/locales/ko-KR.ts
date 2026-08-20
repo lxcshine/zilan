@@ -54,6 +54,10 @@ export default {
     switchFailed: "설정 변경에 실패했습니다. 잠시 후 다시 시도해 주세요",
     disabledBanner: "기억 기능이 꺼져 있습니다: 저장된 기억은 사라지지 않지만, 어시스턴트가 새로운 기억을 추출하고 회상하는 것을 중단합니다.",
     searchPlaceholder: "기억 검색",
+    resident: {
+      badge: "상시",
+      tooltip: "상시 주입: 질문 관련성과 무관하게 매번 대화에 자동으로 포함됩니다",
+    },
     categories: {
       all: "전체",
       profile: "프로필",
@@ -89,6 +93,7 @@ export default {
     profile: {
       completeness: "프로필 완성도",
       completenessHint: "대화할수록 자동으로 채워집니다",
+      residentHint: "프로필·선호·스타일 지시는 매번 대화에 상시 주입되어 자기소개를 반복할 필요가 없습니다",
       sections: {
         identity: "신원",
         role: "직무",
@@ -6725,7 +6730,7 @@ export default {
 	      capabilityManageVectorStores: "검색 인프라 관리",
 	      capabilityManageVectorStoresHint: "벡터 스토어 설정과 파서, 문서 리더, 스토리지 엔진 연결 검사를 관리합니다.",
 	      capabilityManageStorageBackends: "스토리지 백엔드 관리",
-	      capabilityManageStorageBackendsHint: "객체/파일 스토리지 백엔드 인스턴스(예: S3 호환 또는 로컬 파일 스토리지)의 CRUD, 연결 테스트 및 테넌트 기본 스토리지 설정을 관리합니다.",
+	      capabilityManageStorageBackendsHint: "객체/파일 스토리지 백엔드 인스턴스(예: S3 호환 또는 로컬 파일 스토리지)의 CRUD, 연결 테스트 및 워크스페이스 기본 스토리지 설정을 관리합니다.",
 	      capabilityManageWebSearch: "웹 검색 관리",
 	      capabilityManageWebSearchHint: "웹 검색 공급자 설정, 자격 증명 및 연결 테스트를 관리합니다.",
 	      capabilityRunEvaluations: "평가 실행",

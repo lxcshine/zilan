@@ -54,6 +54,10 @@ export default {
     switchFailed: 'Failed to update the setting, please try again later',
     disabledBanner: 'Memory is turned off: saved memories are kept, but the assistant will stop extracting and recalling memories.',
     searchPlaceholder: 'Search memories',
+    resident: {
+      badge: 'Always-on',
+      tooltip: 'Always-on injection: included in every conversation regardless of question relevance',
+    },
     categories: {
       all: 'All',
       profile: 'Profile',
@@ -89,6 +93,7 @@ export default {
     profile: {
       completeness: 'Profile Completeness',
       completenessHint: 'Filled in automatically as you chat',
+      residentHint: 'Profile, preferences and style directives are injected into every conversation — no need to reintroduce yourself',
       sections: {
         identity: 'Identity',
         role: 'Role',
@@ -6725,7 +6730,7 @@ export default {
 	      capabilityManageVectorStores: 'Manage retrieval infrastructure',
 	      capabilityManageVectorStoresHint: 'Manage vector-store configuration plus parser, document reader, and storage engine connectivity checks.',
 	      capabilityManageStorageBackends: 'Manage storage backends',
-	      capabilityManageStorageBackendsHint: 'Manage object/file storage backend instances (e.g. S3-compatible or local file storage): their CRUD lifecycle, connectivity tests, and the tenant default selection.',
+	      capabilityManageStorageBackendsHint: 'Manage object/file storage backend instances (e.g. S3-compatible or local file storage): their CRUD lifecycle, connectivity tests, and the workspace default selection.',
 	      capabilityManageWebSearch: 'Manage web search',
 	      capabilityManageWebSearchHint: 'Manage web-search provider configurations, credentials, and connection tests.',
 	      capabilityRunEvaluations: 'Run evaluations',

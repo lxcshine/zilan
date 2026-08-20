@@ -65,15 +65,29 @@ func (p *PluginMemoryRecall) OnEvent(ctx context.Context,
 	chatManage.MemoryContext = block
 
 	pipelineInfo(ctx, "MemoryRecall", "injected", map[string]interface{}{
-		"session_id":         chatManage.SessionID,
-		"memory_count":       len(memories),
-		"block_chars":        len(block),
-		"block_chars_soul":   injectedCharsByModule(memories, types.MemoryCategorySoul),
-		"block_chars_user":   injectedCharsByModule(memories, types.MemoryCategoryProfile) + injectedCharsByModule(memories, types.MemoryCategoryFact),
-		"block_chars_memory": injectedCharsByModule(memories, types.MemoryCategoryPreference) + injectedCharsByModule(memories, types.MemoryCategoryTodo),
-		"block_chars_agent":  injectedCharsByModule(memories, types.MemoryCategorySkill),
+		"session_id":             chatManage.SessionID,
+		"memory_count":           len(memories),
+		"memory_count_resident":  residentCount(memories),
+		"memory_count_semantic":  len(memories) - residentCount(memories),
+		"block_chars":            len(block),
+		"block_chars_soul":       injectedCharsByModule(memories, types.MemoryCategorySoul),
+		"block_chars_user":       injectedCharsByModule(memories, types.MemoryCategoryProfile) + injectedCharsByModule(memories, types.MemoryCategoryFact),
+		"block_chars_memory":     injectedCharsByModule(memories, types.MemoryCategoryPreference) + injectedCharsByModule(memories, types.MemoryCategoryTodo),
+		"block_chars_agent":      injectedCharsByModule(memories, types.MemoryCategorySkill),
 	})
 	return next()
+}
+
+// residentCount counts always-inject memories in the recall set (PRD P0-3
+// FR3: dual-path observability).
+func residentCount(memories []*types.RecalledMemory) int {
+	count := 0
+	for _, m := range memories {
+		if m.Resident {
+			count++
+		}
+	}
+	return count
 }
 
 // injectedCharsByModule sums the rendered content length of injected facts of

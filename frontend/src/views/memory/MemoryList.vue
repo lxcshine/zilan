@@ -301,6 +301,10 @@
                   class="memory-profile-progress"
                 />
                 <div class="memory-profile-hint">{{ t('memory.profile.completenessHint') }}</div>
+                <div class="memory-profile-resident-hint">
+                  <t-icon name="root-list" size="12px" />
+                  <span>{{ t('memory.profile.residentHint') }}</span>
+                </div>
               </div>
 
               <!-- 四个分组卡 -->
@@ -1637,6 +1641,20 @@ onBeforeUnmount(() => {
   color: var(--td-text-color-placeholder);
   font-size: 12px;
   line-height: 18px;
+}
+
+.memory-profile-resident-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 0 8px;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--td-brand-color-1);
+  color: var(--td-brand-color-6);
+  font-size: 12px;
+  line-height: 22px;
 }
 
 .memory-profile-grid {

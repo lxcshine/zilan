@@ -54,6 +54,10 @@ export default {
     switchFailed: "设置失败，请稍后重试",
     disabledBanner: "记忆功能已关闭：已保存的记忆不会丢失，但助手将暂停提取与召回新记忆。",
     searchPlaceholder: "搜索记忆内容",
+    resident: {
+      badge: "常驻",
+      tooltip: "常驻注入：不依赖提问相关性，每次对话都会自动带上这条记忆",
+    },
     categories: {
       all: "全部",
       profile: "个人档案",
@@ -89,6 +93,7 @@ export default {
     profile: {
       completeness: "档案完整度",
       completenessHint: "持续对话自动补全，无需手动填写",
+      residentHint: "档案、偏好与风格指令常驻每次对话，无需反复自我介绍",
       sections: {
         identity: "身份",
         role: "职责",
@@ -6778,7 +6783,7 @@ export default {
 	      capabilityManageVectorStores: "管理检索基础设施",
 	      capabilityManageVectorStoresHint: "允许管理向量库配置，以及解析器、文档读取器和存储引擎连通性检查。",
 	      capabilityManageStorageBackends: "管理存储后端",
-	      capabilityManageStorageBackendsHint: "允许管理对象/文件存储后端实例（如 S3 兼容或本地文件存储）的增删改查、连通性测试及租户默认存储设置。",
+	      capabilityManageStorageBackendsHint: "允许管理对象/文件存储后端实例（如 S3 兼容或本地文件存储）的增删改查、连通性测试及工作区默认存储设置。",
 	      capabilityManageWebSearch: "管理联网搜索",
 	      capabilityManageWebSearchHint: "允许管理联网搜索供应商配置、凭据和连接测试。",
 	      capabilityRunEvaluations: "运行评测",

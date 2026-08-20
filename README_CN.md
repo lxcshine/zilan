@@ -128,7 +128,7 @@
 - **检索上下文优化** — 相关性分层渲染（高相关全文 / 中相关前一半 / 低相关仅标题摘要）、基于 Embedding 余弦相似度的语义去重、完整章节路径引用溯源
 - **Agent 上下文治理** — 超限工具结果先做 Inner Summary 再注入、ReAct Scratchpad 周期检查点压缩、结构化 JSON 工具输出规整，Long-context 场景更省 token、更准推理
 
-可在 `config/config.yaml` 中全局开启，也支持按租户定制：
+可在 `config/config.yaml` 中全局开启，也支持按工作区定制：
 
 ```yaml
 conversation:
@@ -235,7 +235,7 @@ conversation:
 |------|------|
 | 部署 | 本地 / Docker / Kubernetes (Helm)，支持私有化离线部署 |
 | 界面 | Web UI / RESTful API / 网站嵌入 Widget；知澜极简设计语言全链路覆盖 |
-| 权限控制 | 空间 RBAC 四级角色矩阵（Owner / Admin / Contributor / Viewer），按知识库的资源归属，每空间审计日志，invite-only 准入，无租户预置与受控自助创建工作区，管理员密码重置（会话吊销），跨空间超级管理员，权限范围 API Key |
+| 权限控制 | 空间 RBAC 四级角色矩阵（Owner / Admin / Contributor / Viewer），按知识库的资源归属，每空间审计日志，invite-only 准入，无工作区预置与受控自助创建工作区，管理员密码重置（会话吊销），跨空间超级管理员，权限范围 API Key |
 | 安全 | API Key 与 MCP / 数据源凭据 AES-256-GCM 静态加密、支持平滑密钥轮换；app ↔ docreader gRPC TLS + Token；Redis TLS；防 SSRF HTTP 客户端（覆盖数据源、URL 导入、重定向链等）；密钥响应脱敏；Agent 技能沙箱隔离 |
 | 可观测性 | 集成 Langfuse（唯一追踪后端）以追踪 ReAct 循环、Token 消耗、工具调用和任务流水线；内置 Langfuse 风格的文档解析追踪时间线，逐阶段展示解析进度；系统管理员运行时任务队列面板（队列深度、按模型并发、失败任务排查与手动重试） |
 | 任务管理 | MQ 异步任务，分阶段独立 Worker 池治理（core / 后处理 / enrichment / maintenance + 弹性共享池，Wiki 独立池）与按模型后台并发治理；版本升级自动数据库迁移 |

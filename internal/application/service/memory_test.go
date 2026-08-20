@@ -157,6 +157,12 @@ func newMemoryServiceForTest(t *testing.T) (*memoryService, *gorm.DB, *memoryFak
 
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
+	// Pin the pool to one connection: each fresh sqlite ":memory:" connection
+	// is an empty database, so concurrent Recall + background TouchFacts would
+	// otherwise hit "no such table" on a second pooled connection.
+	if sqlDB, dbErr := db.DB(); dbErr == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
 	require.NoError(t, db.AutoMigrate(&types.MemoryFact{}, &types.MemorySessionSummary{}))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_memory_facts_triple
 		ON memory_facts(tenant_id, user_id, triple_hash)
@@ -353,11 +359,13 @@ func TestMemoryServiceRecallRanksByScore(t *testing.T) {
 	now := time.Now()
 	embedder := &memoryFakeEmbedder{}
 
-	// Two facts: one recent+matching, one stale and unrelated.
+	// Semantic path: one recent+matching fact, one stale and unrelated fact.
+	// Resident path: one preference that leads the merged set regardless of
+	// the query (PRD P0-3 §3.2).
 	matching, err := embedder.Embed(ctx, "用户偏好 Python 异步框架")
 	require.NoError(t, err)
 	recent := &types.MemoryFact{
-		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryPreference,
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryFact,
 		Subject: "用户", Predicate: "偏好", Object: "Python 异步框架",
 		Content: "用户偏好 Python 异步框架", Importance: 0.6, Confidence: 0.9,
 		Embedding: types.VectorBlob(matching), AccessCount: 3,
@@ -367,8 +375,14 @@ func TestMemoryServiceRecallRanksByScore(t *testing.T) {
 		Subject: "用户", Predicate: "提过", Object: "完全不相关的旧事实",
 		Content: "完全不相关的旧事实 zzqxv", Importance: 0.2, Confidence: 0.5,
 	}
+	pref := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryPreference,
+		Subject: "用户", Predicate: "偏好", Object: "Helm 部署",
+		Content: "用户偏好用 Helm 管理部署", Importance: 0.5, Confidence: 0.8,
+	}
 	require.NoError(t, svc.memoryRepo.CreateFact(ctx, recent))
 	require.NoError(t, svc.memoryRepo.CreateFact(ctx, stale))
+	require.NoError(t, svc.memoryRepo.CreateFact(ctx, pref))
 	// Backdate the stale fact by ~10 days so time decay suppresses it.
 	old := now.Add(-10 * 24 * time.Hour)
 	require.NoError(t, db.Model(&types.MemoryFact{}).Where("id = ?", stale.ID).
@@ -382,7 +396,140 @@ func TestMemoryServiceRecallRanksByScore(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, got)
 	require.Equal(t, "fact", got[0].Kind)
-	require.Equal(t, recent.ID, got[0].Fact.ID, "semantically matching + recent fact must rank first")
+	require.Equal(t, pref.ID, got[0].Fact.ID, "resident preference leads the merged set")
+	require.True(t, got[0].Resident)
+	require.Equal(t, recent.ID, got[1].Fact.ID, "semantically matching + recent fact ranks first on the semantic path")
+	require.False(t, got[1].Resident)
+}
+
+func TestMemoryServiceRecallResidentPath(t *testing.T) {
+	svc, db, _, _, _, _ := newMemoryServiceForTest(t)
+	ctx := memoryTestCtx()
+	now := time.Now()
+	embedder := &memoryFakeEmbedder{}
+
+	// A profile attribute backdated far beyond the 10-half-life window must
+	// still inject (the resident path has no recency window); a fact-category
+	// row backdated the same way must not. The query is deliberately
+	// topically unrelated — residency must not depend on semantics.
+	profileEmb, err := embedder.Embed(ctx, "用户是 XX 公司运维负责人")
+	require.NoError(t, err)
+	profile := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryProfile,
+		Subject: "用户", Predicate: "是", Object: "XX 公司运维负责人",
+		Content: "用户是 XX 公司运维负责人", Importance: 0.7, Confidence: 0.9,
+		Embedding: types.VectorBlob(profileEmb),
+	}
+	soul := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategorySoul,
+		Subject: "assistant", Predicate: "称呼", Object: "张工",
+		Content: "称呼用户为张工", Importance: 0.8, Confidence: 0.9,
+	}
+	skill := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategorySkill,
+		Subject: "assistant", Predicate: "回答风格", Object: "先给结论",
+		Content: "给该用户的回答先给结论再展开", Importance: 0.8, Confidence: 0.9,
+	}
+	oldFact := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryFact,
+		Subject: "用户", Predicate: "提过", Object: "窗口外的旧事实",
+		Content: "窗口外的旧事实", Importance: 0.9, Confidence: 0.9,
+	}
+	for _, f := range []*types.MemoryFact{profile, soul, skill, oldFact} {
+		require.NoError(t, svc.memoryRepo.CreateFact(ctx, f))
+	}
+	// Backdate everything beyond 10 half-lives (300 days).
+	ancient := now.Add(-400 * 24 * time.Hour)
+	require.NoError(t, db.Model(&types.MemoryFact{}).Where("user_id = ?", "alice").
+		Updates(map[string]interface{}{"updated_at": ancient, "created_at": ancient}).Error)
+
+	queryVec, err := embedder.Embed(ctx, "写一首关于春天的诗")
+	require.NoError(t, err)
+	got, err := svc.Recall(ctx, &types.MemoryRecallParams{
+		Query: "写一首关于春天的诗", QueryEmbedding: queryVec, Now: now,
+	})
+	require.NoError(t, err)
+
+	ids := make(map[string]bool)
+	for _, m := range got {
+		ids[m.Fact.ID] = true
+	}
+	require.True(t, ids[profile.ID], "resident profile injects on an unrelated query beyond the recency window")
+	require.True(t, ids[soul.ID], "soul directives are resident (supersedes the P0-2 quota mitigation)")
+	require.True(t, ids[skill.ID], "distilled skills are resident")
+	require.False(t, ids[oldFact.ID], "episodic facts stay bounded by the semantic recency window")
+	for _, m := range got {
+		require.True(t, m.Resident, "everything recalled here came from the resident path")
+	}
+}
+
+func TestMemoryServiceRecallResidentCategoryFilter(t *testing.T) {
+	svc, _, _, _, _, _ := newMemoryServiceForTest(t)
+	ctx := memoryTestCtx()
+	now := time.Now()
+
+	profile := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryProfile,
+		Subject: "用户", Predicate: "是", Object: "运维工程师",
+		Content: "用户是运维工程师", Importance: 0.7, Confidence: 0.9,
+	}
+	fact := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryFact,
+		Subject: "用户", Predicate: "提过", Object: "近期事实",
+		Content: "用户近期提到的事实", Importance: 0.6, Confidence: 0.8,
+	}
+	require.NoError(t, svc.memoryRepo.CreateFact(ctx, profile))
+	require.NoError(t, svc.memoryRepo.CreateFact(ctx, fact))
+
+	// Categories=[soul]: resident path only, nothing matches.
+	got, err := svc.Recall(ctx, &types.MemoryRecallParams{
+		Query: "q", Categories: []string{types.MemoryCategorySoul}, Now: now,
+	})
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	// Categories=[profile]: resident path returns the profile row.
+	got, err = svc.Recall(ctx, &types.MemoryRecallParams{
+		Query: "q", Categories: []string{types.MemoryCategoryProfile}, Now: now,
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, profile.ID, got[0].Fact.ID)
+	require.True(t, got[0].Resident)
+
+	// Categories=[fact]: semantic path only.
+	got, err = svc.Recall(ctx, &types.MemoryRecallParams{
+		Query: "q", Categories: []string{types.MemoryCategoryFact}, Now: now,
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, fact.ID, got[0].Fact.ID)
+	require.False(t, got[0].Resident)
+}
+
+func TestMemoryServiceRecallArchivedExitsResidency(t *testing.T) {
+	svc, _, _, _, _, _ := newMemoryServiceForTest(t)
+	ctx := memoryTestCtx()
+	now := time.Now()
+
+	active := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryPreference,
+		Subject: "用户", Predicate: "偏好", Object: "Python",
+		Content: "用户偏好 Python", Importance: 0.6, Confidence: 0.8,
+	}
+	archived := &types.MemoryFact{
+		TenantID: 1, UserID: "alice", SessionID: "s-1", Category: types.MemoryCategoryProfile,
+		Subject: "用户", Predicate: "是", Object: "过时职位",
+		Content: "用户曾担任过时职位", Importance: 0.7, Confidence: 0.9,
+		Status: types.MemoryStatusArchived,
+	}
+	require.NoError(t, svc.memoryRepo.CreateFact(ctx, active))
+	require.NoError(t, svc.memoryRepo.CreateFact(ctx, archived))
+
+	got, err := svc.Recall(ctx, &types.MemoryRecallParams{Query: "q", Now: now})
+	require.NoError(t, err)
+	require.Len(t, got, 1, "archived profile exits the resident set (P0-1 status closed loop)")
+	require.Equal(t, active.ID, got[0].Fact.ID)
 }
 
 func TestMemoryServiceRecallDisabledReturnsNil(t *testing.T) {
@@ -617,6 +764,31 @@ func TestMemoryServiceFormatRecalledForPromptProfileBudget(t *testing.T) {
 	require.NotContains(t, block, "档案条目 1")
 }
 
+func TestMemoryServiceFormatRecalledForPromptProfileGuarantee(t *testing.T) {
+	svc, _, _, _, _, _ := newMemoryServiceForTest(t)
+
+	// A low-importance resident profile row must not be pushed out of the
+	// 用户档案 block by higher-importance semantic fact rows (PRD P0-3 FR2):
+	// profile renders first, facts fill the remaining slots.
+	memories := []*types.RecalledMemory{
+		{Kind: "fact", Fact: &types.MemoryFact{
+			Category: types.MemoryCategoryProfile, Content: "用户是 XX 公司运维负责人", Importance: 0.3,
+		}, Resident: true},
+	}
+	for i := 0; i < memoryInjectProfileMax; i++ {
+		memories = append(memories, &types.RecalledMemory{Kind: "fact", Fact: &types.MemoryFact{
+			Category: types.MemoryCategoryFact, Content: fmt.Sprintf("高重要性事实 %d", i), Importance: 0.9,
+		}})
+	}
+	block := svc.FormatRecalledForPrompt(memories)
+
+	require.Contains(t, block, "用户是 XX 公司运维负责人", "resident profile rows are guaranteed in the block")
+	require.Contains(t, block, "高重要性事实 0")
+	require.Contains(t, block, fmt.Sprintf("高重要性事实 %d", memoryInjectProfileMax-2))
+	require.NotContains(t, block, fmt.Sprintf("高重要性事实 %d", memoryInjectProfileMax-1),
+		"fact rows only fill the slots left by profile rows")
+}
+
 func TestMemoryServiceFormatRecalledForPromptSkillBudget(t *testing.T) {
 	svc, _, _, _, _, _ := newMemoryServiceForTest(t)
 
@@ -639,50 +811,76 @@ func TestMemoryServiceFormatRecalledForPromptSkillBudget(t *testing.T) {
 	require.NotContains(t, block, "技巧条目 1")
 }
 
-func TestSelectRecalledWithSoulQuota(t *testing.T) {
-	mk := func(category string, score float64) *types.RecalledMemory {
-		return &types.RecalledMemory{Kind: "fact", Fact: &types.MemoryFact{Category: category}, Score: score}
+func TestSelectResidentMemories(t *testing.T) {
+	mk := func(category string, importance float64) *types.MemoryFact {
+		return &types.MemoryFact{Category: category, Importance: importance}
 	}
 
-	// Soul directives survive even when ranked below the regular top-k, up
-	// to the overflow tolerance (PRD FR2: total ≤ limit + 2).
-	ranked := []*types.RecalledMemory{
-		mk(types.MemoryCategoryPreference, 0.9),
-		mk(types.MemoryCategoryPreference, 0.8),
-		mk(types.MemoryCategorySoul, 0.5),
-		mk(types.MemoryCategorySoul, 0.4),
+	// Per-category caps: the repo returns rows pre-sorted by importance DESC,
+	// so the 5th profile row is dropped while preference/skill pass through.
+	facts := []*types.MemoryFact{
+		mk(types.MemoryCategoryProfile, 0.9),
+		mk(types.MemoryCategoryProfile, 0.8),
+		mk(types.MemoryCategoryProfile, 0.7),
+		mk(types.MemoryCategoryProfile, 0.6),
+		mk(types.MemoryCategoryProfile, 0.5), // beyond memoryInjectProfileMax
+		mk(types.MemoryCategoryPreference, 0.4),
+		mk(types.MemoryCategorySkill, 0.9),
 	}
-	got := selectRecalledWithSoulQuota(ranked, 2)
-	require.Len(t, got, 4, "two topical + two souls fills limit + tolerance")
-	require.Equal(t, types.MemoryCategorySoul, got[2].Fact.Category)
-	require.Equal(t, types.MemoryCategorySoul, got[3].Fact.Category)
+	got := selectResidentMemories(facts)
+	require.Len(t, got, 6, "4 profile + 1 preference + 1 skill")
+	for _, m := range got {
+		require.True(t, m.Resident, "resident path entries carry the flag")
+		require.Equal(t, "fact", m.Kind)
+		require.GreaterOrEqual(t, m.Score, 1.0, "informational score sits above the semantic range")
+	}
 
-	// The overflow tolerance bounds the total: a third soul is dropped.
-	ranked = []*types.RecalledMemory{
-		mk(types.MemoryCategoryPreference, 0.9),
-		mk(types.MemoryCategoryPreference, 0.8),
-		mk(types.MemoryCategorySoul, 0.7),
-		mk(types.MemoryCategorySoul, 0.5),
-		mk(types.MemoryCategorySoul, 0.4),
+	// Defensive ceilings: soul and preference caps bound runaway sets.
+	many := make([]*types.MemoryFact, 0, soulQuotaMax+memoryResidentPreferenceMax+2)
+	for i := 0; i < soulQuotaMax+1; i++ {
+		many = append(many, mk(types.MemoryCategorySoul, 1))
 	}
-	got = selectRecalledWithSoulQuota(ranked, 2)
-	require.Len(t, got, 4)
-	require.Equal(t, 0.5, got[3].Score, "the higher-ranked soul wins the last slot")
+	for i := 0; i < memoryResidentPreferenceMax+1; i++ {
+		many = append(many, mk(types.MemoryCategoryPreference, 1))
+	}
+	got = selectResidentMemories(many)
+	require.Len(t, got, soulQuotaMax+memoryResidentPreferenceMax)
 
-	// The soul quota is bounded defensively.
-	manySouls := make([]*types.RecalledMemory, 0, soulQuotaMax+2)
-	for i := 0; i < soulQuotaMax+2; i++ {
-		manySouls = append(manySouls, mk(types.MemoryCategorySoul, 1.0-float64(i)/100))
-	}
-	got = selectRecalledWithSoulQuota(manySouls, 8)
-	require.Len(t, got, soulQuotaMax)
+	// Episodic categories never ride the resident path.
+	got = selectResidentMemories([]*types.MemoryFact{
+		mk(types.MemoryCategoryFact, 0.9), mk(types.MemoryCategoryTodo, 0.9),
+		mk(types.MemoryCategoryFeedback, 0.9),
+	})
+	require.Empty(t, got)
+}
 
-	// Regular memories alone obey the plain limit.
-	regular := []*types.RecalledMemory{
-		mk(types.MemoryCategoryFact, 0.9), mk(types.MemoryCategoryFact, 0.8), mk(types.MemoryCategoryFact, 0.7),
-	}
-	got = selectRecalledWithSoulQuota(regular, 2)
-	require.Len(t, got, 2)
+func TestIsResidentMemoryCategory(t *testing.T) {
+	require.True(t, types.IsResidentMemoryCategory(types.MemoryCategorySoul))
+	require.True(t, types.IsResidentMemoryCategory(types.MemoryCategoryProfile))
+	require.True(t, types.IsResidentMemoryCategory(types.MemoryCategoryPreference))
+	require.True(t, types.IsResidentMemoryCategory(types.MemoryCategorySkill))
+	require.False(t, types.IsResidentMemoryCategory(types.MemoryCategoryFact))
+	require.False(t, types.IsResidentMemoryCategory(types.MemoryCategoryTodo))
+	require.False(t, types.IsResidentMemoryCategory(types.MemoryCategoryFeedback))
+	require.False(t, types.IsResidentMemoryCategory(""))
+}
+
+func TestSplitRecallCategories(t *testing.T) {
+	// Empty filter: full resident + semantic sets.
+	resident, semantic := splitRecallCategories(nil)
+	require.ElementsMatch(t, []string{
+		types.MemoryCategorySoul, types.MemoryCategoryProfile,
+		types.MemoryCategoryPreference, types.MemoryCategorySkill,
+	}, resident)
+	require.ElementsMatch(t, []string{types.MemoryCategoryFact, types.MemoryCategoryTodo}, semantic)
+
+	// Explicit filter routes each category to its path; unknown categories
+	// fall through to the semantic path (repo yields no rows).
+	resident, semantic = splitRecallCategories([]string{
+		types.MemoryCategorySoul, types.MemoryCategoryFact, "bogus",
+	})
+	require.Equal(t, []string{types.MemoryCategorySoul}, resident)
+	require.Equal(t, []string{types.MemoryCategoryFact, "bogus"}, semantic)
 }
 
 func TestMemoryServiceSkillConfidenceGate(t *testing.T) {

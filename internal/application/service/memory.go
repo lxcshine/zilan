@@ -563,55 +563,75 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 		}
 	}
 
-	// Candidate window: 10 half-lives back. Beyond that the decay floor makes
-	// scores indistinguishable, so older rows are not worth loading.
-	facts, err := s.memoryRepo.ListActiveFactsForRecall(
-		ctx, tenantID, userID, params.Categories, now.Add(-10*factHalfLife), types.MemoryRecallCandidateLimit)
-	if err != nil {
-		return nil, err
+	// Two-path recall (PRD P0-3 §3.2): resident categories (soul / profile /
+	// preference / skill) are unconditionally injected — no semantic scoring,
+	// no recency window; episodic categories (fact / todo) and L2 summaries
+	// keep the scored semantic path. The requested category filter (empty =
+	// all) is intersected with each path.
+	residentCats, semanticCats := splitRecallCategories(params.Categories)
+
+	// Path A — resident memories: a stable identity attribute from two years
+	// ago is still true, so the fetch passes a zero "since" (no window) and
+	// selection is purely per-category importance caps.
+	var resident []*types.RecalledMemory
+	if len(residentCats) > 0 {
+		facts, err := s.memoryRepo.ListActiveFactsForRecall(
+			ctx, tenantID, userID, residentCats, time.Time{}, types.MemoryRecallCandidateLimit)
+		if err != nil {
+			return nil, err
+		}
+		resident = selectResidentMemories(facts)
+	}
+
+	// Path B — semantic recall. Candidate window: 10 half-lives back; beyond
+	// that the decay floor makes scores indistinguishable, so older rows are
+	// not worth loading.
+	var semantic []*types.RecalledMemory
+	if len(semanticCats) > 0 {
+		facts, err := s.memoryRepo.ListActiveFactsForRecall(
+			ctx, tenantID, userID, semanticCats, now.Add(-10*factHalfLife), types.MemoryRecallCandidateLimit)
+		if err != nil {
+			return nil, err
+		}
+		for _, fact := range facts {
+			similarity := 0.0
+			if len(queryEmbedding) > 0 && len(fact.Embedding) > 0 {
+				similarity = types.Cosine(queryEmbedding, fact.Embedding)
+			}
+			reference := fact.UpdatedAt
+			if fact.LastAccessedAt != nil && fact.LastAccessedAt.After(reference) {
+				reference = *fact.LastAccessedAt
+			}
+			score := types.MemoryRecallScore(similarity, reference, fact.AccessCount, factHalfLife, now)
+			// Blend a small importance prior so never-accessed but critical facts
+			// (deadlines, identity) still surface without a semantic match.
+			score += 0.1 * fact.Importance
+			semantic = append(semantic, &types.RecalledMemory{Kind: "fact", Fact: fact, Score: score})
+		}
 	}
 	summaries, err := s.memoryRepo.ListSessionSummariesForRecall(
 		ctx, tenantID, userID, now.Add(-10*summaryHalfLife), types.MemoryRecallCandidateLimit)
 	if err != nil {
 		return nil, err
 	}
-
-	scored := make([]*types.RecalledMemory, 0, len(facts)+len(summaries))
-	for _, fact := range facts {
-		semantic := 0.0
-		if len(queryEmbedding) > 0 && len(fact.Embedding) > 0 {
-			semantic = types.Cosine(queryEmbedding, fact.Embedding)
-			// Soul directives are persona-level: they must inject even when
-			// topically unrelated to the current query, so their semantic
-			// signal is boosted (PRD P0-2 FR2).
-			if fact.Category == types.MemoryCategorySoul {
-				semantic *= 1.5
-				if semantic > 1 {
-					semantic = 1
-				}
-			}
-		}
-		reference := fact.UpdatedAt
-		if fact.LastAccessedAt != nil && fact.LastAccessedAt.After(reference) {
-			reference = *fact.LastAccessedAt
-		}
-		score := types.MemoryRecallScore(semantic, reference, fact.AccessCount, factHalfLife, now)
-		// Blend a small importance prior so never-accessed but critical facts
-		// (deadlines, identity) still surface without a semantic match.
-		score += 0.1 * fact.Importance
-		scored = append(scored, &types.RecalledMemory{Kind: "fact", Fact: fact, Score: score})
-	}
 	for _, sum := range summaries {
-		semantic := 0.0
+		similarity := 0.0
 		if len(queryEmbedding) > 0 && len(sum.Embedding) > 0 {
-			semantic = types.Cosine(queryEmbedding, sum.Embedding)
+			similarity = types.Cosine(queryEmbedding, sum.Embedding)
 		}
-		score := types.MemoryRecallScore(semantic, sum.UpdatedAt, 0, summaryHalfLife, now)
-		scored = append(scored, &types.RecalledMemory{Kind: "session_summary", Summary: sum, Score: score})
+		score := types.MemoryRecallScore(similarity, sum.UpdatedAt, 0, summaryHalfLife, now)
+		semantic = append(semantic, &types.RecalledMemory{Kind: "session_summary", Summary: sum, Score: score})
 	}
 
-	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
-	scored = selectRecalledWithSoulQuota(scored, limit)
+	sort.Slice(semantic, func(i, j int) bool { return semantic[i].Score > semantic[j].Score })
+	if len(semantic) > limit {
+		semantic = semantic[:limit]
+	}
+
+	// Merge: resident first (guaranteed), then the scored semantic Top-K.
+	scored := make([]*types.RecalledMemory, 0, len(resident)+len(semantic))
+	scored = append(scored, resident...)
+	scored = append(scored, semantic...)
 
 	// Bump access stats fire-and-forget so frequently recalled memories rank
 	// higher over time. Use WithoutCancel: the HTTP request may end first.
@@ -626,6 +646,32 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 	return scored, nil
 }
 
+// splitRecallCategories routes the requested category filter (empty = all)
+// across the two recall paths (PRD P0-3 §3.2). Unknown categories fall
+// through to the semantic path, where the repository's category filter
+// naturally yields no rows.
+func splitRecallCategories(requested []string) (resident, semantic []string) {
+	if len(requested) == 0 {
+		return []string{
+				types.MemoryCategorySoul,
+				types.MemoryCategoryProfile,
+				types.MemoryCategoryPreference,
+				types.MemoryCategorySkill,
+			}, []string{
+				types.MemoryCategoryFact,
+				types.MemoryCategoryTodo,
+			}
+	}
+	for _, category := range requested {
+		if types.IsResidentMemoryCategory(category) {
+			resident = append(resident, category)
+		} else {
+			semantic = append(semantic, category)
+		}
+	}
+	return resident, semantic
+}
+
 func recalledFactIDs(memories []*types.RecalledMemory) []string {
 	ids := make([]string, 0, len(memories))
 	for _, m := range memories {
@@ -636,45 +682,43 @@ func recalledFactIDs(memories []*types.RecalledMemory) []string {
 	return ids
 }
 
-// soulOverflowTolerance bounds how far the final recall set may exceed the
-// regular limit when soul directives are appended (PRD P0-2 FR2: total ≤
-// DefaultMemoryRecallLimit + 2).
-const soulOverflowTolerance = 2
-
-// soulQuotaMax is the defensive ceiling on soul directives in one recall
+// soulQuotaMax is the defensive ceiling on soul directives in one resident
 // set. Soul directives are few by nature; the cap guards against runaway
 // persona memories, it is not an expected operating point.
 const soulQuotaMax = 4
 
-// selectRecalledWithSoulQuota picks the final recall set from the ranked
-// candidates: soul directives have their own quota (they are persona-level
-// and must not be pushed out by topical memories), everything else takes the
-// top `limit` by score. Total is bounded at limit + soulOverflowTolerance.
-func selectRecalledWithSoulQuota(ranked []*types.RecalledMemory, limit int) []*types.RecalledMemory {
-	souls := 0
-	others := 0
-	totalCap := limit + soulOverflowTolerance
-	selected := make([]*types.RecalledMemory, 0, totalCap)
-	for _, m := range ranked {
-		if others+souls >= totalCap {
-			// Total budget exhausted (PRD FR2: total ≤ limit + 2).
-			break
+// memoryResidentPreferenceMax bounds preference-category rows in the resident
+// injection set (PRD P0-3 §3.3).
+const memoryResidentPreferenceMax = 4
+
+// selectResidentMemories picks the always-inject set (PRD P0-3 FR1): the
+// repository returns rows pre-sorted by importance DESC / updated_at DESC,
+// so selection is a per-category cap walk. Resident categories never see the
+// query — they describe who the user is and how the assistant should behave,
+// not what the current topic is.
+func selectResidentMemories(facts []*types.MemoryFact) []*types.RecalledMemory {
+	caps := map[string]int{
+		types.MemoryCategorySoul:       soulQuotaMax,
+		types.MemoryCategoryProfile:    memoryInjectProfileMax,
+		types.MemoryCategoryPreference: memoryResidentPreferenceMax,
+		types.MemoryCategorySkill:      memoryInjectSkillMax,
+	}
+	counts := make(map[string]int)
+	selected := make([]*types.RecalledMemory, 0, len(facts))
+	for _, fact := range facts {
+		if counts[fact.Category] >= caps[fact.Category] {
+			continue
 		}
-		isSoul := m.Kind == "fact" && m.Fact != nil && m.Fact.Category == types.MemoryCategorySoul
-		if isSoul {
-			if souls >= soulQuotaMax {
-				continue
-			}
-			souls++
-		} else {
-			if others >= limit {
-				// Keep scanning: later soul directives can still fill the
-				// soul quota.
-				continue
-			}
-			others++
-		}
-		selected = append(selected, m)
+		counts[fact.Category]++
+		// Score is informational: resident rows do not compete with the
+		// semantic path. 1 + importance keeps them above the semantic range
+		// and orders them sensibly in logs.
+		selected = append(selected, &types.RecalledMemory{
+			Kind:     "fact",
+			Fact:     fact,
+			Score:    1 + fact.Importance,
+			Resident: true,
+		})
 	}
 	return selected
 }
@@ -709,7 +753,7 @@ func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory
 	}
 
 	var soul, profile, memoryFacts, skills, summaries []string
-	var profileFacts, skillFacts []*types.MemoryFact
+	var profileRows, factRows, skillFacts []*types.MemoryFact
 	for _, m := range memories {
 		switch m.Kind {
 		case "fact":
@@ -719,8 +763,10 @@ func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory
 			switch m.Fact.Category {
 			case types.MemoryCategorySoul:
 				soul = append(soul, factLine(m.Fact))
-			case types.MemoryCategoryProfile, types.MemoryCategoryFact:
-				profileFacts = append(profileFacts, m.Fact)
+			case types.MemoryCategoryProfile:
+				profileRows = append(profileRows, m.Fact)
+			case types.MemoryCategoryFact:
+				factRows = append(factRows, m.Fact)
 			case types.MemoryCategorySkill:
 				skillFacts = append(skillFacts, m.Fact)
 			case types.MemoryCategoryFeedback:
@@ -736,14 +782,28 @@ func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory
 		}
 	}
 
-	// 用户档案: importance-ordered, bounded.
-	sort.SliceStable(profileFacts, func(i, j int) bool {
-		return profileFacts[i].Importance > profileFacts[j].Importance
+	// 用户档案 (PRD P0-3 FR2): resident profile rows are guaranteed — they
+	// render first within the block budget; semantic fact rows fill the
+	// remaining slots, both importance-ordered.
+	sort.SliceStable(profileRows, func(i, j int) bool {
+		return profileRows[i].Importance > profileRows[j].Importance
 	})
-	if len(profileFacts) > memoryInjectProfileMax {
-		profileFacts = profileFacts[:memoryInjectProfileMax]
+	if len(profileRows) > memoryInjectProfileMax {
+		profileRows = profileRows[:memoryInjectProfileMax]
 	}
-	for _, f := range profileFacts {
+	sort.SliceStable(factRows, func(i, j int) bool {
+		return factRows[i].Importance > factRows[j].Importance
+	})
+	if remaining := memoryInjectProfileMax - len(profileRows); len(factRows) > remaining {
+		if remaining < 0 {
+			remaining = 0
+		}
+		factRows = factRows[:remaining]
+	}
+	for _, f := range profileRows {
+		profile = append(profile, factLine(f))
+	}
+	for _, f := range factRows {
 		profile = append(profile, factLine(f))
 	}
 

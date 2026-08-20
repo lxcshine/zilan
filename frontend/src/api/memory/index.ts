@@ -16,6 +16,23 @@ export type MemoryCategory =
 /** 记忆状态：生效中 / 已完成（todo）/ 已归档 */
 export type MemoryStatus = 'active' | 'done' | 'archived'
 
+/**
+ * 常驻注入类别（P0-3）：soul 风格指令 / profile 画像 / preference 偏好 / skill 技巧
+ * 无条件注入每次对话，不依赖语义相关性；fact / todo / 反馈走语义评分召回。
+ * 镜像后端 internal/types/memory.go 的 IsResidentMemoryCategory（单一事实源在后端）。
+ */
+export const RESIDENT_MEMORY_CATEGORIES: ReadonlySet<MemoryCategory> = new Set([
+  'soul',
+  'profile',
+  'preference',
+  'skill',
+])
+
+/** 判断某条记忆是否常驻注入（仅 active 状态参与注入） */
+export function isResidentMemory(fact: Pick<MemoryFact, 'category' | 'status'>): boolean {
+  return fact.status === 'active' && RESIDENT_MEMORY_CATEGORIES.has(fact.category)
+}
+
 export interface MemoryFact {
   id: string
   category: MemoryCategory

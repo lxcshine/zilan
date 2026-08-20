@@ -42,6 +42,12 @@
         <t-icon name="check" size="12px" />
         {{ t('memory.status.done') }}
       </span>
+      <t-tooltip v-if="isResident" :content="t('memory.resident.tooltip')" placement="top">
+        <span class="memory-resident-chip">
+          <t-icon name="root-list" size="12px" />
+          {{ t('memory.resident.badge') }}
+        </span>
+      </t-tooltip>
       <span class="memory-meta-item">
         <span class="memory-imp" :title="t('memory.card.importance')">
           <i v-for="seg in 5" :key="seg" class="memory-imp-seg" :class="{ 'is-on': seg <= importanceLevel }" />
@@ -77,7 +83,7 @@
 // extra 插槽用于附加展示（如技巧卡的"来自你的反馈"来源标签）。
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import type { MemoryFact } from '@/api/memory'
+import { isResidentMemory, type MemoryFact } from '@/api/memory'
 
 const props = withDefaults(
   defineProps<{
@@ -99,6 +105,8 @@ const { t } = useI18n()
 
 const importanceLevel = computed(() => Math.min(5, Math.max(0, Math.round((props.fact.importance ?? 0) * 5))))
 const confidencePct = computed(() => Math.round((props.fact.confidence ?? 0) * 100))
+/** 常驻注入（P0-3）：soul/profile/preference/skill 且 active 状态 */
+const isResident = computed(() => isResidentMemory(props.fact))
 const isOverdue = computed(() => {
   if (!props.fact.due_at) return false
   const due = new Date(props.fact.due_at).getTime()
@@ -250,6 +258,17 @@ function relativeTime(dateStr?: string): string {
   border-radius: 999px;
   background: var(--td-success-color-1);
   color: var(--td-success-color-6);
+}
+
+.memory-resident-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--td-brand-color-1);
+  color: var(--td-brand-color-6);
+  cursor: default;
 }
 
 .memory-imp {

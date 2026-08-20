@@ -117,6 +117,21 @@ const (
 	MemoryStatusArchived = "archived" // hidden from recall, kept for audit
 )
 
+// IsResidentMemoryCategory reports whether the category bypasses semantic
+// scoring and is unconditionally injected into every turn ("常驻注入", PRD
+// P0-3 §3.1): soul directives, stable profile attributes, preferences and
+// distilled skills are topic-independent, so they must not depend on query
+// similarity or the recency window. Episodic categories (fact, todo) and L2
+// session summaries stay on the scored semantic path.
+func IsResidentMemoryCategory(category string) bool {
+	switch category {
+	case MemoryCategorySoul, MemoryCategoryProfile, MemoryCategoryPreference, MemoryCategorySkill:
+		return true
+	default:
+		return false
+	}
+}
+
 // Memory recall tuning defaults. The half-lives control the exponential time
 // decay factor of the recall score; MaxFactsPerUser bounds the per-user memory
 // set so brute-force cosine over candidates stays cheap and importance-based
@@ -297,6 +312,10 @@ type RecalledMemory struct {
 	Fact    *MemoryFact           `json:"fact,omitempty"`
 	Summary *MemorySessionSummary `json:"summary,omitempty"`
 	Score   float64               `json:"score"`
+	// Resident marks memories selected by the always-inject path (PRD P0-3):
+	// they bypass semantic scoring and the recency window. Informational —
+	// rendering dispatches on category, not on this flag.
+	Resident bool `json:"resident,omitempty"`
 }
 
 // MemoryExtractPayload is the asynq payload for TypeMemoryExtract. One task
