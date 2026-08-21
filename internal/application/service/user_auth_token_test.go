@@ -60,6 +60,9 @@ func (s *stubUserRepoForAuth) GetUsersByIDs(context.Context, []string) (map[stri
 func (s *stubUserRepoForAuth) GetUserByEmail(context.Context, string) (*types.User, error) {
 	return nil, nil
 }
+func (s *stubUserRepoForAuth) GetUserByPhone(context.Context, string) (*types.User, error) {
+	return nil, nil
+}
 func (s *stubUserRepoForAuth) GetUserByUsername(context.Context, string) (*types.User, error) {
 	return nil, nil
 }

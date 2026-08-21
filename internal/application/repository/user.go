@@ -98,6 +98,18 @@ func (r *userRepository) GetUserByUsername(ctx context.Context, username string)
 	return &user, nil
 }
 
+// GetUserByPhone gets a user by mobile number (P0-4 dual-channel login).
+func (r *userRepository) GetUserByPhone(ctx context.Context, phone string) (*types.User, error) {
+	var user types.User
+	if err := r.db.WithContext(ctx).Where("phone = ?", phone).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrUserNotFound
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
 // GetUserByTenantID gets the first user (owner) of a tenant
 func (r *userRepository) GetUserByTenantID(ctx context.Context, tenantID uint64) (*types.User, error) {
 	var user types.User

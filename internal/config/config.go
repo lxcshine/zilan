@@ -310,6 +310,118 @@ type AuthConfig struct {
 	// tenantless creates only the identity and waits for an invitation or an
 	// explicit self-service tenant creation.
 	DefaultTenantMode string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	// Captcha configures the human-verification challenge presented on the
+	// login/register surfaces (P0-4, docs/prd/auth-dual-channel-verification.md §5).
+	Captcha *AuthCaptchaConfig `yaml:"captcha" json:"captcha,omitempty"`
+	// VerificationCode configures the SMS/email ownership-proof codes (P0-4 §6).
+	VerificationCode *AuthVerificationCodeConfig `yaml:"verification_code" json:"verification_code,omitempty"`
+	// SMS configures the short-message channel used by phone registration.
+	SMS *AuthSMSConfig `yaml:"sms" json:"sms,omitempty"`
+	// Email configures the email channel used by email-code registration.
+	Email *AuthEmailCodeConfig `yaml:"email" json:"email,omitempty"`
+}
+
+// AuthCaptchaConfig selects the human-verification challenge type and where
+// it is enforced.
+type AuthCaptchaConfig struct {
+	// Type is the challenge flavour: "slider" (default) or "text".
+	Type string `yaml:"type" json:"type"`
+	// LoginRequired toggles the captcha gate on POST /auth/login. Default
+	// true; operators running pure API integrations (headless widgets,
+	// scripted clients) may set false to keep those clients working.
+	LoginRequired *bool `yaml:"login_required" json:"login_required,omitempty"`
+}
+
+// AuthVerificationCodeConfig bounds the ownership-proof codes.
+type AuthVerificationCodeConfig struct {
+	Length                 int `yaml:"length"                   json:"length"`
+	TTLMinutes             int `yaml:"ttl_minutes"              json:"ttl_minutes"`
+	ResendIntervalSeconds  int `yaml:"resend_interval_seconds"  json:"resend_interval_seconds"`
+	DailyLimitPerTarget    int `yaml:"daily_limit_per_target"   json:"daily_limit_per_target"`
+	MaxAttempts            int `yaml:"max_attempts"             json:"max_attempts"`
+}
+
+// AuthSMSConfig selects the SMS provider. provider "log" writes the code to
+// the server log instead of sending anything (development mode); "aliyun"
+// sends via Alibaba Cloud dysmsapi using the ACS3 signature.
+type AuthSMSConfig struct {
+	Provider string                  `yaml:"provider"  json:"provider"`
+	Aliyun   *AuthAliyunSMSConfig    `yaml:"aliyun"    json:"aliyun,omitempty"`
+}
+
+// AuthAliyunSMSConfig carries Alibaba Cloud dysmsapi credentials.
+type AuthAliyunSMSConfig struct {
+	AccessKeyID     string `yaml:"access_key_id"     json:"access_key_id"`
+	AccessKeySecret string `yaml:"access_key_secret" json:"-"`
+	SignName        string `yaml:"sign_name"          json:"sign_name"`
+	TemplateCode    string `yaml:"template_code"     json:"template_code"`
+}
+
+// AuthEmailCodeConfig selects the email provider. provider "log" writes the
+// code to the server log (development); "smtp" sends real mail through the
+// configured SMTP server (465 implicit SSL or 587/25 STARTTLS).
+type AuthEmailCodeConfig struct {
+	Provider string         `yaml:"provider" json:"provider"`
+	SMTP     *AuthSMTPConfig `yaml:"smtp"     json:"smtp,omitempty"`
+}
+
+// AuthSMTPConfig carries the outbound SMTP connection details.
+type AuthSMTPConfig struct {
+	// Preset names a well-known mailbox provider (qq/163/126/gmail/exmail/
+	// aliyun/outlook). When set, host/port/use_ssl fall back to that
+	// provider's standard values; explicitly configured fields always win
+	// over the preset, so custom enterprise mailboxes can mix preset port
+	// with a private host.
+	Preset   string `yaml:"preset"   json:"preset"`
+	Host     string `yaml:"host"     json:"host"`
+	Port     int    `yaml:"port"     json:"port"`
+	Username string `yaml:"username" json:"username"`
+	Password string `yaml:"password" json:"-"`
+	From     string `yaml:"from"     json:"from"`
+	// UseSSL selects implicit TLS (port 465). When false, STARTTLS is
+	// attempted on plain connections (587/25).
+	UseSSL *bool `yaml:"use_ssl" json:"use_ssl,omitempty"`
+}
+
+// smtpPresetDefaults maps well-known mailbox providers to their standard
+// outbound SMTP settings. Provider credentials (授权码/应用密码) are always
+// account-specific and must be configured separately — presets never carry
+// credentials.
+var smtpPresetDefaults = map[string]struct {
+	host   string
+	port   int
+	useSSL bool
+}{
+	"qq":      {"smtp.qq.com", 465, true},
+	"163":     {"smtp.163.com", 465, true},
+	"126":     {"smtp.126.com", 465, true},
+	"gmail":   {"smtp.gmail.com", 465, true},
+	"exmail":  {"smtp.exmail.qq.com", 465, true},  // 腾讯企业邮箱
+	"aliyun":  {"smtp.qiye.aliyun.com", 465, true}, // 阿里企业邮箱
+	"outlook": {"smtp.office365.com", 587, false},  // Microsoft 365 / Outlook（STARTTLS）
+}
+
+// applySMTPPresetDefaults fills host/port/use_ssl from the named preset
+// when those fields were not set explicitly (yaml or env). An explicit
+// value always wins over the preset.
+func applySMTPPresetDefaults(smtp *AuthSMTPConfig) {
+	if smtp == nil {
+		return
+	}
+	preset, ok := smtpPresetDefaults[strings.ToLower(strings.TrimSpace(smtp.Preset))]
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(smtp.Host) == "" {
+		smtp.Host = preset.host
+	}
+	if smtp.Port == 0 {
+		smtp.Port = preset.port
+	}
+	if smtp.UseSSL == nil {
+		useSSL := preset.useSSL
+		smtp.UseSSL = &useSSL
+	}
 }
 
 // AuthRegistrationMode constants used by handlers and middleware.
@@ -881,6 +993,8 @@ func applyAuthAndTenantDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.Auth.DefaultTenantMode) == "" {
 		cfg.Auth.DefaultTenantMode = AuthDefaultTenantModeCreatePersonal
 	}
+	applyAuthVerificationDefaults(cfg.Auth)
+
 
 	if value := strings.TrimSpace(os.Getenv("WEKNORA_TENANT_ENABLE_RBAC")); value != "" {
 		v := strings.EqualFold(value, "true")
@@ -918,6 +1032,185 @@ func applyAuthAndTenantDefaults(cfg *Config) {
 			)
 		}
 	}
+}
+
+// applyAuthVerificationDefaults fills in defaults and env overrides for the
+// P0-4 auth verification sections (captcha / verification_code / sms / email).
+//
+// Defaults:
+//   - auth.captcha.type          -> "slider"
+//   - auth.captcha.login_required-> true
+//   - auth.verification_code.*   -> 6 digits / 10 min TTL / 60s resend
+//                                    interval / 10 per target per day /
+//                                    5 failed attempts
+//   - auth.sms.provider          -> "log" (zero-config safe: codes go to
+//                                    the server log; aliyun requires
+//                                    explicit credentials)
+//   - auth.email.provider        -> "log" (same rationale)
+//
+// Env overrides (when set and non-empty):
+//   - WEKNORA_AUTH_CAPTCHA_TYPE / WEKNORA_AUTH_CAPTCHA_LOGIN_REQUIRED
+//   - WEKNORA_AUTH_SMS_PROVIDER, WEKNORA_AUTH_SMS_ALIYUN_ACCESS_KEY_ID,
+//     WEKNORA_AUTH_SMS_ALIYUN_ACCESS_KEY_SECRET,
+//     WEKNORA_AUTH_SMS_ALIYUN_SIGN_NAME, WEKNORA_AUTH_SMS_ALIYUN_TEMPLATE_CODE
+//   - WEKNORA_AUTH_EMAIL_PROVIDER, WEKNORA_AUTH_EMAIL_SMTP_HOST/PORT/
+//     USERNAME/PASSWORD/FROM/FROM_ADDR, and WEKNORA_AUTH_EMAIL_SMTP_PRESET
+//     (qq/163/126/gmail/exmail/aliyun/outlook — fills host/port/use_ssl
+//     with the provider's standard values when not set explicitly)
+//
+// Channel availability semantics (PRD §6.3): a channel is usable when its
+// provider is fully configured ("aliyun"/"smtp" with credentials, or the
+// explicit "log" provider). With both channels on "log" and no SMTP/SMS
+// credentials the register form falls back to the classic email+password
+// flow, so zero-config deployments keep working after upgrade.
+func applyAuthVerificationDefaults(auth *AuthConfig) {
+	if auth.Captcha == nil {
+		auth.Captcha = &AuthCaptchaConfig{}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_CAPTCHA_TYPE")); v != "" {
+		auth.Captcha.Type = v
+	}
+	if strings.TrimSpace(auth.Captcha.Type) == "" {
+		auth.Captcha.Type = "slider"
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_CAPTCHA_LOGIN_REQUIRED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			auth.Captcha.LoginRequired = &b
+		}
+	}
+	if auth.Captcha.LoginRequired == nil {
+		on := true
+		auth.Captcha.LoginRequired = &on
+	}
+
+	vc := auth.VerificationCode
+	if vc == nil {
+		vc = &AuthVerificationCodeConfig{}
+		auth.VerificationCode = vc
+	}
+	if vc.Length == 0 {
+		vc.Length = 6
+	}
+	if vc.TTLMinutes == 0 {
+		vc.TTLMinutes = 10
+	}
+	if vc.ResendIntervalSeconds == 0 {
+		vc.ResendIntervalSeconds = 60
+	}
+	if vc.DailyLimitPerTarget == 0 {
+		vc.DailyLimitPerTarget = 10
+	}
+	if vc.MaxAttempts == 0 {
+		vc.MaxAttempts = 5
+	}
+
+	if auth.SMS == nil {
+		auth.SMS = &AuthSMSConfig{}
+	}
+	if auth.SMS.Aliyun == nil {
+		auth.SMS.Aliyun = &AuthAliyunSMSConfig{}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_SMS_PROVIDER")); v != "" {
+		auth.SMS.Provider = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_SMS_ALIYUN_ACCESS_KEY_ID")); v != "" {
+		auth.SMS.Aliyun.AccessKeyID = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_SMS_ALIYUN_ACCESS_KEY_SECRET")); v != "" {
+		auth.SMS.Aliyun.AccessKeySecret = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_SMS_ALIYUN_SIGN_NAME")); v != "" {
+		auth.SMS.Aliyun.SignName = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_SMS_ALIYUN_TEMPLATE_CODE")); v != "" {
+		auth.SMS.Aliyun.TemplateCode = v
+	}
+	// Zero-config default: "log". An explicit aliyun provider only counts as
+	// usable when its credentials are complete (validated in the service).
+	if strings.TrimSpace(auth.SMS.Provider) == "" {
+		auth.SMS.Provider = "log"
+	}
+
+	if auth.Email == nil {
+		auth.Email = &AuthEmailCodeConfig{}
+	}
+	if auth.Email.SMTP == nil {
+		auth.Email.SMTP = &AuthSMTPConfig{}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_PROVIDER")); v != "" {
+		auth.Email.Provider = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_PRESET")); v != "" {
+		auth.Email.SMTP.Preset = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_HOST")); v != "" {
+		auth.Email.SMTP.Host = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_PORT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			auth.Email.SMTP.Port = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_USERNAME")); v != "" {
+		auth.Email.SMTP.Username = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_PASSWORD")); v != "" {
+		auth.Email.SMTP.Password = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_EMAIL_SMTP_FROM")); v != "" {
+		auth.Email.SMTP.From = v
+	}
+	if strings.TrimSpace(auth.Email.Provider) == "" {
+		auth.Email.Provider = "log"
+	}
+	// Preset resolution comes last and only fills empty fields: an explicit
+	// host/port/use_ssl from yaml or env always wins over the preset.
+	applySMTPPresetDefaults(auth.Email.SMTP)
+}
+
+// SMSEnabled reports whether the SMS channel can deliver codes: either the
+// log provider (dev) or a fully-credentialed aliyun provider.
+func (c *AuthConfig) SMSEnabled() bool {
+	if c == nil || c.SMS == nil {
+		return false
+	}
+	switch strings.TrimSpace(c.SMS.Provider) {
+	case "log":
+		return true
+	case "aliyun":
+		return c.SMS.Aliyun != nil &&
+			c.SMS.Aliyun.AccessKeyID != "" &&
+			c.SMS.Aliyun.AccessKeySecret != "" &&
+			c.SMS.Aliyun.SignName != "" &&
+			c.SMS.Aliyun.TemplateCode != ""
+	default:
+		return false
+	}
+}
+
+// EmailCodeEnabled reports whether the email channel can deliver codes:
+// either the log provider (dev) or an smtp provider with a host configured.
+func (c *AuthConfig) EmailCodeEnabled() bool {
+	if c == nil || c.Email == nil {
+		return false
+	}
+	switch strings.TrimSpace(c.Email.Provider) {
+	case "log":
+		return true
+	case "smtp":
+		return c.Email.SMTP != nil && strings.TrimSpace(c.Email.SMTP.Host) != ""
+	default:
+		return false
+	}
+}
+
+// CaptchaLoginRequired reports whether POST /auth/login must present a
+// captcha token. Default true.
+func (c *AuthConfig) CaptchaLoginRequired() bool {
+	if c == nil || c.Captcha == nil || c.Captcha.LoginRequired == nil {
+		return true
+	}
+	return *c.Captcha.LoginRequired
 }
 
 // applyAuditDefaults fills in defaults for the Audit config section

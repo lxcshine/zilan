@@ -2,6 +2,8 @@
 .*
 # 但不忽略特定隐藏文件和目录
 !.gitignore
+# 环境变量示例文件随仓库分发（README 的 cp .env.example .env 依赖它）；.env 本体含密钥，保持忽略
+!.env.example
 
 # 敏感文件
 *.pem

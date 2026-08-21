@@ -8,13 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -33,31 +33,17 @@ var (
 	jwtSecret     string
 
 	// ErrPasswordPolicy is returned when a newly chosen password does not
-	// meet the product's public 8-32 character, letter-and-number contract.
-	// It is exported so HTTP handlers can translate the failure to a 400
-	// without exposing bcrypt or persistence errors.
-	ErrPasswordPolicy = errors.New("password must be 8-32 characters and contain at least one letter and one number")
+	// meet the product's public 8-32 character, upper+lower+digit contract
+	// (P0-4). It is exported so HTTP handlers can translate the failure to
+	// a 400 without exposing bcrypt or persistence errors.
+	ErrPasswordPolicy = errors.New("password must be 8-32 characters and contain uppercase letters, lowercase letters and numbers")
 )
 
-// ValidatePasswordPolicy keeps administrative password resets aligned with
-// the registration form's documented policy. Password bytes are never logged
-// or included in the returned error.
+// ValidatePasswordPolicy keeps registration, password changes and
+// administrative resets aligned with the documented policy. Password bytes
+// are never logged or included in the returned error.
 func ValidatePasswordPolicy(password string) error {
-	length := utf8.RuneCountInString(password)
-	if length < 8 || length > 32 {
-		return ErrPasswordPolicy
-	}
-	hasLetter := false
-	hasNumber := false
-	for _, r := range password {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
-			hasLetter = true
-		case r >= '0' && r <= '9':
-			hasNumber = true
-		}
-	}
-	if !hasLetter || !hasNumber {
+	if !types.ValidatePasswordStrength(password) {
 		return ErrPasswordPolicy
 	}
 	return nil
@@ -87,7 +73,11 @@ type userService struct {
 	tokenRepo     interfaces.AuthTokenRepository
 	tenantService interfaces.TenantService
 	memberService interfaces.TenantMemberService
-	config        *config.Config
+	// verificationCodeSvc backs channel-based registration (P0-4). Nil in
+	// legacy test fixtures — channel registration then returns an explicit
+	// error instead of panicking.
+	verificationCodeSvc interfaces.VerificationCodeService
+	config              *config.Config
 }
 
 // NewUserService creates a new user service instance
@@ -97,23 +87,40 @@ func NewUserService(
 	tokenRepo interfaces.AuthTokenRepository,
 	tenantService interfaces.TenantService,
 	memberService interfaces.TenantMemberService,
+	verificationCodeSvc interfaces.VerificationCodeService,
 ) interfaces.UserService {
 	return &userService{
-		userRepo:      userRepo,
-		tokenRepo:     tokenRepo,
-		tenantService: tenantService,
-		memberService: memberService,
-		config:        configInfo,
+		userRepo:            userRepo,
+		tokenRepo:           tokenRepo,
+		tenantService:       tenantService,
+		memberService:       memberService,
+		verificationCodeSvc: verificationCodeSvc,
+		config:              configInfo,
 	}
 }
 
-// Register creates a new user account
+// Register creates a new user account. Two wire formats are accepted
+// (P0-4, docs/prd/auth-dual-channel-verification.md §7): channel-based
+// registration (phone/email proven by a verification code, username
+// auto-generated) and the classic username/email/password format whose
+// behaviour is preserved for legacy clients and zero-config deployments.
 func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) (*types.User, error) {
 	logger.Info(ctx, "Start user registration")
 
-	// Validate input
+	if strings.TrimSpace(req.Channel) != "" {
+		return s.registerWithCode(ctx, req)
+	}
+	return s.registerClassic(ctx, req)
+}
+
+// registerClassic preserves the historical username/email/password flow,
+// tightened by the P0-4 password policy (upper + lower + digit).
+func (s *userService) registerClassic(ctx context.Context, req *types.RegisterRequest) (*types.User, error) {
 	if req.Username == "" || req.Email == "" || req.Password == "" {
 		return nil, errors.New("username, email and password are required")
+	}
+	if err := ValidatePasswordPolicy(req.Password); err != nil {
+		return nil, err
 	}
 
 	// Check if user already exists
@@ -127,14 +134,119 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 		return nil, errors.New("user with this username already exists")
 	}
 
+	return s.provisionUser(ctx, req.Username, req.Email, "", req.Password, req.TenantProvisioning)
+}
+
+// registerWithCode handles channel-based registration: the target
+// (phone/email) has been proven by a verification code, and the username is
+// generated server-side so the form stays minimal.
+func (s *userService) registerWithCode(ctx context.Context, req *types.RegisterRequest) (*types.User, error) {
+	if s.verificationCodeSvc == nil {
+		return nil, errors.New("verification code service unavailable")
+	}
+	channel := strings.TrimSpace(req.Channel)
+	target := strings.TrimSpace(req.Target)
+	code := strings.TrimSpace(req.Code)
+
+	switch channel {
+	case types.VerificationChannelSMS:
+		if !types.IsMainlandChinaMobile(target) {
+			return nil, errors.New("invalid mainland China mobile number")
+		}
+	case types.VerificationChannelEmail:
+		if !types.IsEmailFormat(target) {
+			return nil, errors.New("invalid email address")
+		}
+	default:
+		return nil, errors.New("unsupported registration channel")
+	}
+	if code == "" {
+		return nil, errors.New("verification code is required")
+	}
+	if err := ValidatePasswordPolicy(req.Password); err != nil {
+		return nil, err
+	}
+	if err := s.verificationCodeSvc.Verify(ctx, channel, target, types.VerificationPurposeRegister, code); err != nil {
+		if ve, ok := AsVerificationError(err); ok {
+			return nil, errors.New(ve.Message)
+		}
+		return nil, errors.New("verification code check failed")
+	}
+
+	// Duplicate guards per channel.
+	if channel == types.VerificationChannelSMS {
+		if existing, _ := s.userRepo.GetUserByPhone(ctx, target); existing != nil {
+			return nil, errors.New("user with this phone number already exists")
+		}
+	} else {
+		if existing, _ := s.userRepo.GetUserByEmail(ctx, target); existing != nil {
+			return nil, errors.New("user with this email already exists")
+		}
+	}
+
+	username, email, phone := s.deriveRegistrationIdentity(channel, target)
+	// Username collisions are resolved by suffixing random digits.
+	for i := 0; i < 5; i++ {
+		if existing, _ := s.userRepo.GetUserByUsername(ctx, username); existing == nil {
+			break
+		}
+		username = fmt.Sprintf("%s_%d", username, 100+randIntRange(900))
+	}
+
+	return s.provisionUser(ctx, username, email, phone, req.Password, req.TenantProvisioning)
+}
+
+// deriveRegistrationIdentity computes the (username, email, phone) triple
+// for a channel registration. Phone-registered accounts keep the real
+// number in users.phone and a non-deliverable placeholder in the NOT NULL
+// email column; email-registered accounts mirror that.
+func (s *userService) deriveRegistrationIdentity(channel, target string) (username, email, phone string) {
+	if channel == types.VerificationChannelSMS {
+		username = fmt.Sprintf("zilan_%s_%02d", target[len(target)-4:], randIntRange(100))
+		return username, target + "@phone.placeholder.local", target
+	}
+	local := strings.SplitN(target, "@", 2)[0]
+	sanitized := make([]rune, 0, len(local))
+	for _, r := range local {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			sanitized = append(sanitized, r)
+		default:
+			sanitized = append(sanitized, '_')
+		}
+	}
+	if len(sanitized) == 0 {
+		sanitized = []rune("zilan_user")
+	}
+	if len(sanitized) > 16 {
+		sanitized = sanitized[:16]
+	}
+	return string(sanitized), target, ""
+}
+
+// randIntRange returns a crypto-random int in [0, n).
+func randIntRange(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	v, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	if err != nil {
+		return 0
+	}
+	return int(v.Int64())
+}
+
+// provisionUser is the shared tail of both registration formats: hash the
+// password, optionally provision the personal workspace, create the user
+// row and bootstrap Owner membership.
+func (s *userService) provisionUser(ctx context.Context, username, email, phone, password string, provisioning types.TenantProvisioningMode) (*types.User, error) {
 	// Hash password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to hash password: %v", err)
 		return nil, errors.New("failed to process password")
 	}
 
-	provisioning := req.TenantProvisioning
 	if provisioning == "" {
 		provisioning = types.TenantProvisioningCreatePersonal
 	}
@@ -147,7 +259,7 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 		// Note: RetrieverEngines is left empty - system will use defaults
 		// from RETRIEVE_DRIVER env.
 		tenant := &types.Tenant{
-			Name:        fmt.Sprintf("%s's Workspace", secutils.SanitizeForLog(req.Username)),
+			Name:        fmt.Sprintf("%s's Workspace", secutils.SanitizeForLog(username)),
 			Description: "Default workspace",
 			Status:      "active",
 		}
@@ -162,8 +274,9 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	// Create user
 	user := &types.User{
 		ID:           uuid.New().String(),
-		Username:     req.Username,
-		Email:        req.Email,
+		Username:     username,
+		Email:        email,
+		Phone:        phone,
 		PasswordHash: string(hashedPassword),
 		TenantID:     0,
 		IsActive:     true,
@@ -203,23 +316,40 @@ func (s *userService) Register(ctx context.Context, req *types.RegisterRequest) 
 	return user, nil
 }
 
-// Login authenticates a user and returns tokens
+// Login authenticates a user and returns tokens. The identifier auto-detects
+// a mainland-China mobile number vs an email address (P0-4 §8); the legacy
+// Email field is honoured when Identifier is empty.
 func (s *userService) Login(ctx context.Context, req *types.LoginRequest) (*types.LoginResponse, error) {
 	logger.Info(ctx, "Start user login")
-	// Get user by email
-	user, err := s.userRepo.GetUserByEmail(ctx, req.Email)
-	if err != nil {
-		logger.Errorf(ctx, "Failed to get user by email: %v", err)
-		return &types.LoginResponse{
-			Success: false,
-			Message: "Invalid email or password",
-		}, nil
+
+	identifier := strings.TrimSpace(req.Identifier)
+	if identifier == "" {
+		identifier = strings.TrimSpace(req.Email)
+	}
+
+	var user *types.User
+	var err error
+	switch {
+	case types.IsMainlandChinaMobile(identifier):
+		user, err = s.userRepo.GetUserByPhone(ctx, identifier)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to get user by phone: %v", err)
+			return &types.LoginResponse{Success: false, Message: "Invalid account or password"}, nil
+		}
+	case types.IsEmailFormat(identifier):
+		user, err = s.userRepo.GetUserByEmail(ctx, identifier)
+		if err != nil {
+			logger.Errorf(ctx, "Failed to get user by email: %v", err)
+			return &types.LoginResponse{Success: false, Message: "Invalid account or password"}, nil
+		}
+	default:
+		return &types.LoginResponse{Success: false, Message: "Invalid account format, use a phone number or email"}, nil
 	}
 	if user == nil {
-		logger.Warn(ctx, "User not found for email")
+		logger.Warn(ctx, "User not found for identifier")
 		return &types.LoginResponse{
 			Success: false,
-			Message: "Invalid email or password",
+			Message: "Invalid account or password",
 		}, nil
 	}
 

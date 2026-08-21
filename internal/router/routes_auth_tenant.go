@@ -221,6 +221,13 @@ func RegisterAuthRoutes(r *gin.RouterGroup, handler *handler.AuthHandler, g *rba
 	publicAuthRL := middleware.PublicAuthRateLimit()
 	r.POST("/auth/register-by-invite", publicAuthRL, handler.RegisterByInvite)
 	r.POST("/auth/invitations/lookup", publicAuthRL, handler.LookupInvitationByToken)
+	// Captcha + verification-code surfaces (P0-4). The send endpoint is
+	// the expensive one (SMS/email delivery) so it shares the public
+	// IP rate limiter; challenge/verify are cheap and self-throttling
+	// (challenge TTL + attempt caps live in the captcha service).
+	r.GET("/auth/captcha", handler.GetCaptchaChallenge)
+	r.POST("/auth/captcha/verify", handler.VerifyCaptchaChallenge)
+	r.POST("/auth/verification-code/send", publicAuthRL, handler.SendVerificationCode)
 	r.POST("/auth/login", handler.Login)
 	r.POST("/auth/auto-setup", handler.AutoSetup)
 	r.GET("/auth/config", handler.GetAuthConfig)

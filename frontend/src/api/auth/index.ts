@@ -3,10 +3,14 @@ import i18n from '@/i18n'
 
 const t = (key: string) => i18n.global.t(key)
 
-// 用户登录接口
+// 用户登录接口。P0-4 双通道：identifier 接受手机号或邮箱（后端自动
+// 识别）；email 为旧客户端兼容字段。captcha_token 在
+// auth.captcha.login_required 开启（默认）时必填。
 export interface LoginRequest {
-  email: string
+  identifier?: string
+  email?: string
   password: string
+  captcha_token?: string
 }
 
 export interface LoginResponse {
@@ -68,11 +72,17 @@ export interface OIDCConfigResponse {
   message?: string
 }
 
-// 用户注册接口
+// 用户注册接口。P0-4 双格式：
+//   1. 通道式（channel: 'sms' | 'email' + target + code + password），
+//      手机/邮箱所有权由验证码证明，用户名由服务端自动生成；
+//   2. 经典式（username + email + password），零配置回退 / 邀请链接注册。
 export interface RegisterRequest {
-  username: string
-  email: string
+  username?: string
+  email?: string
   password: string
+  channel?: 'sms' | 'email'
+  target?: string
+  code?: string
 }
 
 export interface RegisterResponse {
@@ -263,6 +273,17 @@ export async function getOIDCConfig(): Promise<OIDCConfigResponse> {
 export interface AuthConfigResponse {
   success: boolean
   registration_mode: 'self_serve' | 'invite_only' | string
+  // P0-4：人机验证与验证码通道可用性。字段缺失（旧后端）时前端按
+  // “未启用”处理，回退到经典注册/登录表单。
+  captcha?: {
+    enabled: boolean
+    login_required: boolean
+    type: string // 'slider' | 'text'
+  }
+  channels?: {
+    sms_enabled: boolean
+    email_enabled: boolean
+  }
 }
 
 export async function getAuthConfig(): Promise<AuthConfigResponse> {
@@ -272,6 +293,79 @@ export async function getAuthConfig(): Promise<AuthConfigResponse> {
   } catch {
     return { success: false, registration_mode: 'self_serve' }
   }
+}
+
+// ---- 人机验证（captcha，P0-4 §5） ----------------------------------------
+
+export interface CaptchaChallengeResponse {
+  success: boolean
+  captcha_id: string
+  type: 'slider' | 'text'
+  // slider 挑战字段
+  background_image?: string // data:image/png;base64,...
+  piece_image?: string
+  piece_y?: number
+  piece_size?: number
+  // text 挑战字段
+  text_image?: string
+}
+
+export interface CaptchaVerifyRequest {
+  captcha_id: string
+  x?: number
+  answer?: string
+}
+
+export interface CaptchaVerifyResponse {
+  success: boolean
+  captcha_token?: string
+  message?: string
+}
+
+/**
+ * 获取人机验证挑战（滑块拼图 / 数字图形验证码）。
+ * 失败（含服务未启用 503）返回 null，由调用方决定降级表现。
+ */
+export async function getCaptchaChallenge(): Promise<CaptchaChallengeResponse | null> {
+  try {
+    const response = await get('/api/v1/auth/captcha')
+    return response as unknown as CaptchaChallengeResponse
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 校验人机验证答案。返回 success=false 表示答案错误（可重试），
+ * 抛错仅发生在网络/服务异常时。
+ */
+export async function verifyCaptchaChallenge(req: CaptchaVerifyRequest): Promise<CaptchaVerifyResponse> {
+  try {
+    const response = await post('/api/v1/auth/captcha/verify', req)
+    return response as unknown as CaptchaVerifyResponse
+  } catch (error: any) {
+    return { success: false, message: error?.message || '' }
+  }
+}
+
+// ---- 短信/邮箱验证码（P0-4 §6） -------------------------------------------
+
+export interface VerificationCodeSendRequest {
+  channel: 'sms' | 'email'
+  target: string
+  purpose: 'register'
+  captcha_token: string
+}
+
+/**
+ * 发送短信/邮箱验证码。与上面两个接口不同：HTTP 层的错误（频控、
+ * 通道未配置等）必须抛出而不是吞掉——调用方依赖 error.error.details
+ * 里的机器码（resend_too_frequent / daily_limit_exceeded / ...）
+ * 做 i18n 映射并驱动重发倒计时。
+ */
+export async function sendVerificationCode(data: VerificationCodeSendRequest): Promise<{ success: boolean; message?: string }> {
+  const response = await post('/api/v1/auth/verification-code/send', data)
+  return response as unknown as { success: boolean; message?: string }
 }
 
 /**

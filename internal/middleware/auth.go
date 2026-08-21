@@ -38,6 +38,13 @@ var noAuthAPI = map[string][]string{
 	"/api/v1/auth/register":   {"POST"},
 	"/api/v1/auth/login":      {"POST"},
 	"/api/v1/auth/auto-setup": {"POST"},
+	// Captcha + verification-code surfaces (P0-4): unauthenticated by
+	// design — the caller has no account yet. Abuse is bounded by the
+	// captcha ticket requirement on send, plus per-target frequency
+	// caps in the verification-code service.
+	"/api/v1/auth/captcha":                {"GET"},
+	"/api/v1/auth/captcha/verify":         {"POST"},
+	"/api/v1/auth/verification-code/send": {"POST"},
 	// Share-link surfaces accept a plaintext invite token from anonymous
 	// callers (an invitee who hasn't registered yet). They are registered
 	// as public routes in RegisterAuthRoutes and rate-limited by IP, so the

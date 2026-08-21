@@ -101,6 +101,9 @@ type UserRepository interface {
 	GetUserByEmail(ctx context.Context, email string) (*types.User, error)
 	// GetUserByUsername gets a user by username
 	GetUserByUsername(ctx context.Context, username string) (*types.User, error)
+	// GetUserByPhone gets a user by mobile number (P0-4 dual-channel login).
+	// Returns ErrUserNotFound when no user has that phone.
+	GetUserByPhone(ctx context.Context, phone string) (*types.User, error)
 	// GetUserByTenantID gets the first user (owner) of a tenant
 	GetUserByTenantID(ctx context.Context, tenantID uint64) (*types.User, error)
 	// UpdateUser updates a user

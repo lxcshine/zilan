@@ -264,6 +264,36 @@ Once started, visit **http://localhost** to get started.
 
 > To use a local Ollama model, run `ollama serve > /dev/null 2>&1 &` first.
 
+### ⚙️ First-Run Configuration (.env)
+
+`.env.example` is organized into commented sections (A runtime / B data & storage / C vector search / D models / E document parsing / F auth & security). Most entries can stay empty to use defaults. For a first deployment, focus on:
+
+| Section | When needed | Notes |
+|---------|-------------|-------|
+| `B1. Database` | External DB only | `docker compose up -d` ships with PostgreSQL and works out of the box; for your own DB, set `DB_DRIVER` / `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` |
+| `F1. SYSTEM_AES_KEY` | Change in production | 32-byte static encryption key for API keys / MCP / data-source credentials. The default is for evaluation only; **encrypted data is unrecoverable if the key is lost** |
+| `D1 / D2. Models` | Before first use | Configure any provider's API key via Web UI after startup, or declare built-in models via `config/builtin_models.yaml` (see file comments) |
+| `F2.5. Verification codes` | Optional | Registration/login verification channels, see below |
+
+**Registration / Login Verification Channels (optional, log dev mode by default)**
+
+Registration and login support phone / email dual channels with automatic format validation, human verification (slider puzzle or digit image, switch via `WEKNORA_AUTH_CAPTCHA_TYPE`), and passwords must contain uppercase, lowercase and digits. Unconfigured channels run in `log` mode — codes are written to server logs only (search `auth/email:log` / `auth/sms:log`), so the full flow works with zero configuration.
+
+To actually send email codes (QQ Mail example):
+
+```bash
+WEKNORA_AUTH_EMAIL_PROVIDER=smtp            # log=log only (default) / smtp=real delivery
+WEKNORA_AUTH_EMAIL_SMTP_PRESET=qq           # Provider preset: fills host/port/TLS automatically
+WEKNORA_AUTH_EMAIL_SMTP_USERNAME=you@qq.com # Sender mailbox
+WEKNORA_AUTH_EMAIL_SMTP_PASSWORD=<SMTP auth code> # Not the mailbox login password
+```
+
+- **Presets**: `qq` / `163` / `126` / `gmail` / `exmail` (Tencent Exmail) / `aliyun` (Alibaba mail) / `outlook` (Microsoft 365). For self-hosted enterprise mail, skip the preset and set `WEKNORA_AUTH_EMAIL_SMTP_HOST` / `PORT` directly (credentials optional for internal unauthenticated relays)
+- **Auth codes**: QQ/163 mailboxes generate one after enabling POP3/SMTP service in settings; Gmail needs an App Password with 2FA enabled
+- **SMS codes**: set `WEKNORA_AUTH_SMS_PROVIDER=aliyun` plus the four Alibaba Cloud SMS credentials (`WEKNORA_AUTH_SMS_ALIYUN_*`) for real delivery
+
+Restart to apply `.env` changes: `docker compose down && docker compose up -d`
+
 ### 🔧 Optional Services (Docker Compose Profiles)
 
 Add `--profile` flags to enable additional components. Multiple profiles can be combined:

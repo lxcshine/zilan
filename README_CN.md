@@ -264,6 +264,36 @@ docker compose up -d   # 启动核心服务
 
 > 如需使用本地 Ollama 模型，请先运行 `ollama serve > /dev/null 2>&1 &`
 
+### ⚙️ 初次运行配置（.env）
+
+`.env.example` 按用途分区并附逐项注释（A 运行时基础 / B 数据与存储 / C 向量检索 / D 模型 / E 文档解析 / F 认证与安全），绝大多数项留空即用默认值。初次部署只需关注：
+
+| 配置节 | 何时需要 | 说明 |
+|--------|----------|------|
+| `B1. 数据库` | 自建数据库时 | `docker compose up -d` 自带 PostgreSQL，默认连接参数开箱即用；自建库需改 `DB_DRIVER` / `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` |
+| `F1. SYSTEM_AES_KEY` | 生产必改 | 32 字节静态加密密钥（加密 API Key / MCP / 数据源凭据）。默认值仅供体验；**丢失后已加密数据不可恢复，请妥善保管** |
+| `D1 / D2. 模型` | 使用前需配置 | 启动后可在 Web UI「模型管理」配置任意厂商 API Key，或通过 `config/builtin_models.yaml` 声明式内置（详见文件内注释） |
+| `F2.5. 验证码` | 可选 | 注册/登录的验证码与人机验证通道，见下文 |
+
+**注册 / 登录验证码通道（可选，默认 log 开发模式）**
+
+注册与登录支持手机号 / 邮箱双通道、格式自动校验、人机验证（滑块拼图或数字图形，`WEKNORA_AUTH_CAPTCHA_TYPE` 切换），密码须同时包含大小写字母与数字。验证码通道未配置时走 `log` 模式——验证码只写入服务端日志（搜 `auth/email:log` / `auth/sms:log`），不真正发送，便于零配置体验完整流程。
+
+邮箱验证码真实发信（以 QQ 邮箱为例）：
+
+```bash
+WEKNORA_AUTH_EMAIL_PROVIDER=smtp            # log=只写日志（默认） / smtp=真实发信
+WEKNORA_AUTH_EMAIL_SMTP_PRESET=qq           # 服务商预设，自动填充服务器地址/端口/加密方式
+WEKNORA_AUTH_EMAIL_SMTP_USERNAME=you@qq.com # 发件邮箱
+WEKNORA_AUTH_EMAIL_SMTP_PASSWORD=<SMTP授权码> # 非邮箱登录密码
+```
+
+- **预设支持**：`qq` / `163` / `126` / `gmail` / `exmail`（腾讯企业邮）/ `aliyun`（阿里企业邮）/ `outlook`（Microsoft 365）；自建企业邮箱不设 preset，直接填 `WEKNORA_AUTH_EMAIL_SMTP_HOST` / `PORT`（内网免认证中继可不填账号密码）
+- **授权码获取**：QQ/163 邮箱在设置中开启 POP3/SMTP 服务后生成；Gmail 需开启两步验证后生成应用专用密码
+- **短信验证码**：`WEKNORA_AUTH_SMS_PROVIDER=aliyun` 并补全四项阿里云短信凭证（`WEKNORA_AUTH_SMS_ALIYUN_*`）后真实发送
+
+修改 `.env` 后重启生效：`docker compose down && docker compose up -d`
+
 ### 🔧 可选服务（Docker Compose Profile）
 
 按需添加 `--profile` 启动额外组件，多个 profile 可叠加使用：

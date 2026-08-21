@@ -36,6 +36,12 @@ type AuthHandler struct {
 	// fixtures — the share-link endpoints respond 503 rather than
 	// blocking the rest of the auth surface.
 	invitationSvc interfaces.TenantInvitationService
+	// captchaSvc backs the login captcha gate (P0-4). Nil (legacy test
+	// fixtures) disables the gate rather than blocking password logins.
+	captchaSvc interfaces.CaptchaService
+	// verificationCodeSvc backs channel-based registration. Nil keeps
+	// register working in the classic format only.
+	verificationCodeSvc interfaces.VerificationCodeService
 }
 
 // NewAuthHandler creates a new auth handler instance with the provided services
@@ -54,6 +60,8 @@ func NewAuthHandler(configInfo *config.Config,
 	userService interfaces.UserService, tenantService interfaces.TenantService,
 	systemSettingSvc interfaces.SystemSettingService,
 	invitationSvc interfaces.TenantInvitationService,
+	captchaSvc interfaces.CaptchaService,
+	verificationCodeSvc interfaces.VerificationCodeService,
 ) *AuthHandler {
 	// Boot-time guard: a nil-or-empty Auth section silently disables the
 	// invite_only gate (see Register below). Emit a loud one-shot log
@@ -66,11 +74,13 @@ func NewAuthHandler(configInfo *config.Config,
 			configInfo)
 	}
 	return &AuthHandler{
-		configInfo:       configInfo,
-		userService:      userService,
-		tenantService:    tenantService,
-		systemSettingSvc: systemSettingSvc,
-		invitationSvc:    invitationSvc,
+		configInfo:          configInfo,
+		userService:         userService,
+		tenantService:       tenantService,
+		systemSettingSvc:    systemSettingSvc,
+		invitationSvc:       invitationSvc,
+		captchaSvc:          captchaSvc,
+		verificationCodeSvc: verificationCodeSvc,
 	}
 }
 
@@ -164,17 +174,25 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 	req.Username = secutils.SanitizeForLog(req.Username)
 	req.Email = secutils.SanitizeForLog(req.Email)
-	req.Password = secutils.SanitizeForLog(req.Password)
+	req.Target = secutils.SanitizeForLog(req.Target)
 
-	// Validate required fields
-	if req.Username == "" || req.Email == "" || req.Password == "" {
+	// Validate required fields per wire format (P0-4 §7):
+	//   - channel registration: channel + target + code + password
+	//   - classic registration: username + email + password
+	channel := strings.TrimSpace(req.Channel)
+	if channel != "" {
+		if req.Target == "" || strings.TrimSpace(req.Code) == "" {
+			logger.Error(ctx, "Missing channel registration fields")
+			appErr := errors.NewValidationError("Target and verification code are required")
+			c.Error(appErr)
+			return
+		}
+	} else if req.Username == "" || req.Email == "" {
 		logger.Error(ctx, "Missing required registration fields")
 		appErr := errors.NewValidationError("Username, email and password are required")
 		c.Error(appErr)
 		return
 	}
-	req.Username = secutils.SanitizeForLog(req.Username)
-	req.Email = secutils.SanitizeForLog(req.Email)
 	req.TenantProvisioning = h.resolveDefaultTenantMode(ctx)
 	// Call service to register user
 	user, err := h.userService.Register(ctx, &req)
@@ -218,14 +236,31 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		c.Error(appErr)
 		return
 	}
-	email := secutils.SanitizeForLog(req.Email)
+
+	// P0-4 dual-channel: Identifier (phone or email, auto-detected) with
+	// the legacy Email field as fallback for older clients.
+	identifier := strings.TrimSpace(req.Identifier)
+	if identifier == "" {
+		identifier = strings.TrimSpace(req.Email)
+	}
 
 	// Validate required fields
-	if req.Email == "" || req.Password == "" {
+	if identifier == "" || req.Password == "" {
 		logger.Error(ctx, "Missing required login fields")
-		appErr := errors.NewValidationError("Email and password are required")
+		appErr := errors.NewValidationError("Account and password are required")
 		c.Error(appErr)
 		return
+	}
+
+	// Human-verification gate (P0-4 §5.3): when enabled (default) the
+	// client must present a captcha ticket from POST /auth/captcha/verify.
+	// It is consumed here — replaying one token across attempts fails.
+	if h.captchaLoginRequired() {
+		if h.captchaSvc == nil || !h.captchaSvc.ConsumeToken(ctx, req.CaptchaToken) {
+			appErr := errors.NewValidationError("captcha verification required")
+			c.Error(appErr)
+			return
+		}
 	}
 
 	// Call service to authenticate user
@@ -246,8 +281,18 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	// User is already in the correct format from service
 
-	logger.Infof(ctx, "User logged in successfully, email: %s", email)
+	logger.Infof(ctx, "User logged in successfully, account: %s", secutils.SanitizeForLog(identifier))
 	c.JSON(http.StatusOK, dto.NewAuthLoginResponse(response))
+}
+
+// captchaLoginRequired mirrors config into a nil-safe predicate: the gate
+// defaults ON; a missing captcha service (legacy fixtures) disables it so
+// password logins keep working.
+func (h *AuthHandler) captchaLoginRequired() bool {
+	if h.captchaSvc == nil {
+		return false
+	}
+	return h.configInfo == nil || h.configInfo.Auth == nil || h.configInfo.Auth.CaptchaLoginRequired()
 }
 
 // GetOIDCAuthorizationURL godoc
@@ -707,15 +752,28 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 //
 // GetAuthConfig is intentionally a no-auth endpoint: the frontend reads
 // it on app load to decide whether to show the Register tab. We expose
-// only what the UI strictly needs (registration_mode); other config
-// stays internal.
+// only what the UI strictly needs (registration_mode, captcha flavour and
+// which verification channels are usable); other config stays internal.
 func (h *AuthHandler) GetAuthConfig(c *gin.Context) {
 	// Same source-of-truth as Register's gate, so the UI hide-the-button
 	// signal can never disagree with the API enforcement signal.
-	mode := h.resolveRegistrationMode(c.Request.Context())
+	ctx := c.Request.Context()
+	mode := h.resolveRegistrationMode(ctx)
+
+	captcha := gin.H{
+		"login_required": h.captchaLoginRequired(),
+		"type":           h.captchaPublicType(),
+		"enabled":        h.captchaSvc != nil,
+	}
+	channels := gin.H{
+		"sms_enabled":   h.verificationCodeSvc != nil && h.verificationCodeSvc.ChannelEnabled(types.VerificationChannelSMS),
+		"email_enabled": h.verificationCodeSvc != nil && h.verificationCodeSvc.ChannelEnabled(types.VerificationChannelEmail),
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success":           true,
 		"registration_mode": mode,
+		"captcha":           captcha,
+		"channels":          channels,
 	})
 }
 
