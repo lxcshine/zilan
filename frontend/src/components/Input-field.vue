@@ -2458,7 +2458,28 @@ defineExpose({
     if (!text.trim()) return;
     query.value = text;
     nextTick(() => createSession(text));
-  }
+  },
+  // 快捷入口注入文件（PRD §7.2「文档解读」）：复用拖拽/粘贴同一分流逻辑
+  addFiles(files: File[]) {
+    handleDroppedFiles(files);
+  },
+  // 快捷入口预填 prompt（PRD §7.2「智能写作」「网页摘要」）
+  setQuery(text: string) {
+    query.value = text;
+    nextTick(() => {
+      const el = textareaRef.value as any;
+      el?.focus?.();
+      if (el?.$el?.querySelector) {
+        const inner = el.$el.querySelector('textarea');
+        if (inner) {
+          inner.focus();
+          // 光标移到末尾，便于在模板后继续输入
+          const len = inner.value.length;
+          inner.setSelectionRange(len, len);
+        }
+      }
+    });
+  },
 });
 
 </script>
@@ -2744,7 +2765,7 @@ const getImgSrc = (url: string) => {
 .rich-input-container {
   position: relative;
   width: 100%;
-  max-width: 960px;
+  max-width: var(--app-content-max, 768px);
   background: var(--td-bg-color-container, #FFF);
   border-radius: 16px;
   border: 1px solid var(--td-component-stroke, #dcdcdc);

@@ -1,15 +1,15 @@
 <template>
-  <!-- 全局右上角"待处理邀请"铃铛。
-       - 与原先 UserMenu 中铃铛的逻辑一致：只在 pendingInvitationCount > 0 时渲染，
-         空收件箱场景不占用角落像素。
+  <!-- 全局右上角通知铃铛（PRD ui-layout-visual-redesign §4.4）。
+       - 汇聚两类通知：待处理邀请（打开收件箱弹窗）+ 共享空间待审批加入请求
+         （组织入口从 Rail 移除后，徽标并入铃铛，点击直达待审批列表）。
+       - 只在总数 > 0 时渲染，空收件箱场景不占用角落像素。
        - 固定定位、z-index 远低于 t-drawer 默认 2500，业务页面右侧抽屉（FAQ、KB 调试、
-         Tenant 审计、SettingDrawer 等）弹出时会自然覆盖铃铛，不需要特意联动隐藏。
-       - 点击铃铛复用同一份 MyInvitationsDialog，行为与之前一致。 -->
-  <template v-if="pendingInvitationCount > 0">
-    <t-badge :count="pendingInvitationCount" :max-count="99" :offset="[6, 4]"
+         Tenant 审计、SettingDrawer 等）弹出时会自然覆盖铃铛，不需要特意联动隐藏。 -->
+  <template v-if="totalNoticeCount > 0">
+    <t-badge :count="totalNoticeCount" :max-count="99" :offset="[6, 4]"
       class="global-invitation-bell">
       <button type="button" class="global-invitation-bell__btn"
-        :title="$t('tenantInvitation.inboxTooltip')" @click="openDialog">
+        :title="bellTooltip" @click="handleClick">
         <t-icon name="notification" size="18px" />
       </button>
     </t-badge>
@@ -19,15 +19,38 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationStore } from '@/stores/organization'
 import MyInvitationsDialog from '@/components/MyInvitationsDialog.vue'
 
+const { t } = useI18n()
+const router = useRouter()
 const authStore = useAuthStore()
+const orgStore = useOrganizationStore()
 
 const pendingInvitationCount = computed(() => authStore.pendingInvitationCount)
 
+// 组织待审批加入请求：仅空间管理员可见（与旧侧栏徽标的可见性一致）
+const orgPendingCount = computed(() =>
+  !authStore.isLiteMode && authStore.hasRole('admin') ? orgStore.totalPendingJoinRequestCount : 0
+)
+
+const totalNoticeCount = computed(() => pendingInvitationCount.value + orgPendingCount.value)
+
+const bellTooltip = computed(() =>
+  orgPendingCount.value > 0 ? t('organization.settings.pendingJoinRequestsBadge') : t('tenantInvitation.inboxTooltip')
+)
+
 const dialogVisible = ref(false)
-const openDialog = () => {
+
+const handleClick = () => {
+  // 有待审批加入请求时直达组织待审批列表；否则回落到邀请收件箱
+  if (orgPendingCount.value > 0) {
+    router.push('/platform/organizations')
+    return
+  }
   dialogVisible.value = true
 }
 </script>

@@ -1031,11 +1031,20 @@ onBeforeRouteUpdate((to, from, next) => {
     display: flex;
     flex-direction: column;
     align-items: center;
-    max-width: calc(100vw - 260px);
+    /* 三栏布局宽度补偿（PRD §3.2）：Rail 60px + 列表栏 264px = 324px；
+       1024-1279 断点下列表栏为 232px → 292px */
+    max-width: calc(100vw - 324px);
     min-width: 400px;
 
     &.is-sidebar-collapsed {
-        max-width: calc(100vw - 60px);
+        /* 折叠态：Rail 60px + 展开条 18px = 78px */
+        max-width: calc(100vw - 78px);
+    }
+
+    @media (max-width: 1279px) {
+        &:not(.is-sidebar-collapsed) {
+            max-width: calc(100vw - 292px);
+        }
     }
 
     &.is-embedded {
@@ -1181,7 +1190,7 @@ onBeforeRouteUpdate((to, from, next) => {
     display: flex;
     flex-direction: column;
     gap: 20px;
-    max-width: 960px;
+    max-width: var(--app-content-max, 768px);
     padding: 16px 0;
     animation: contentFadeIn 0.3s ease-out;
 }
@@ -1203,9 +1212,21 @@ onBeforeRouteUpdate((to, from, next) => {
     flex-shrink: 0;
     margin: 0 auto;
     width: 100%;
-    max-width: 960px;
+    max-width: var(--app-content-max, 768px);
     box-sizing: border-box;
     position: relative;
+
+    /* 贴底输入框上缘渐隐遮罩（PRD §7.3）：消息流滚入输入框后缘时柔和淡出 */
+    &::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 100%;
+        height: 20px;
+        background: linear-gradient(to top, var(--td-bg-color-container), transparent);
+        pointer-events: none;
+    }
 
     &.is-embedded {
         max-width: 100%;
@@ -1222,7 +1243,8 @@ onBeforeRouteUpdate((to, from, next) => {
     display: flex;
     flex-direction: column;
     gap: 16px;
-    max-width: 960px;
+    /* 会话态消息流内容列宽（PRD ui-layout-visual-redesign §3.2/§7.3） */
+    max-width: var(--app-content-max, 768px);
     flex: 1;
     margin: 0 auto;
     width: 100%;

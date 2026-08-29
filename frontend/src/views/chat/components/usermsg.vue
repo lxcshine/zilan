@@ -220,7 +220,8 @@ const closePreImg = () => {
     align-items: flex-start;
     gap: 4px;
     flex: 1 0 0;
-    border-radius: 18px;
+    /* 用户消息浅灰底右对齐气泡（PRD ui-layout-visual-redesign §7.3：圆角 14px） */
+    border-radius: var(--td-radius-large, 14px);
     background: var(--td-bg-color-secondarycontainer);
     margin-left: auto;
     color: var(--td-text-color-primary);

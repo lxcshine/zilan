@@ -200,3 +200,21 @@ select:-webkit-autofill {
     border-color: var(--td-brand-color);
     box-shadow: none;
 }
+
+/* ===== 三栏布局令牌（PRD ui-layout-visual-redesign §8.1）=====
+   Rail 60px / 列表栏 264px / 画布内容列 768px / hero 输入框 720px。
+   亮暗模式取值一致，仅作为布局尺寸单一来源。 */
+:root:root,
+:root:root[theme-mode="light"] {
+    --app-rail-width: 60px;
+    --app-listbar-width: 264px;
+    --app-content-max: 768px;
+    --app-hero-input-max: 720px;
+}
+
+:root:root[theme-mode="dark"] {
+    --app-rail-width: 60px;
+    --app-listbar-width: 264px;
+    --app-content-max: 768px;
+    --app-hero-input-max: 720px;
+}

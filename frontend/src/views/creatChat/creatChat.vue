@@ -1,9 +1,31 @@
 <template>
+    <!-- 新对话态画布（PRD ui-layout-visual-redesign §7.1/§7.2）：
+         品牌标识 + 知澜 Copilot 状态 Label → 中央悬浮输入框（hero）→ 底部快捷入口 → 推荐问题 -->
     <div class="dialogue-wrap">
         <div class="dialogue-answers">
-            <div class="dialogue-title" style="--wails-draggable: drag">
-                <span style="--wails-draggable: drag">{{ $t('createChat.title') }}</span>
+            <!-- 品牌区 + 激励 Label（ima「ima copilot」对应物） -->
+            <div class="hero-brand" style="--wails-draggable: drag">
+                <div class="hero-brand__mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="28" height="24" fill="none">
+                        <circle cx="12" cy="12" r="3.2" fill="currentColor" />
+                        <path d="M12 5.4c4.3 0 7.8 3 7.8 6.6" stroke="currentColor" stroke-width="1.4"
+                            stroke-linecap="round" opacity="0.75" />
+                        <path d="M12 2.6c5.9 0 10.7 4.2 10.7 9.4" stroke="currentColor" stroke-width="1.4"
+                            stroke-linecap="round" opacity="0.5" />
+                    </svg>
+                </div>
+                <span class="hero-brand__word">{{ $t('createChat.title') }}</span>
+                <span class="hero-brand__copilot">{{ $t('hero.copilotBadge') }}</span>
             </div>
+
+            <!-- 中央悬浮输入框（hero 形态）：复用 InputField 全部能力（模型切换/@联想/附件/发送） -->
+            <div class="hero-composer">
+                <InputField ref="inputFieldRef" @send-msg="sendMsg"></InputField>
+            </div>
+
+            <!-- 底部快捷入口 -->
+            <QuickActions @files="onQuickFiles" @prefill="onQuickPrefill" @create-kb="uiStore.openCreateKB('document')" />
+
             <!-- 推荐问题 -->
             <div ref="sqContainerRef" class="suggested-questions-container">
                 <!-- 骨架屏占位 -->
@@ -43,7 +65,6 @@
                     </div>
                 </transition>
             </div>
-            <InputField ref="inputFieldRef" @send-msg="sendMsg"></InputField>
         </div>
     </div>
 
@@ -58,6 +79,7 @@
 import { ref, watch, onMounted, nextTick, computed } from 'vue';
 import ContextualGuide from '@/components/ContextualGuide.vue';
 import InputField from '@/components/Input-field.vue';
+import QuickActions from '@/components/chat/QuickActions.vue';
 import { createSessions } from "@/api/chat/index";
 import { getSuggestedQuestions } from "@/api/agent/index";
 import type { SuggestedQuestion } from "@/api/agent/index";
@@ -81,6 +103,15 @@ const { navigateToKnowledgeBaseList } = useKnowledgeBaseCreationNavigation();
 const showChatContextualGuide = computed(() => {
     return route.name === 'globalCreatChat' || route.name === 'kbCreatChat';
 });
+
+// ===== 快捷入口（PRD §7.2）=====
+const onQuickFiles = (files: File[]) => {
+    inputFieldRef.value?.addFiles(files);
+};
+
+const onQuickPrefill = (text: string) => {
+    inputFieldRef.value?.setQuery(text);
+};
 
 // ===== 推荐问题 =====
 const suggestedQuestions = ref<SuggestedQuestion[]>([]);
@@ -248,7 +279,7 @@ const handleKBEditorSuccess = (kbId: string) => {
     display: flex;
     justify-content: center;
     align-items: center;
-    // position: relative;
+    overflow-y: auto;
 }
 
 .dialogue-answers {
@@ -256,8 +287,11 @@ const handleKBEditorSuccess = (kbId: string) => {
     flex-flow: column;
     align-items: center;
     width: 100%;
-    max-width: 960px;
-    gap: 32px;
+    max-width: var(--app-hero-input-max, 720px);
+    gap: 24px;
+    // hero 垂直中心上移，为快捷区与推荐问题留出视觉重心
+    margin-top: -6vh;
+    padding: 24px 16px 32px;
 
     :deep(.answers-input) {
         position: static;
@@ -265,31 +299,46 @@ const handleKBEditorSuccess = (kbId: string) => {
     }
 }
 
-.dialogue-title {
+// ===== 品牌区 + 状态 Label（PRD §6.1/§7.1）=====
+.hero-brand {
     display: flex;
-    color: var(--td-text-color-primary);
-    font-family: var(--app-font-family);
-    font-size: 28px;
-    font-weight: 500;
-    letter-spacing: 0.02em;
     align-items: center;
-    margin-bottom: 0;
+    gap: 10px;
+    color: var(--td-text-color-primary);
 
-    .icon {
+    .hero-brand__mark {
         display: flex;
-        width: 32px;
-        height: 32px;
-        justify-content: center;
         align-items: center;
-        border-radius: 6px;
-        background: var(--td-bg-color-container);
-        box-shadow: var(--td-shadow-1);
-        margin-right: 12px;
+        color: var(--td-text-color-primary);
+    }
 
-        .logo_img {
-            height: 24px;
-            width: 24px;
-        }
+    .hero-brand__word {
+        font-family: var(--app-font-family);
+        font-size: 24px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+    }
+
+    // 激励 Label：胶囊、浅灰底、12px
+    .hero-brand__copilot {
+        height: 22px;
+        padding: 0 10px;
+        border-radius: 999px;
+        background: var(--td-bg-color-secondarycontainer);
+        color: var(--td-text-color-secondary);
+        font-size: 12px;
+        line-height: 22px;
+    }
+}
+
+// ===== 中央悬浮输入框（hero 形态）=====
+.hero-composer {
+    width: 100%;
+
+    // 聚焦升浮：边框 + 阴影微变（呼吸感来自阴影，不用彩色光晕）
+    :deep(.rich-input-container) {
+        border-radius: 18px;
+        max-width: 100%;
     }
 }
 
@@ -306,7 +355,7 @@ const handleKBEditorSuccess = (kbId: string) => {
 }
 
 .suggested-questions-container {
-    max-width: 960px;
+    max-width: 100%;
     margin: 0;
     padding: 0 16px;
     transition: height 0.35s @suggested-ease;
@@ -361,46 +410,6 @@ const handleKBEditorSuccess = (kbId: string) => {
 
     &.sq-card-visible:active {
         transform: scale(0.98);
-    }
-}
-
-@media (max-width: 1250px) and (min-width: 1045px) {
-    .answers-input {
-        transform: translateX(-329px);
-    }
-
-    :deep(.t-textarea__inner) {
-        width: 654px !important;
-    }
-}
-
-@media (max-width: 1045px) {
-    .answers-input {
-        transform: translateX(-250px);
-    }
-
-    :deep(.t-textarea__inner) {
-        width: 500px !important;
-    }
-}
-
-@media (max-width: 750px) {
-    .answers-input {
-        transform: translateX(-250px);
-    }
-
-    :deep(.t-textarea__inner) {
-        width: 340px !important;
-    }
-}
-
-@media (max-width: 600px) {
-    .answers-input {
-        transform: translateX(-250px);
-    }
-
-    :deep(.t-textarea__inner) {
-        width: 300px !important;
     }
 }
 </style>

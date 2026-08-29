@@ -91,7 +91,8 @@ const router = createRouter({
     {
       path: "/platform",
       name: "Platform",
-      redirect: "/platform/knowledge-bases",
+      // 新对话态作为 /platform 默认落地（PRD ui-layout-visual-redesign §6.2）
+      redirect: "/platform/creatChat",
       component: () => import("../views/platform/index.vue"),
       meta: { requiresInit: true, requiresAuth: true },
       children: [
@@ -115,6 +116,20 @@ const router = createRouter({
           path: "knowledge-bases/:kbId",
           name: "knowledgeBaseDetail",
           component: () => import("../views/knowledge/KnowledgeBase.vue"),
+          meta: { requiresInit: true, requiresAuth: true }
+        },
+        {
+          // 文档模式（全局文档库，PRD ui-layout-visual-redesign §9）：
+          // 列表态为跨库概览，详情态复用同一画布组件
+          path: "documents",
+          name: "documentList",
+          component: () => import("../views/documents/DocumentsView.vue"),
+          meta: { requiresInit: true, requiresAuth: true }
+        },
+        {
+          path: "documents/:kbId/:knowledgeId",
+          name: "documentDetail",
+          component: () => import("../views/documents/DocumentsView.vue"),
           meta: { requiresInit: true, requiresAuth: true }
         },
         {

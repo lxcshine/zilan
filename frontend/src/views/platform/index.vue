@@ -1,6 +1,8 @@
 <template>
     <div class="main" ref="dropzone">
-        <Menu></Menu>
+        <!-- 三栏布局（PRD ui-layout-visual-redesign §3）：一级 Rail + 二级列表栏 + 主画布 -->
+        <AppRail />
+        <ListPanel />
         <div v-if="isRouterAlive" class="platform-route-outlet">
             <RouterView />
         </div>
@@ -19,7 +21,8 @@
     </div>
 </template>
 <script setup lang="ts">
-import Menu from '@/components/menu.vue'
+import AppRail from '@/components/layout/AppRail.vue'
+import ListPanel from '@/components/layout/ListPanel.vue'
 import { ref, onMounted, onUnmounted, nextTick, provide, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router'
 import UploadMask from '@/components/upload-mask.vue'
@@ -29,6 +32,7 @@ import GlobalInvitationBell from '@/components/GlobalInvitationBell.vue'
 import NewUserGuide from '@/components/NewUserGuide.vue'
 import { useCommandPaletteStore } from '@/stores/commandPalette'
 import { useChatResourcesStore } from '@/stores/chatResources'
+import { useUIStore } from '@/stores/ui'
 import { getKnowledgeBaseById } from '@/api/knowledge-base/index'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
@@ -60,6 +64,15 @@ const handleGlobalKeyDown = (e: KeyboardEvent) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
         e.preventDefault()
         reloadApp()
+    }
+}
+
+// ⌘/Ctrl + B：折叠/展开二级列表栏（PRD ui-layout-visual-redesign §3.3）。
+// 在输入控件内也不拦截（Ctrl+B 浏览器无默认行为，安全）。
+const handleToggleListbarKey = (e: KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault()
+        useUIStore().toggleSidebar()
     }
 }
 
@@ -205,6 +218,7 @@ onMounted(() => {
     document.addEventListener('dragover', handleGlobalDragOver, true);
     document.addEventListener('dragleave', handleGlobalDragLeave, true);
     document.addEventListener('drop', handleGlobalDrop, true);
+    window.addEventListener('keydown', handleToggleListbarKey);
     if (isWailsDesktop) {
         window.addEventListener('keydown', handleGlobalKeyDown);
         // @ts-ignore
@@ -240,6 +254,7 @@ onUnmounted(() => {
     document.removeEventListener('dragover', handleGlobalDragOver, true);
     document.removeEventListener('dragleave', handleGlobalDragLeave, true);
     document.removeEventListener('drop', handleGlobalDrop, true);
+    window.removeEventListener('keydown', handleToggleListbarKey);
     if (isWailsDesktop) {
         window.removeEventListener('keydown', handleGlobalKeyDown);
         // @ts-ignore

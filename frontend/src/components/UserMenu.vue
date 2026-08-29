@@ -1,12 +1,12 @@
 <template>
-  <div class="user-menu" :class="{ 'user-menu--collapsed': uiStore.sidebarCollapsed }" ref="menuRef">
+  <div class="user-menu" :class="{ 'user-menu--collapsed': isCompact }" ref="menuRef">
     <!-- 用户按钮 -->
     <div class="user-button" data-guide="user-menu" @click="toggleMenu">
       <div class="user-avatar">
         <img v-if="userAvatar" :src="userAvatar" :alt="$t('common.avatar')" />
         <span v-else class="avatar-placeholder">{{ userInitial }}</span>
       </div>
-      <template v-if="!uiStore.sidebarCollapsed">
+      <template v-if="!isCompact">
         <div class="user-info">
           <!-- 多空间 / superuser：首行空间名，次行 username · 角色。单空间：昵称 + 邮箱。 -->
           <template v-if="showTenantIdentityLine">
@@ -27,6 +27,7 @@
         <t-icon :name="menuVisible ? 'chevron-up' : 'chevron-down'" class="dropdown-icon" />
       </template>
     </div>
+
 
     <!-- 下拉菜单 -->
     <Transition name="dropdown">
@@ -81,6 +82,12 @@
         <div v-if="!authStore.isLiteMode" class="menu-item" @click="handleQuickNav('tenant')">
           <t-icon name="user-circle" class="menu-icon" />
           <span>{{ $t('settings.workspaceSettings') }}</span>
+        </div>
+        <!-- 我的空间：组织（共享空间）管理入口，从一级导航降级到用户菜单（PRD §4.4） -->
+        <div v-if="canOpenOrganizations" class="menu-item" @click="handleOpenOrganizations">
+          <t-icon name="cluster" class="menu-icon" />
+          <span>{{ $t('rail.mySpaces') }}</span>
+          <span v-if="orgPendingCount > 0" class="menu-item-badge">{{ orgPendingCount > 99 ? '99+' : orgPendingCount }}</span>
         </div>
         <!-- “管理”类快捷入口只对真正具备写权限的人展示。只读名册和模型列表
              仍可从「全部设置」进入，避免 viewer 看到名不副实的管理入口。 -->
@@ -179,6 +186,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useUIStore } from '@/stores/ui'
 import { useAuthStore } from '@/stores/auth'
+import { useOrganizationStore } from '@/stores/organization'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { getCurrentUser, logout as logoutApi, userInfoFromApi } from '@/api/auth'
 import { useI18n } from 'vue-i18n'
@@ -196,9 +204,20 @@ import { SETTINGS_MANAGEMENT_SHORTCUT_MIN_ROLE } from '@/config/settingsAccess'
 
 const { t } = useI18n()
 
+// compact：Rail 底部的紧凑形态（仅头像 + 下拉菜单）。旧侧栏折叠态语义保留：
+// 未显式传 compact 时跟随 uiStore.sidebarCollapsed。
+const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: undefined })
+
 const router = useRouter()
 const uiStore = useUIStore()
 const authStore = useAuthStore()
+
+const isCompact = computed(() => (props.compact ?? false) || uiStore.sidebarCollapsed)
+
+// 「我的空间」入口（PRD §4.4）：组织从 Rail 移除后，admin/owner 从头像菜单进入
+const canOpenOrganizations = computed(() => !authStore.isLiteMode && authStore.hasRole('admin'))
+const orgStore = useOrganizationStore()
+const orgPendingCount = computed(() => orgStore.totalPendingJoinRequestCount)
 const { formatRole, roleIcon } = useRoleLabel()
 const { homeTenantId, isHomeTenantActive, isHomeTenant } = useHomeTenant()
 
@@ -469,6 +488,12 @@ const clampFloatingToViewport = (selector: string, target: { value: Record<strin
 const reopenGuide = () => {
   menuVisible.value = false
   openNewUserGuide()
+}
+
+// 我的空间：组织管理页（PRD §4.4 组织入口降级）
+const handleOpenOrganizations = () => {
+  menuVisible.value = false
+  router.push('/platform/organizations')
 }
 
 // 注销
@@ -909,7 +934,6 @@ onUnmounted(() => {
   transition: all 0.2s;
   font-size: 14px;
   color: var(--td-text-color-primary);
-
   &:hover {
     background: var(--td-bg-color-container-hover);
   }
@@ -924,6 +948,21 @@ onUnmounted(() => {
     .menu-icon {
       color: var(--td-error-color);
     }
+  }
+
+  // 我的空间待审批徽标（PRD §4.4）
+  .menu-item-badge {
+    margin-left: auto;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: var(--td-error-color);
+    color: var(--td-text-color-anti);
+    font-size: 11px;
+    line-height: 18px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   // 包含右弹子菜单的菜单项

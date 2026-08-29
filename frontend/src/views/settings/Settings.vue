@@ -768,11 +768,11 @@ onUnmounted(() => {
   max-height: 0;
 }
 
-/* 右侧内容区域 */
+/* 右侧内容区域：PRD §9 设置页卡片化——灰画布底，每个 section 一张白卡 */
 .settings-content {
   flex: 1;
   overflow-y: auto;
-  background-color: var(--td-bg-color-container);
+  background-color: var(--td-bg-color-page);
 }
 
 .content-wrapper {
@@ -801,7 +801,16 @@ onUnmounted(() => {
   }
 }
 
+/* section 卡片容器：每组设置一张白卡，浮于灰画布之上（PRD §9）。
+   子组件（GeneralSettings 等）自身的 section-header 行距在卡片内边距下依然成立。 */
 .section {
+  padding: 24px 28px 20px;
+  margin-bottom: 16px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-large, 14px);
+  background: var(--td-bg-color-container);
+  box-shadow: var(--td-shadow-1);
+  box-sizing: border-box;
   animation: fadeIn 0.3s ease;
 }
 

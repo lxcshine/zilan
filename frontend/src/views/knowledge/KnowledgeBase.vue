@@ -2319,7 +2319,7 @@ async function createNewSession(value: string): Promise<void> {
                 </template>
                 <template v-else-if="!docListLoading">
                   <div class="doc-empty-state">
-                    <EmptyKnowledge />
+                    <EmptyKnowledge :kb-id="kbId" />
                   </div>
                 </template>
               </div>
@@ -2416,14 +2416,17 @@ async function createNewSession(value: string): Promise<void> {
 .knowledge-layout {
   display: flex;
   flex-direction: column;
-  margin: 0 16px 0 4px;
-  gap: 20px;
+  /* 旧两栏布局的水平补偿 margin 已随三栏改造移除；灰画布需铺满画布宽度 */
+  margin: 0;
+  gap: 16px;
   height: 100%;
   flex: 1;
   width: 100%;
   min-width: 0;
-  padding: 24px 32px 0px;
+  padding: 24px 32px 16px;
   box-sizing: border-box;
+  /* PRD §9：详情画布灰底，头部与列表以白卡片浮于其上 */
+  background: var(--td-bg-color-page);
 }
 
 // Breadcrumb tab switch (文档/Wiki in breadcrumb)
@@ -2698,10 +2701,13 @@ async function createNewSession(value: string): Promise<void> {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 0;
-  border: none;
+  /* PRD §9：文档列表区白卡片容器（过滤栏 + 滚动列表同处一张卡） */
+  padding: 16px 20px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-large, 14px);
+  background: var(--td-bg-color-container);
+  box-shadow: var(--td-shadow-1);
   overflow: hidden;
-  background: transparent;
 }
 
 .doc-card-area {
@@ -3017,7 +3023,7 @@ async function createNewSession(value: string): Promise<void> {
   }
 }
 
-// Header 样式（无底部分割线，留更多空间给下方内容区）
+// Header 样式（PRD §9：头部区域白卡片化，浮于灰画布之上）
 .document-header {
   display: flex;
   align-items: flex-start;
@@ -3025,6 +3031,12 @@ async function createNewSession(value: string): Promise<void> {
   flex-wrap: wrap;
   gap: 12px;
   flex-shrink: 0;
+  padding: 16px 20px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-large, 14px);
+  background: var(--td-bg-color-container);
+  box-shadow: var(--td-shadow-1);
+  box-sizing: border-box;
 
   .document-header-title {
     display: flex;

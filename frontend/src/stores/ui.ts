@@ -1,7 +1,22 @@
 import { defineStore } from 'pinia'
 
+/** 三栏布局的工作模式（PRD ui-layout-visual-redesign §3.4） */
+export type AppWorkMode = 'chat' | 'knowledge' | 'documents' | 'agents' | 'memory'
+
+const ACTIVE_MODE_KEY = 'zilan_active_mode'
+
+function loadInitialMode(): AppWorkMode {
+  const saved = localStorage.getItem(ACTIVE_MODE_KEY)
+  if (saved === 'chat' || saved === 'knowledge' || saved === 'documents' || saved === 'agents' || saved === 'memory') {
+    return saved
+  }
+  return 'chat'
+}
+
 export const useUIStore = defineStore('ui', {
   state: () => ({
+    /** 当前工作模式：驱动 Rail 高亮与列表栏内容 */
+    activeMode: loadInitialMode() as AppWorkMode,
     showSettingsModal: false,
     showKBEditorModal: false,
     kbEditorMode: 'create' as 'create' | 'edit',
@@ -24,6 +39,11 @@ export const useUIStore = defineStore('ui', {
   }),
 
   actions: {
+    setActiveMode(mode: AppWorkMode) {
+      this.activeMode = mode
+      localStorage.setItem(ACTIVE_MODE_KEY, mode)
+    },
+
     openSettings(section?: string, subSection?: string) {
       this.settingsInitialSection = section || null
       this.settingsInitialSubSection = subSection || null
