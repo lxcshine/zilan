@@ -169,16 +169,15 @@ conversation:
 
 <table>
   <tr>
-    <td width="50%" align="center"><b>💬 新对话</b><br/><img src="./images/1.jpg" alt="新对话" width="100%"></td>
-    <td width="50%" align="center"><b>📚 知识库</b><br/><img src="./images/2.jpg" alt="知识库" width="100%"></td>
+    <td width="50%" align="center"><b>💬 新对话</b><br/><img src="./images/v2_1.jpg" alt="新对话" width="100%"></td>
+    <td width="50%" align="center"><b>📚 知识库</b><br/><img src="./images/v2_2.jpg" alt="知识库" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%" align="center"><b>🤖 智能体</b><br/><img src="./images/3.jpg" alt="智能体" width="100%"></td>
-    <td width="50%" align="center"><b>👥 共享空间</b><br/><img src="./images/4.jpg" alt="共享空间" width="100%"></td>
+    <td width="50%" align="center"><b>📄 文档</b><br/><img src="./images/v2_3.jpg" alt="文档" width="100%"></td>
+    <td width="50%" align="center"><b>🤖 智能体</b><br/><img src="./images/v2_4.jpg" alt="智能体" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%" align="center"><b>🧠 我的记忆</b><br/><img src="./images/memory.jpg" alt="我的记忆" width="100%"></td>
-    <td width="50%" align="center"><b>⚙️ 系统设置</b><br/><img src="./images/settings.jpg" alt="系统设置" width="100%"></td>
+    <td width="50%" align="center"><b>🧠 我的记忆</b><br/><img src="./images/v2_5.jpg" alt="我的记忆" width="100%"></td>
   </tr>
 </table>
 

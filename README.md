@@ -169,16 +169,15 @@ Product name, UI marks, browser titles, storage keys, JWT audience, webhook sign
 
 <table>
   <tr>
-    <td width="50%" align="center"><b>💬 New Chat</b><br/><img src="./images/1.jpg" alt="New Chat" width="100%"></td>
-    <td width="50%" align="center"><b>📚 Knowledge Base</b><br/><img src="./images/2.jpg" alt="Knowledge Base" width="100%"></td>
+    <td width="50%" align="center"><b>💬 New Chat</b><br/><img src="./images/v2_1.jpg" alt="New Chat" width="100%"></td>
+    <td width="50%" align="center"><b>📚 Knowledge Base</b><br/><img src="./images/v2_2.jpg" alt="Knowledge Base" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%" align="center"><b>🤖 Agent</b><br/><img src="./images/3.jpg" alt="Agent" width="100%"></td>
-    <td width="50%" align="center"><b>👥 Shared Space</b><br/><img src="./images/4.jpg" alt="Shared Space" width="100%"></td>
+    <td width="50%" align="center"><b>📄 Documents</b><br/><img src="./images/v2_3.jpg" alt="Documents" width="100%"></td>
+    <td width="50%" align="center"><b>🤖 Agent</b><br/><img src="./images/v2_4.jpg" alt="Agent" width="100%"></td>
   </tr>
   <tr>
-    <td width="50%" align="center"><b>🧠 My Memory</b><br/><img src="./images/memory.jpg" alt="My Memory" width="100%"></td>
-    <td width="50%" align="center"><b>⚙️ System Settings</b><br/><img src="./images/settings.jpg" alt="System Settings" width="100%"></td>
+    <td width="50%" align="center"><b>🧠 My Memory</b><br/><img src="./images/v2_5.jpg" alt="My Memory" width="100%"></td>
   </tr>
 </table>
 
