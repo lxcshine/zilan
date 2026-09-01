@@ -178,6 +178,17 @@ const (
 	AuditActionFAQImportStarted   AuditAction = "faq.import_started"
 	AuditActionFAQImportCompleted AuditAction = "faq.import_completed"
 	AuditActionFAQImportFailed    AuditAction = "faq.import_failed"
+
+	// Backup & recovery actions (PRD docs/prd/data-backup-recovery.md §6.2:
+	// "全部 RequireSystemAdmin，均入审计日志"). All rows carry tenant_id=0 —
+	// these are platform-scope operations even when they target one
+	// workspace; ScopeType/ScopeID identify the backup record or restore
+	// job. Dry-run restores are audited too (DoD §11.5).
+	AuditActionBackupRun            AuditAction = "backup.run"
+	AuditActionBackupDeleted        AuditAction = "backup.deleted"
+	AuditActionBackupTenantExported AuditAction = "backup.tenant_exported"
+	AuditActionBackupRestoreStarted AuditAction = "backup.restore_started"
+	AuditActionBackupRestoreDone    AuditAction = "backup.restore_done"
 )
 
 // AuditOutcome separates asynchronous acceptance from terminal business

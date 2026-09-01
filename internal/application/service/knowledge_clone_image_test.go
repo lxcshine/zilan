@@ -61,6 +61,10 @@ func (c *countingFileService) CopyFile(ctx context.Context, srcPath string, tena
 	return "", fmt.Errorf("CopyFile must not be used for embedded image copies")
 }
 
+func (c *countingFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	return nil
+}
+
 func mustImageInfoJSON(t *testing.T, imgs []types.ImageInfo) string {
 	t.Helper()
 	b, err := json.Marshal(imgs)

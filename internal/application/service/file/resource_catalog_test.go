@@ -78,6 +78,9 @@ func (s *physicalFileStub) DeleteFile(context.Context, string) error           {
 func (s *physicalFileStub) CopyFile(context.Context, string, uint64, string) (string, error) {
 	return "", nil
 }
+func (s *physicalFileStub) WriteFileToPath(context.Context, string, io.Reader) error {
+	return nil
+}
 
 func TestResourceCatalogFileServiceReturnsReferenceAndResolvesReads(t *testing.T) {
 	inner := &physicalFileStub{savedPath: "local://7/exports/a.png"}

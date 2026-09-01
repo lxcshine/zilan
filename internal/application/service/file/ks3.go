@@ -230,6 +230,33 @@ func (s *ks3FileService) GetFile(ctx context.Context, filePath string) (io.ReadC
 	return resp.Body, nil
 }
 
+// WriteFileToPath writes content to an existing ks3:// path (backup
+// restore). Overwrites the object in place. The KS3 SDK requires a
+// ReadSeeker body, so the stream is buffered in memory — restore feeds
+// it bounded-size snapshot objects.
+func (s *ks3FileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	_, objectKey, err := parseKS3FilePath(filePath)
+	if err != nil {
+		return err
+	}
+	if err := utils.SafeObjectKey(objectKey); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("failed to read file content: %w", err)
+	}
+	_, err = s.client.PutObject(&ks3s3.PutObjectInput{
+		Bucket: ks3aws.String(s.bucketName),
+		Key:    ks3aws.String(objectKey),
+		Body:   bytes.NewReader(data),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write file to KS3: %w", err)
+	}
+	return nil
+}
+
 func (s *ks3FileService) DeleteFile(ctx context.Context, filePath string) error {
 	_, objectKey, err := parseKS3FilePath(filePath)
 	if err != nil {

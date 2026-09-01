@@ -226,6 +226,29 @@ func (s *tosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("tos://%s/%s", targetBucket, objectName), nil
 }
 
+// WriteFileToPath writes content to an existing tos:// path (backup
+// restore). Overwrites the object in place.
+func (s *tosFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	bucketName, objectName, err := parseTOSFilePath(filePath)
+	if err != nil {
+		return err
+	}
+	if err := utils.SafeObjectKey(objectName); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+	_, err = s.client.PutObjectV2(ctx, &tos.PutObjectV2Input{
+		PutObjectBasicInput: tos.PutObjectBasicInput{
+			Bucket: bucketName,
+			Key:    objectName,
+		},
+		Content: r,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write file to TOS: %w", err)
+	}
+	return nil
+}
+
 // CopyFile copies an existing TOS object to a new knowledge-owned object using a
 // server-side CopyObject (no data leaves TOS). The destination uses the same
 // layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a tos:// path.

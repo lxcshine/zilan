@@ -40,6 +40,9 @@ func (m *mockFileService) DeleteFile(ctx context.Context, filePath string) error
 func (m *mockFileService) CopyFile(ctx context.Context, srcPath string, tenantID uint64, knowledgeID string) (string, error) {
 	return "", nil
 }
+func (m *mockFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	return nil
+}
 
 func TestResolveRemoteImages_NormalDownload(t *testing.T) {
 	// Whitelist localhost for this test so the test server is reachable

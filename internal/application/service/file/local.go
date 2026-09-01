@@ -212,6 +212,41 @@ func (s *localFileService) CopyFile(ctx context.Context,
 	return newPath, nil
 }
 
+// WriteFileToPath writes content to an existing local path (backup restore).
+// The path is validated and resolved under baseDir exactly like GetFile, then
+// written via a temp file + rename so a crash mid-write never leaves a torn
+// object at the referenced path.
+func (s *localFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	candidate := s.normalizePathForBase(filePath)
+	resolved, err := secutils.SafePathUnderBase(s.baseDir, candidate)
+	if err != nil {
+		logger.Errorf(ctx, "Path traversal denied for WriteFileToPath: %v", err)
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+	tmp := resolved + ".restore-tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	if err := os.Rename(tmp, resolved); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("failed to finalize file: %w", err)
+	}
+	return nil
+}
+
 // SaveBytes saves bytes data to a file and returns the file path
 // temp parameter is ignored for local storage (no auto-expiration support)
 // fileName 仅允许安全文件名，禁止路径遍历（如 ../../）

@@ -43,6 +43,10 @@ func (s *stubIMFileService) CopyFile(context.Context, string, uint64, string) (s
 	return "", nil
 }
 
+func (s *stubIMFileService) WriteFileToPath(context.Context, string, io.Reader) error {
+	return nil
+}
+
 func TestBuildIMFileServiceForProvider_FallbackToGlobal(t *testing.T) {
 	stub := &stubIMFileService{}
 	tenant := &types.Tenant{

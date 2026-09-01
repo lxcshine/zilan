@@ -60,3 +60,10 @@ func (s *DummyFileService) CopyFile(ctx context.Context, srcPath string, tenantI
 func (s *DummyFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
 	return filePath, nil
 }
+
+// WriteFileToPath is a no-op for the dummy service: there is no real
+// storage behind it, so restore writes are silently discarded.
+func (s *DummyFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	logger.Warnf(ctx, "[dummy] WriteFileToPath no-op for %q (no real storage)", filePath)
+	return nil
+}

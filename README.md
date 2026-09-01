@@ -273,6 +273,7 @@ Once started, visit **http://localhost** to get started.
 | `F1. SYSTEM_AES_KEY` | Change in production | 32-byte static encryption key for API keys / MCP / data-source credentials. The default is for evaluation only; **encrypted data is unrecoverable if the key is lost** |
 | `D1 / D2. Models` | Before first use | Configure any provider's API key via Web UI after startup, or declare built-in models via `config/builtin_models.yaml` (see file comments) |
 | `F2.5. Verification codes` | Optional | Registration/login verification channels, see below |
+| `F2.6. Backup & recovery` | Optional | Daily user-data snapshots into an independent backup store, see below |
 
 **Registration / Login Verification Channels (optional, log dev mode by default)**
 
@@ -290,6 +291,29 @@ WEKNORA_AUTH_EMAIL_SMTP_PASSWORD=<SMTP auth code> # Not the mailbox login passwo
 - **Presets**: `qq` / `163` / `126` / `gmail` / `exmail` (Tencent Exmail) / `aliyun` (Alibaba mail) / `outlook` (Microsoft 365). For self-hosted enterprise mail, skip the preset and set `WEKNORA_AUTH_EMAIL_SMTP_HOST` / `PORT` directly (credentials optional for internal unauthenticated relays)
 - **Auth codes**: QQ/163 mailboxes generate one after enabling POP3/SMTP service in settings; Gmail needs an App Password with 2FA enabled
 - **SMS codes**: set `WEKNORA_AUTH_SMS_PROVIDER=aliyun` plus the four Alibaba Cloud SMS credentials (`WEKNORA_AUTH_SMS_ALIYUN_*`) for real delivery
+
+**Backup & Recovery (optional, off by default)**
+
+Daily automatic snapshots of every workspace's data: metadata is exported per-workspace as logical `jsonl.gz` streams, file-tier objects are copied into an independently configured backup store, and snapshots are pruned automatically by a simplified GFS retention policy (7 daily / 4 weekly / 6 monthly by default). Restores verify the SHA-256 manifest of every object before writing anything.
+
+```bash
+WEKNORA_BACKUP_ENABLED=true                  # master switch
+WEKNORA_BACKUP_STORAGE_PROVIDER=local        # local / minio / s3
+WEKNORA_BACKUP_STORAGE_LOCAL_PATH=/data/backups
+# --- or an S3-compatible target (MUST be a different instance/bucket
+#     than the primary storage — backing up onto the primary defeats the purpose) ---
+# WEKNORA_BACKUP_STORAGE_ENDPOINT=minio.example.com:9000
+# WEKNORA_BACKUP_STORAGE_ACCESS_KEY=...
+# WEKNORA_BACKUP_STORAGE_SECRET_KEY=...
+# WEKNORA_BACKUP_STORAGE_BUCKET=weknora-backups
+WEKNORA_BACKUP_SCHEDULE="0 0 3 * * *"        # 6-field cron, daily 03:00
+```
+
+Once enabled, system admins get a **Backup & Recovery** section under Settings → System Administration with the last-success status (RPO countdown), snapshot records, per-workspace archive export, and a restore wizard (per-workspace restore into a new `-restored-` workspace or full-instance disaster recovery, both with a dry-run verification mode).
+
+- **Encryption**: set `WEKNORA_BACKUP_ENCRYPT=true` to seal metadata blobs with AES-256-GCM (envelope encryption keyed off `SYSTEM_AES_KEY`). **If you enable it, `SYSTEM_AES_KEY` must go into offline key custody — losing the key makes the backups unrecoverable.**
+- **Deleted-workspace safety net**: `WEKNORA_BACKUP_PRE_DELETE_SNAPSHOT=true` (default) takes a final snapshot right before a workspace is deleted, giving an undo window for accidental deletions.
+- **Lower RPO / DR guidance**: the built-in scheduler targets RPO ≤ 24h. For minute-level recovery points, run PostgreSQL WAL archiving plus cross-region replication of the backup bucket at the deployment layer — both are documented patterns that require no application changes. We recommend a quarterly restore drill using the dry-run report plus one real per-workspace restore.
 
 Restart to apply `.env` changes: `docker compose down && docker compose up -d`
 

@@ -236,6 +236,35 @@ func (s *cosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	return fmt.Sprintf("cos://%s/%s/%s", s.bucketName, s.region, objectName), nil
 }
 
+// WriteFileToPath writes content to an existing cos:// path (backup
+// restore). Overwrites the object in place; temp-bucket legacy URLs are
+// routed to the temp client.
+func (s *cosFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	if s.tempClient != nil && strings.HasPrefix(filePath, s.tempBucketURL) {
+		objectName := strings.TrimPrefix(filePath, s.tempBucketURL)
+		if err := utils.SafeObjectKey(objectName); err != nil {
+			return fmt.Errorf("invalid file path: %w", err)
+		}
+		_, err := s.tempClient.Object.Put(ctx, objectName, r, nil)
+		if err != nil {
+			return fmt.Errorf("failed to write file to COS temp bucket: %w", err)
+		}
+		return nil
+	}
+	objectName, err := s.parseCosObjectName(filePath)
+	if err != nil {
+		return err
+	}
+	if err := utils.SafeObjectKey(objectName); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+	_, err = s.client.Object.Put(ctx, objectName, r, nil)
+	if err != nil {
+		return fmt.Errorf("failed to write file to COS: %w", err)
+	}
+	return nil
+}
+
 // GetFileURL returns a presigned download URL for the file
 func (s *cosFileService) GetFileURL(ctx context.Context, filePath string) (string, error) {
 	// 判断文件属于哪个桶

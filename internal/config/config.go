@@ -11,6 +11,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -21,8 +22,9 @@ type Config struct {
 	Server          *ServerConfig          `yaml:"server"           json:"server"`
 	KnowledgeBase   *KnowledgeBaseConfig   `yaml:"knowledge_base"   json:"knowledge_base"`
 	Tenant          *TenantConfig          `yaml:"tenant"           json:"tenant"`
-	Auth            *AuthConfig            `yaml:"auth"             json:"auth"`
-	Audit           *AuditConfig           `yaml:"audit"            json:"audit"`
+	Auth            *AuthConfig            `yaml:"auth"            json:"auth"`
+	Audit           *AuditConfig           `yaml:"audit"           json:"audit"`
+	Backup          *BackupConfig          `yaml:"backup"          json:"backup"`
 	OIDCAuth        *OIDCAuthConfig        `yaml:"oidc_auth"        json:"oidc_auth"`
 	Models          []ModelConfig          `yaml:"models"           json:"models"`
 	VectorDatabase  *VectorDatabaseConfig  `yaml:"vector_database"  json:"vector_database"`
@@ -293,6 +295,68 @@ type AuditConfig struct {
 	//   < 0 — invalid; ValidateConfig rejects it.
 	// Default: 90 (set by applyAuditDefaults when the section is omitted).
 	RetentionDays int `yaml:"retention_days" json:"retention_days"`
+}
+
+// BackupConfig governs the daily user-data backup & recovery subsystem
+// (PRD docs/prd/data-backup-recovery.md §7). Everything is optional:
+// a nil or disabled section means the scheduler never registers, and the
+// backup API surface answers 503.
+type BackupConfig struct {
+	// Enabled is the master switch. Default false.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Storage is the backup target — deliberately a separate instance
+	// from the primary storage so a lost primary does not take the
+	// backups with it (PRD §2.2 B5).
+	Storage *BackupStorageConfig `yaml:"storage" json:"storage,omitempty"`
+	// Schedule is a 6-field cron expression (seconds-first, matching
+	// the datasource scheduler). Default "0 0 3 * * *": daily 03:00.
+	Schedule string `yaml:"schedule" json:"schedule"`
+	// Retention GFS tiers: keep N daily / N weekly / N monthly
+	// snapshots. 0 disables that tier's pruning contribution. Defaults
+	// 7 / 4 / 6.
+	RetentionDaily   int `yaml:"retention_daily"   json:"retention_daily"`
+	RetentionWeekly  int `yaml:"retention_weekly"  json:"retention_weekly"`
+	RetentionMonthly int `yaml:"retention_monthly" json:"retention_monthly"`
+	// Compression: "gzip" (default) or "none". Applies to metadata
+	// jsonl streams only; file-tier objects are copied byte-for-byte.
+	Compression string `yaml:"compression" json:"compression"`
+	// Encrypt enables AES-256-GCM envelope encryption of metadata
+	// blobs and the manifest, keyed off SYSTEM_AES_KEY. Default false.
+	Encrypt bool `yaml:"encrypt" json:"encrypt"`
+	// Concurrency knobs: how many workspaces and how many objects per
+	// workspace copy in parallel. Defaults 2 / 8.
+	ConcurrencyTenants int `yaml:"concurrency_tenants" json:"concurrency_tenants"`
+	ConcurrencyObjects int `yaml:"concurrency_objects" json:"concurrency_objects"`
+	// PreDeleteSnapshot: snapshot a workspace right before it is
+	// deleted, giving operators an undo window. Default true.
+	PreDeleteSnapshot *bool `yaml:"pre_delete_snapshot" json:"pre_delete_snapshot,omitempty"`
+}
+
+// BackupStorageConfig describes the backup target backend. Supported
+// providers: "local" (a directory on the backup host) and S3-compatible
+// object stores via "minio" / "s3" (MinIO, AWS S3, and any endpoint
+// speaking the S3 protocol — most clouds offer one).
+type BackupStorageConfig struct {
+	// Provider: local | minio | s3.
+	Provider string `yaml:"provider" json:"provider"`
+	// Local path when provider == local.
+	LocalPath string `yaml:"local_path" json:"local_path,omitempty"`
+	// S3-compatible settings (provider minio|s3).
+	Endpoint  string `yaml:"endpoint"  json:"endpoint,omitempty"`
+	AccessKey string `yaml:"access_key" json:"access_key,omitempty"`
+	SecretKey string `yaml:"secret_key" json:"secret_key,omitempty"`
+	Bucket    string `yaml:"bucket"    json:"bucket,omitempty"`
+	// UseSSL for the S3-compatible endpoint. Default true when an
+	// https endpoint is given.
+	UseSSL *bool `yaml:"use_ssl" json:"use_ssl,omitempty"`
+	// PathPrefix inside the bucket (default "backups").
+	PathPrefix string `yaml:"path_prefix" json:"path_prefix,omitempty"`
+}
+
+// IsPreDeleteSnapshotEnabled reports whether workspace deletion should
+// trigger a final snapshot. Default true (nil = enabled).
+func (b *BackupConfig) IsPreDeleteSnapshotEnabled() bool {
+	return b == nil || b.PreDeleteSnapshot == nil || *b.PreDeleteSnapshot
 }
 
 // AuthConfig governs the user authentication entry points.
@@ -728,6 +792,7 @@ func LoadConfig() (*Config, error) {
 	applyKnowledgeBaseEnvOverrides(&cfg)
 	applyAuthAndTenantDefaults(&cfg)
 	applyAuditDefaults(&cfg)
+	applyBackupEnvOverrides(&cfg)
 
 	if err := ValidateConfig(&cfg); err != nil {
 		return nil, err
@@ -788,6 +853,14 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.Audit != nil && cfg.Audit.RetentionDays < 0 {
 		errs = append(errs, fmt.Sprintf("audit.retention_days must be >= 0 (got %d); use 0 to disable purge",
 			cfg.Audit.RetentionDays))
+	}
+
+	// Backup section (PRD data-backup-recovery §7): a disabled section
+	// is fully inert; an enabled one must carry a usable target.
+	if cfg.Backup != nil && cfg.Backup.Enabled {
+		if err := validateBackupConfig(cfg.Backup); err != nil {
+			errs = append(errs, err.Error())
+		}
 	}
 
 	if cfg.Conversation != nil {
@@ -1243,6 +1316,160 @@ func applyAuditDefaults(cfg *Config) {
 			cfg.Audit.RetentionDays = n
 		}
 	}
+}
+
+// applyBackupEnvOverrides fills backup defaults and applies
+// WEKNORA_BACKUP_* env overrides (PRD docs/prd/data-backup-recovery.md §7).
+// Env always wins when explicitly set; defaults keep the section inert
+// (enabled=false) so upgrading deployments see no behaviour change.
+func applyBackupEnvOverrides(cfg *Config) {
+	if cfg.Backup == nil {
+		cfg.Backup = &BackupConfig{}
+	}
+	b := cfg.Backup
+
+	if b.Schedule == "" {
+		b.Schedule = "0 0 3 * * *"
+	}
+	if b.RetentionDaily == 0 {
+		b.RetentionDaily = 7
+	}
+	if b.RetentionWeekly == 0 {
+		b.RetentionWeekly = 4
+	}
+	if b.RetentionMonthly == 0 {
+		b.RetentionMonthly = 6
+	}
+	if b.Compression == "" {
+		b.Compression = "gzip"
+	}
+	if b.ConcurrencyTenants == 0 {
+		b.ConcurrencyTenants = 2
+	}
+	if b.ConcurrencyObjects == 0 {
+		b.ConcurrencyObjects = 8
+	}
+	if b.Storage == nil {
+		b.Storage = &BackupStorageConfig{}
+	}
+	if b.Storage.PathPrefix == "" {
+		b.Storage.PathPrefix = "backups"
+	}
+
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_ENABLED")); v != "" {
+		b.Enabled = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_SCHEDULE")); v != "" {
+		b.Schedule = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_RETENTION_DAILY")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			b.RetentionDaily = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_RETENTION_WEEKLY")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			b.RetentionWeekly = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_RETENTION_MONTHLY")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			b.RetentionMonthly = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_COMPRESSION")); v != "" {
+		b.Compression = strings.ToLower(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_ENCRYPT")); v != "" {
+		b.Encrypt = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_CONCURRENCY_TENANTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			b.ConcurrencyTenants = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_CONCURRENCY_OBJECTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			b.ConcurrencyObjects = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_PRE_DELETE_SNAPSHOT")); v != "" {
+		enabled := strings.EqualFold(v, "true") || v == "1"
+		b.PreDeleteSnapshot = &enabled
+	}
+
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_PROVIDER")); v != "" {
+		b.Storage.Provider = strings.ToLower(v)
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_LOCAL_PATH")); v != "" {
+		b.Storage.LocalPath = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_ENDPOINT")); v != "" {
+		b.Storage.Endpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_ACCESS_KEY")); v != "" {
+		b.Storage.AccessKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_SECRET_KEY")); v != "" {
+		b.Storage.SecretKey = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_BUCKET")); v != "" {
+		b.Storage.Bucket = v
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_USE_SSL")); v != "" {
+		useSSL := strings.EqualFold(v, "true") || v == "1"
+		b.Storage.UseSSL = &useSSL
+	}
+	if v := strings.TrimSpace(os.Getenv("WEKNORA_BACKUP_STORAGE_PATH_PREFIX")); v != "" {
+		b.Storage.PathPrefix = v
+	}
+}
+
+// validateBackupConfig gates an ENABLED backup section: the schedule must
+// parse, retention tiers must be non-negative, compression must be a known
+// flavour, and the storage target must be complete enough to construct.
+// The guard against "backup target == primary storage" happens at container
+// wiring time (where the primary storage config is visible), not here.
+func validateBackupConfig(b *BackupConfig) error {
+	if b.Schedule != "" {
+		if _, err := cron.ParseStandard(b.Schedule); err != nil {
+			// Try the 6-field (seconds-first) form used by the datasource
+			// scheduler before rejecting.
+			if _, err6 := cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor).Parse(b.Schedule); err6 != nil {
+				return fmt.Errorf("backup.schedule is not a valid cron expression: %q (%v)", b.Schedule, err)
+			}
+		}
+	}
+	if b.RetentionDaily < 0 || b.RetentionWeekly < 0 || b.RetentionMonthly < 0 {
+		return fmt.Errorf("backup retention tiers must be >= 0 (got daily=%d weekly=%d monthly=%d)",
+			b.RetentionDaily, b.RetentionWeekly, b.RetentionMonthly)
+	}
+	if b.Compression != "" && b.Compression != "gzip" && b.Compression != "none" {
+		return fmt.Errorf("backup.compression must be gzip or none (got %q)", b.Compression)
+	}
+	if b.ConcurrencyTenants < 0 || b.ConcurrencyObjects < 0 {
+		return fmt.Errorf("backup concurrency values must be >= 0")
+	}
+
+	if b.Storage == nil {
+		return fmt.Errorf("backup.storage is required when backup.enabled is true")
+	}
+	switch b.Storage.Provider {
+	case "":
+		return fmt.Errorf("backup.storage.provider is required when backup.enabled is true (local | minio | s3)")
+	case "local":
+		if strings.TrimSpace(b.Storage.LocalPath) == "" {
+			return fmt.Errorf("backup.storage.local_path is required for provider=local")
+		}
+	case "minio", "s3":
+		if strings.TrimSpace(b.Storage.Endpoint) == "" || strings.TrimSpace(b.Storage.AccessKey) == "" ||
+			strings.TrimSpace(b.Storage.SecretKey) == "" || strings.TrimSpace(b.Storage.Bucket) == "" {
+			return fmt.Errorf("backup.storage endpoint/access_key/secret_key/bucket are all required for provider=%s", b.Storage.Provider)
+		}
+	default:
+		return fmt.Errorf("backup.storage.provider %q is not supported for the backup target; use local, minio, or s3 (S3-compatible endpoint)", b.Storage.Provider)
+	}
+	return nil
 }
 
 // into actual prompt text content. Only xxx_id fields are used;

@@ -226,3 +226,17 @@ func (s *minioFileService) GetFileURL(ctx context.Context, filePath string) (str
 	}
 	return presignedURL.String(), nil
 }
+
+// WriteFileToPath writes content to an existing minio:// path (backup
+// restore). Overwrites the object in place.
+func (s *minioFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	objectName, err := s.parseMinioFilePath(filePath)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutObject(ctx, s.bucketName, objectName, r, -1, minio.PutObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to write file to MinIO: %w", err)
+	}
+	return nil
+}

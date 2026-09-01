@@ -206,6 +206,12 @@ const router = createRouter({
           meta: { requiresInit: true, requiresAuth: true, requiresSystemAdmin: true },
         },
         {
+          path: "system/backup",
+          name: "systemBackup",
+          redirect: { path: "/platform/settings", query: { section: "system-backup" } },
+          meta: { requiresInit: true, requiresAuth: true, requiresSystemAdmin: true },
+        },
+        {
           path: "system/admins",
           name: "systemAdmins",
           redirect: { path: "/platform/settings", query: { section: "system-global" } },

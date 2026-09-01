@@ -50,6 +50,7 @@ import (
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	backupSvc "github.com/Tencent/WeKnora/internal/application/service/backup"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
@@ -176,6 +177,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewWikiPageRepository))
 	must(container.Provide(repository.NewTaskPendingOpsRepository))
 	must(container.Provide(repository.NewTaskDeadLetterRepository))
+	must(container.Provide(repository.NewBackupRepository))
 
 	// MCP manager for managing MCP client connections
 	logger.Debugf(ctx, "[Container] Registering MCP manager...")
@@ -327,6 +329,13 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	logger.Debugf(ctx, "[Container] Data source sync framework registered")
 	must(container.Invoke(startAuditLogRetention))
 	logger.Debugf(ctx, "[Container] Audit log retention runner registered")
+	// Backup & recovery subsystem (PRD docs/prd/data-backup-recovery.md):
+	// service + daily cron scheduler. Disabled deployments register the
+	// same wiring — StartScheduler short-circuits when the section is
+	// off, and the HTTP surface answers 503.
+	must(container.Provide(backupSvc.NewBackupService))
+	must(container.Invoke(startBackupScheduler))
+	logger.Debugf(ctx, "[Container] Backup service registered")
 	must(container.Provide(service.NewHousekeepingService))
 	must(container.Invoke(startHousekeepingService))
 	logger.Debugf(ctx, "[Container] Knowledge housekeeping runner registered")
@@ -399,6 +408,7 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewIMHandler))
 	must(container.Provide(handler.NewEmbedChannelHandler))
 	must(container.Provide(handler.NewWeKnoraCloudHandler))
+	must(container.Provide(handler.NewBackupHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read
@@ -1692,4 +1702,90 @@ func startAuditLogRetention(
 		runner.Stop()
 		return nil
 	})
+}
+
+// startBackupScheduler arms the daily backup cron and registers the
+// graceful-shutdown stop. When the backup section is disabled (or the
+// schedule invalid) StartScheduler is a logged no-op — boot continues.
+// The same-store guard (PRD data-backup-recovery.md §7 配置校验) runs
+// first: a backup target identical to the primary storage fails startup
+// with a readable reason — "backing up onto the primary" defeats the
+// entire subsystem's failure-domain isolation.
+func startBackupScheduler(svc *backupSvc.Service, cfg *config.Config, cleaner interfaces.ResourceCleaner) error {
+	if cfg != nil && cfg.Backup != nil && cfg.Backup.Enabled {
+		if err := ensureBackupStoreIsolated(cfg.Backup); err != nil {
+			return err
+		}
+	}
+	stop := svc.StartScheduler(context.Background())
+	cleaner.RegisterWithName("BackupScheduler", func() error {
+		stop()
+		return nil
+	})
+	// Workspace deletion fires the pre-delete snapshot through this
+	// package-level hook — mirrors the chat.LocalImageResolver wiring
+	// pattern, avoiding a constructor dependency cycle.
+	service.TenantPreDeleteHook = svc.SnapshotTenantBeforeDelete
+	return nil
+}
+
+// ensureBackupStoreIsolated rejects a backup target that is the primary
+// storage (same local dir, or same S3-compatible endpoint+bucket).
+func ensureBackupStoreIsolated(b *config.BackupConfig) error {
+	if b.Storage == nil {
+		return nil
+	}
+	primary := strings.ToLower(strings.TrimSpace(os.Getenv("STORAGE_TYPE")))
+
+	// Local-vs-local: same directory.
+	if strings.EqualFold(b.Storage.Provider, "local") && primary == "local" {
+		primaryDir := strings.TrimSpace(os.Getenv("LOCAL_STORAGE_BASE_DIR"))
+		if primaryDir == "" {
+			primaryDir = "/data/files"
+		}
+		if strings.TrimSpace(b.Storage.LocalPath) != "" &&
+			filepath.Clean(strings.TrimSpace(b.Storage.LocalPath)) == filepath.Clean(primaryDir) {
+			return fmt.Errorf(
+				"backup.storage.local_path (%s) equals the primary storage base dir (%s): "+
+					"backing up onto the primary storage provides no failure isolation — "+
+					"point WEKNORA_BACKUP_STORAGE_LOCAL_PATH at a different volume",
+				b.Storage.LocalPath, primaryDir)
+		}
+		return nil
+	}
+
+	// S3-vs-S3: same normalized endpoint AND same bucket.
+	switch strings.ToLower(strings.TrimSpace(b.Storage.Provider)) {
+	case "minio", "s3":
+		var primaryEndpoint, primaryBucket string
+		switch primary {
+		case "minio":
+			primaryEndpoint = os.Getenv("MINIO_ENDPOINT")
+			primaryBucket = os.Getenv("MINIO_BUCKET_NAME")
+		case "s3":
+			primaryEndpoint = os.Getenv("S3_ENDPOINT")
+			primaryBucket = os.Getenv("S3_BUCKET_NAME")
+		}
+		if primaryEndpoint == "" || primaryBucket == "" {
+			return nil
+		}
+		if normalizeStorageEndpoint(b.Storage.Endpoint) == normalizeStorageEndpoint(primaryEndpoint) &&
+			strings.EqualFold(strings.TrimSpace(b.Storage.Bucket), strings.TrimSpace(primaryBucket)) {
+			return fmt.Errorf(
+				"backup.storage points at the primary storage bucket (%s/%s): "+
+					"backing up onto the primary storage provides no failure isolation — "+
+					"use a different instance or bucket via WEKNORA_BACKUP_STORAGE_*",
+				primaryEndpoint, primaryBucket)
+		}
+	}
+	return nil
+}
+
+// normalizeStorageEndpoint strips scheme and trailing slash so
+// "http://minio:9000", "minio:9000" and "minio:9000/" compare equal.
+func normalizeStorageEndpoint(endpoint string) string {
+	e := strings.TrimSpace(endpoint)
+	e = strings.TrimPrefix(e, "https://")
+	e = strings.TrimPrefix(e, "http://")
+	return strings.TrimSuffix(strings.ToLower(e), "/")
 }

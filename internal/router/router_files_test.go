@@ -94,6 +94,10 @@ func (s *stubFileService) CopyFile(ctx context.Context, srcPath string, tenantID
 	panic("unexpected call to CopyFile")
 }
 
+func (s *stubFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	panic("unexpected call to WriteFileToPath")
+}
+
 func TestServeFilesFallsBackToGlobalFileService(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("STORAGE_TYPE", "local")

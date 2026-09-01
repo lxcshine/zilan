@@ -273,6 +273,7 @@ docker compose up -d   # 启动核心服务
 | `F1. SYSTEM_AES_KEY` | 生产必改 | 32 字节静态加密密钥（加密 API Key / MCP / 数据源凭据）。默认值仅供体验；**丢失后已加密数据不可恢复，请妥善保管** |
 | `D1 / D2. 模型` | 使用前需配置 | 启动后可在 Web UI「模型管理」配置任意厂商 API Key，或通过 `config/builtin_models.yaml` 声明式内置（详见文件内注释） |
 | `F2.5. 验证码` | 可选 | 注册/登录的验证码与人机验证通道，见下文 |
+| `F2.6. 备份与恢复` | 可选 | 每日用户数据快照到独立备份存储，见下文 |
 
 **注册 / 登录验证码通道（可选，默认 log 开发模式）**
 
@@ -290,6 +291,29 @@ WEKNORA_AUTH_EMAIL_SMTP_PASSWORD=<SMTP授权码> # 非邮箱登录密码
 - **预设支持**：`qq` / `163` / `126` / `gmail` / `exmail`（腾讯企业邮）/ `aliyun`（阿里企业邮）/ `outlook`（Microsoft 365）；自建企业邮箱不设 preset，直接填 `WEKNORA_AUTH_EMAIL_SMTP_HOST` / `PORT`（内网免认证中继可不填账号密码）
 - **授权码获取**：QQ/163 邮箱在设置中开启 POP3/SMTP 服务后生成；Gmail 需开启两步验证后生成应用专用密码
 - **短信验证码**：`WEKNORA_AUTH_SMS_PROVIDER=aliyun` 并补全四项阿里云短信凭证（`WEKNORA_AUTH_SMS_ALIYUN_*`）后真实发送
+
+**备份与恢复（可选，默认关闭）**
+
+开启后每日在低峰窗口自动为全部空间做快照：元数据逐空间逻辑导出为 `jsonl.gz`，文件层对象复制到独立配置的备份存储，并按简化 GFS 策略自动清理过期快照（默认日备 7 天 / 周备 4 周 / 月备 6 月）。恢复前会逐项校验 SHA-256 清单，任何损坏都会中止并明示受损条目。
+
+```bash
+WEKNORA_BACKUP_ENABLED=true                  # 总开关
+WEKNORA_BACKUP_STORAGE_PROVIDER=local        # local / minio / s3
+WEKNORA_BACKUP_STORAGE_LOCAL_PATH=/data/backups
+# --- 或使用 S3 兼容目标（必须与主存储不同实例/桶，
+#     备份到主存储自身等于没有容灾） ---
+# WEKNORA_BACKUP_STORAGE_ENDPOINT=minio.example.com:9000
+# WEKNORA_BACKUP_STORAGE_ACCESS_KEY=...
+# WEKNORA_BACKUP_STORAGE_SECRET_KEY=...
+# WEKNORA_BACKUP_STORAGE_BUCKET=weknora-backups
+WEKNORA_BACKUP_SCHEDULE="0 0 3 * * *"        # 6 字段 cron，默认每日 03:00
+```
+
+启用后，系统管理员可在「设置 → 系统管理 → 备份与恢复」查看上次成功备份状态（RPO 倒计时）、快照记录列表、按空间导出归档，并通过恢复向导执行按空间恢复（恢复为新空间，原名加 `-restored-` 后缀）或全实例灾难恢复，两者均支持先试运行校验。
+
+- **加密**：`WEKNORA_BACKUP_ENCRYPT=true` 后元数据包以 AES-256-GCM 信封加密（密钥派生自 `SYSTEM_AES_KEY`）。**开启后请务必将 `SYSTEM_AES_KEY` 纳入离线保管——密钥丢失则备份不可恢复。**
+- **误删保护**：`WEKNORA_BACKUP_PRE_DELETE_SNAPSHOT=true`（默认）会在空间删除前自动做最后一次快照，为误删提供找回窗口。
+- **更低 RPO / 容灾指引**：内置调度面向 RPO ≤ 24 小时。若需分钟级恢复点，请在部署层为 PostgreSQL 配置 WAL 归档、为备份桶开启跨区复制——两者均为成熟运维手段，无需改动应用。建议每季度用试运行报告加一次真实按空间恢复做演练。
 
 修改 `.env` 后重启生效：`docker compose down && docker compose up -d`
 

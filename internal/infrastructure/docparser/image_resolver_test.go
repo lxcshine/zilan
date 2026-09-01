@@ -111,6 +111,10 @@ func (c *captureSaveBytes) CopyFile(context.Context, string, uint64, string) (st
 	return "", nil
 }
 
+func (c *captureSaveBytes) WriteFileToPath(context.Context, string, io.Reader) error {
+	return nil
+}
+
 var _ interfaces.FileService = (*captureSaveBytes)(nil)
 
 func TestResolveDataURIImages(t *testing.T) {

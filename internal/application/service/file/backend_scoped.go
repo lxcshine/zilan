@@ -100,6 +100,13 @@ func (s *backendScopedFileService) DeleteFile(ctx context.Context, path string) 
 	}
 	return s.inner.DeleteFile(ctx, p)
 }
+func (s *backendScopedFileService) WriteFileToPath(ctx context.Context, path string, r io.Reader) error {
+	p, err := s.unwrap(path)
+	if err != nil {
+		return err
+	}
+	return s.inner.WriteFileToPath(ctx, p, r)
+}
 func (s *backendScopedFileService) CopyFile(ctx context.Context, path string, tenantID uint64, knowledgeID string) (string, error) {
 	p, err := s.unwrap(path)
 	if err != nil {

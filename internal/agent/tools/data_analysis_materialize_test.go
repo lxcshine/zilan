@@ -44,6 +44,9 @@ func (f *fakeFileService) DeleteFile(ctx context.Context, _ string) error { retu
 func (f *fakeFileService) CopyFile(ctx context.Context, _ string, _ uint64, _ string) (string, error) {
 	return "", nil
 }
+func (f *fakeFileService) WriteFileToPath(ctx context.Context, _ string, _ io.Reader) error {
+	return errors.New("not implemented in fake")
+}
 
 // TestMaterializeKnowledgeFile_HandlesLocalScheme is the regression guard
 // for the dev-mode failure where DuckDB was handed a local:// URL it can't

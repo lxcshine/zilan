@@ -196,6 +196,24 @@ func (s *obsFileService) GetFile(ctx context.Context, filePath string) (io.ReadC
 	return output.Body, nil
 }
 
+// WriteFileToPath writes content to an existing obs path (backup
+// restore). Overwrites the object in place.
+func (s *obsFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	objectKey, err := s.parseObsFilePath(filePath)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucketName),
+		Key:    aws.String(objectKey),
+		Body:   r,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write file to OBS: %w", err)
+	}
+	return nil
+}
+
 func (s *obsFileService) DeleteFile(ctx context.Context, filePath string) error {
 	objectKey, err := s.parseObsFilePath(filePath)
 	if err != nil {

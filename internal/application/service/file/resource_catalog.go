@@ -163,6 +163,18 @@ func (s *resourceCatalogFileService) DeleteFile(ctx context.Context, filePath st
 	return nil
 }
 
+// WriteFileToPath writes to the PHYSICAL path backing filePath (backup
+// restore). resource:// references are resolved to their physical
+// location first; no catalog registration happens because restore
+// replays catalog rows from the metadata tier.
+func (s *resourceCatalogFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	physical, _, err := s.resolve(ctx, filePath)
+	if err != nil {
+		return err
+	}
+	return s.inner.WriteFileToPath(ctx, physical, r)
+}
+
 func (s *resourceCatalogFileService) CopyFile(
 	ctx context.Context,
 	filePath string,

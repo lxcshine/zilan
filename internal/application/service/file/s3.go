@@ -250,6 +250,24 @@ func (s *s3FileService) GetFile(ctx context.Context, filePath string) (io.ReadCl
 	return resp.Body, nil
 }
 
+// WriteFileToPath writes content to an existing s3:// path (backup
+// restore). Overwrites the object in place.
+func (s *s3FileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	objectName, err := s.parseS3FilePath(filePath)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucketName),
+		Key:    aws.String(objectName),
+		Body:   r,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write file to S3: %w", err)
+	}
+	return nil
+}
+
 // DeleteFile deletes a file
 func (s *s3FileService) DeleteFile(ctx context.Context, filePath string) error {
 	objectName, err := s.parseS3FilePath(filePath)

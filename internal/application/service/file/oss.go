@@ -303,6 +303,36 @@ func (s *ossFileService) GetFile(ctx context.Context, filePath string) (io.ReadC
 	return resp.Body, nil
 }
 
+// WriteFileToPath writes content to an existing oss:// path (backup
+// restore). Overwrites the object in place; temp-bucket objects are
+// routed to the temp client.
+func (s *ossFileService) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	bucketName, objectName, err := parseOssFilePath(filePath)
+	if err != nil {
+		return err
+	}
+	if err := utils.SafeObjectKey(objectName); err != nil {
+		return fmt.Errorf("invalid file path: %w", err)
+	}
+
+	var client *oss.Client
+	if bucketName == s.tempBucketName && s.tempClient != nil {
+		client = s.tempClient
+	} else {
+		client = s.client
+	}
+
+	_, err = client.PutObject(ctx, &oss.PutObjectRequest{
+		Bucket: oss.Ptr(bucketName),
+		Key:    oss.Ptr(objectName),
+		Body:   r,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write file to OSS: %w", err)
+	}
+	return nil
+}
+
 // DeleteFile removes a file from OSS.
 func (s *ossFileService) DeleteFile(ctx context.Context, filePath string) error {
 	bucketName, objectName, err := parseOssFilePath(filePath)

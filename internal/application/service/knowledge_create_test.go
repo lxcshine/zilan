@@ -115,6 +115,10 @@ func (s *createKnowledgeFileServiceStub) CopyFile(ctx context.Context, srcPath s
 	return "", errors.New("not implemented")
 }
 
+func (s *createKnowledgeFileServiceStub) WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error {
+	return errors.New("not implemented")
+}
+
 type createKnowledgeTaskEnqueuerStub struct {
 	calls int
 }

@@ -25,6 +25,14 @@ type tenantService struct {
 	storageRepo interfaces.StorageBackendRepository
 }
 
+// TenantPreDeleteHook is invoked synchronously right before a workspace
+// row is deleted. The container wires the backup subsystem's
+// SnapshotTenantBeforeDelete here (PRD data-backup-recovery.md §7 空间
+// 删除前自动快照); nil (unwired or backup disabled) makes deletion
+// behave exactly as before. Hook failures must never block deletion —
+// the backup service logs them internally.
+var TenantPreDeleteHook func(ctx context.Context, tenantID uint64)
+
 // NewTenantService creates a new tenant service instance
 func NewTenantService(repo interfaces.TenantRepository, storageRepo interfaces.StorageBackendRepository) interfaces.TenantService {
 	return &tenantService{repo: repo, storageRepo: storageRepo}
@@ -188,6 +196,13 @@ func (s *tenantService) DeleteTenant(ctx context.Context, id uint64) error {
 		}
 	} else {
 		logger.Infof(ctx, "Deleting tenant, ID: %d, name: %s", id, tenant.Name)
+	}
+
+	// Final safety snapshot before the data goes away — an undo window
+	// for the 误删 scenario (PRD data-backup-recovery.md §1.2). No-op
+	// when backup is disabled or the hook is unwired.
+	if TenantPreDeleteHook != nil {
+		TenantPreDeleteHook(ctx, id)
 	}
 
 	err = s.repo.DeleteTenant(ctx, id)

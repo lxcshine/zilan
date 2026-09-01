@@ -28,4 +28,11 @@ type FileService interface {
 	// independent: deleting the source never affects it. Returns ErrCrossBackendCopy
 	// when srcPath belongs to a different storage provider than this service.
 	CopyFile(ctx context.Context, srcPath string, tenantID uint64, knowledgeID string) (string, error)
+	// WriteFileToPath writes content to an EXISTING provider path, creating
+	// parent prefixes as needed and overwriting whatever is there. This is
+	// the path-preserving inverse of GetFile, used by backup restore to put
+	// objects back exactly where metadata rows reference them. It does NOT
+	// register the object with the resource catalog — restore replays the
+	// catalog rows from the metadata tier.
+	WriteFileToPath(ctx context.Context, filePath string, r io.Reader) error
 }
