@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	agentmemory "github.com/Tencent/WeKnora/internal/agent/memory"
+	"github.com/Tencent/WeKnora/internal/agent/compaction"
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	agenttoken "github.com/Tencent/WeKnora/internal/agent/token"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
@@ -38,22 +38,50 @@ type AgentEngine struct {
 	toolRegistry             *agenttools.ToolRegistry
 	chatModel                chat.Chat
 	eventBus                 *event.EventBus
-	knowledgeBasesInfo       []*KnowledgeBaseInfo      // Detailed knowledge base information for prompt
-	selectedDocs             []*SelectedDocumentInfo   // User-selected documents (via @ mention)
-	pinnedMCPServices        []*PinnedMCPServiceInfo   // User @mentioned MCP services for this turn
-	pinnedSkills             []*PinnedSkillInfo        // User @mentioned skills for this turn
-	sessionID                string                    // Session ID for logging and event emission
-	systemPromptTemplate     string                    // System prompt template (optional, uses default if empty)
-	skillsManager            *skills.Manager           // Skills manager for Progressive Disclosure (optional)
-	appConfig                *appconfig.Config         // Application config for prompt template resolution (optional)
-	imageDescriber           ImageDescriberFunc        // VLM function for describing images in tool results (optional)
-	tokenEstimator           *agenttoken.Estimator     // Token estimator for context window management
-	memoryConsolidator       *agentmemory.Consolidator // Memory consolidator for LLM-powered summarization (optional)
-	lastUsage                types.TokenUsage          // Token usage from the most recent LLM call
-	lastSentMsgCount         int                       // Number of messages sent in the most recent LLM call
-	modelContext             *modelcontext.Registry    // single request-local boundary for every model handle
-	govTokenCounter          *contextx.Counter         // vendor-calibrated counter for context governance (lazy)
-	lastScratchpadCompressAt int                       // tool-step count at the last scratchpad compression
+	knowledgeBasesInfo       []*KnowledgeBaseInfo    // Detailed knowledge base information for prompt
+	selectedDocs             []*SelectedDocumentInfo // User-selected documents (via @ mention)
+	pinnedMCPServices        []*PinnedMCPServiceInfo // User @mentioned MCP services for this turn
+	pinnedSkills             []*PinnedSkillInfo      // User @mentioned skills for this turn
+	sessionID                string                  // Session ID for logging and event emission
+	systemPromptTemplate     string                  // System prompt template (optional, uses default if empty)
+	skillsManager            *skills.Manager         // Skills manager for Progressive Disclosure (optional)
+	appConfig                *appconfig.Config       // Application config for prompt template resolution (optional)
+	imageDescriber           ImageDescriberFunc      // VLM function for describing images in tool results (optional)
+	tokenEstimator           *agenttoken.Estimator   // Token estimator for context window management
+	lastUsage                types.TokenUsage        // Token usage from the most recent LLM call
+	lastSentMsgCount         int                     // Number of messages sent in the most recent LLM call
+	modelContext             *modelcontext.Registry  // single request-local boundary for every model handle
+	govTokenCounter          *contextx.Counter       // vendor-calibrated counter for context governance (lazy)
+	lastScratchpadCompressAt int                     // tool-step count at the last scratchpad compression
+
+	// turnUsage 是本轮所有模型往返（每个 ReAct 轮次 + 最终答案合成，含溢出重试）的
+	// 累加用量（PRD FR-12）。lastUsage 只是"最近一次"的内存态基线，用于估算当前上下文
+	// 规模；持久化到 messages.usage 上的是本轮总量，因此两者不能互相替代。
+	turnUsage types.TokenUsage
+	// turnRounds 是本轮真正发生的模型往返数，写进 ContextTurnStats.Rounds。
+	turnRounds int
+	// turnStats 是本轮的上下文归因（PRD FR-12），懒创建：窗口口径与压缩/截断事件
+	// 都从这里进出，最终随 EventAgentComplete 的 Extra 交给 handler 落库。
+	turnStats *types.ContextTurnStats
+
+	// compactor 把较早的历史摘要掉以适配上下文窗口（nil 表示未启用），承载 PRD FR-06。
+	compactor *compaction.Compactor
+	// overflowRecovered 记录本轮已经用掉了那唯一一次「压缩后重试」。第二次尝试意味着历史
+	// 体积从来不是问题所在，继续循环只会白烧轮次预算。每个 turn 复位一次。
+	overflowRecovered bool
+	// compactionExhaustedAt 是压缩上一次报告"无可释放"时的消息数。低于该计数时答案不会
+	// 变化，因此没有理由再付一次摘要调用。
+	compactionExhaustedAt int
+
+	// checkpointSink 持久化压缩检查点（PRD FR-10）。nil（默认）表示每次压缩只在本轮内
+	// 生效，下一轮重新付一次摘要调用。
+	checkpointSink types.ContextCheckpointSink
+	// historyView 是本轮装载历史得到的轮次身份视图（坐标为 llmContext 下标），
+	// Execute 会把它平移到引擎消息坐标后交给压缩器。
+	historyView *compaction.HistoryView
+	// historyAppended 是 buildMessagesWithLLMContext 实际转写进消息列表的历史条数，
+	// 用于校验轮次区间与消息下标仍然 1:1 对齐（见 attachHistoryView）。
+	historyAppended int
 }
 
 // ImageDescriberFunc generates a text description of an image.
@@ -91,14 +119,35 @@ func NewAgentEngine(
 		modelContext:         modelcontext.NewRegistry(config.CitationsEnabled()),
 	}
 
-	// Initialize memory consolidator if context window management is configured
-	if config.MaxContextTokens > 0 {
-		engine.memoryConsolidator = agentmemory.NewConsolidator(
-			chatModel, tokenEst, config.MaxContextTokens, 0,
-		)
-	}
+	// 挂载上下文压缩器（PRD FR-06）。token 计量走 internal/contextx 的多厂商精确
+	// tokenizer（govCounter），而非 BPE 估算——这是 PRD §4.9 的净领先点。
+	engine.compactor = compaction.New(chatModel, engine.govCounter(), compaction.Settings{
+		Enabled:          config.MaxContextTokens > 0,
+		MaxContextTokens: config.MaxContextTokens,
+		ReserveTokens:    reserveTokensFor(config),
+	})
 
 	return engine
+}
+
+// contextSafetyTokens 是「我们估算的请求开销」与「供应商实际计数」之间的余量。token
+// 计数是近似的，供应商还会加上自己的脚手架；没有余量时，那个按我们的算术恰好装得下的
+// 请求正是会被拒绝的那个。
+const contextSafetyTokens = 4096
+
+// defaultCompletionTokenBudget 是每轮 ReAct 请求假定的补全预算。Zilan 不显式设置
+// max_tokens（由供应商默认），这里取一个保守值用于推导上下文预留量。
+const defaultCompletionTokenBudget = 8192
+
+// reserveTokensFor 是历史不得占用的那部分窗口，因为下一次回复必须放得进去。
+func reserveTokensFor(cfg *types.AgentConfig) int {
+	reserve := max(defaultCompletionTokenBudget+contextSafetyTokens, compaction.DefaultReserveTokens)
+	// 小窗口下把预留压到窗口的一半：否则阈值退化为 1，每一轮都会触发压缩，而保留预算
+	// 也会大于窗口本身，压缩根本无处可切。
+	if cfg != nil && cfg.MaxContextTokens > 0 {
+		reserve = min(reserve, max(cfg.MaxContextTokens/2, 1))
+	}
+	return reserve
 }
 
 // SetPinnedMentions sets per-turn @mention scope for MCP services and skills.
@@ -178,16 +227,111 @@ func (e *AgentEngine) GetSkillsManager() *skills.Manager {
 	return e.skillsManager
 }
 
-// estimateCurrentTokens returns the best estimate of the current context token count.
-// When API-reported usage from a previous round is available, it uses that as a
-// baseline and only BPE-estimates the delta (newly appended messages). Otherwise it
-// falls back to a full BPE estimation of all messages.
+// estimateCurrentTokens 返回当前上下文 token 数的最佳估计。上一轮有 API 报告的 usage 时，
+// 以它为基线，只对新追加的消息计量增量；否则对全部消息计量。
+//
+// 计量走 internal/contextx 的多厂商精确 tokenizer（含图片的保守估值），与压缩阈值同口径
+// （PRD §4.9：Zilan 使用精确 tokenizer 而非估算）。
 func (e *AgentEngine) estimateCurrentTokens(messages []chat.Message) int {
 	if e.lastUsage.TotalTokens > 0 && e.lastSentMsgCount > 0 && e.lastSentMsgCount < len(messages) {
-		delta := e.tokenEstimator.EstimateMessages(messages[e.lastSentMsgCount:])
+		delta := e.countContextTokens(messages[e.lastSentMsgCount:])
 		return e.lastUsage.TotalTokens + delta
 	}
-	return e.tokenEstimator.EstimateMessages(messages)
+	return e.countContextTokens(messages)
+}
+
+// ---------------------------------------------------------------------------
+// 每轮用量与上下文归因的采集（PRD FR-12）
+//
+// 引擎每轮新建（见 CreateAgentEngine），因此这里的状态天然只描述当前这一轮；
+// Execute 仍然显式复位一次，避免任何未来的复用把上一轮的数字带进来。
+// 口径约束：token 数只来自供应商回报的 usage 与 internal/contextx 的精确
+// tokenizer（compaction.CountMessages / govCounter），绝不用字符数估算。
+// ---------------------------------------------------------------------------
+
+// resetTurnAccounting 复位本轮的用量与归因采集。
+func (e *AgentEngine) resetTurnAccounting() {
+	e.turnUsage = types.TokenUsage{}
+	e.turnRounds = 0
+	e.turnStats = nil
+}
+
+// accumulateTurnUsage 把一次模型调用的用量累加进本轮总量。
+//
+// 一轮对话包含多次模型往返（每个 ReAct 轮次、溢出后的重试、最终答案合成），
+// 而 messages.usage 上持久化的是本轮总量，因此每一次回报都要累加（见
+// types.TokenUsage.Accumulate）。供应商未回报 usage（nil）时不计入往返数：
+// 那一次调用没有任何可归因的数字。
+func (e *AgentEngine) accumulateTurnUsage(usage *types.TokenUsage) {
+	if e == nil || usage == nil {
+		return
+	}
+	e.turnUsage.Accumulate(*usage)
+	e.turnRounds++
+}
+
+// turnContextStats 返回本轮的上下文归因，首次调用时按当前配置建好骨架。
+//
+// Agent 链路不做 L0–L4 五层预算切分（那是 chat pipeline 装配器的职责），因此
+// Budget / Used 保持零值；看板据此把 Agent 轮次排除在五层占比的分母之外，
+// 只统计它确实提供的窗口口径、往返数与压缩/截断事件。
+func (e *AgentEngine) turnContextStats() *types.ContextTurnStats {
+	if e.turnStats != nil {
+		return e.turnStats
+	}
+	stats := &types.ContextTurnStats{Source: types.ContextTurnStatsSourceAgent}
+	if e.chatModel != nil {
+		stats.Model = e.chatModel.GetModelName()
+	}
+	// compactor 为 nil（未配置窗口）时 Settings() 返回零值，于是窗口口径全为 0。
+	if settings := e.compactor.Settings(); settings.MaxContextTokens > 0 {
+		stats.Window = settings.MaxContextTokens
+		stats.ReservedOutput = settings.ReserveTokens
+		stats.Usable = settings.MaxContextTokens - settings.ReserveTokens
+		stats.CompactThreshold = settings.Threshold()
+	}
+	e.turnStats = stats
+	return stats
+}
+
+// recordContextEvent 记录一次压缩/截断事件。round 是 Agent 轮次（从 1 开始），
+// 五层链路没有轮次概念，因此该字段是 Agent 归因独有的定位信息。
+func (e *AgentEngine) recordContextEvent(round int, ev types.ContextTurnEvent) {
+	if e == nil {
+		return
+	}
+	ev.Round = round
+	e.turnContextStats().RecordEvent(ev)
+}
+
+// turnUsagePayload 返回本轮累计用量的副本；一次都没有回报时返回 nil，
+// 于是消息行上的 usage 存 NULL 而不是一份全零的假计量。
+func (e *AgentEngine) turnUsagePayload() *types.TokenUsage {
+	if e.turnUsage.IsZero() {
+		return nil
+	}
+	usage := e.turnUsage
+	return &usage
+}
+
+// turnStatsPayload 收尾本轮归因：补上往返数，没有任何可展示内容时返回 nil
+// （ContextTurnStats.Value 对空值同样存 NULL）。
+func (e *AgentEngine) turnStatsPayload() *types.ContextTurnStats {
+	// 即使本轮没有触发任何压缩/截断也要建出骨架：窗口口径与模型往返数本身就是
+	// 看板要的归因，而且压缩触发频率以"有归因的轮次"为分母，只在压缩时才有归因
+	// 会让那个比率恒等于 1。
+	stats := e.turnContextStats()
+	stats.Rounds = e.turnRounds
+	if stats.Empty() {
+		return nil
+	}
+	return stats
+}
+
+// turnAccountingExtra 把本轮的用量与归因挂到事件 Extra 上（PRD FR-12）。
+// 形状由 types.NewTurnUsageExtra 统一，chat pipeline 那条通道用的是同一个。
+func (e *AgentEngine) turnAccountingExtra() map[string]interface{} {
+	return types.NewTurnUsageExtra(e.turnUsagePayload(), e.turnStatsPayload())
 }
 
 // Execute executes the agent with conversation history and streaming output
@@ -253,6 +397,13 @@ func (e *AgentEngine) Execute(
 		CurrentRound:  0,
 	}
 
+	// 每个 turn 各复位一次：溢出恢复的「压缩后重试」上限是每 turn 一次（PRD FR-06 规则 4），
+	// 压缩耗尽标记描述的也只是上一 turn 的历史规模。
+	e.overflowRecovered = false
+	e.compactionExhaustedAt = 0
+	// 用量与上下文归因同样是每 turn 一份（PRD FR-12）。
+	e.resetTurnAccounting()
+
 	// Build system prompt using progressive RAG prompt
 	// If skills are enabled, include skills metadata (Level 1 - Progressive Disclosure)
 	systemPrompt := e.buildSystemPrompt(ctx)
@@ -264,6 +415,8 @@ func (e *AgentEngine) Execute(
 		imgs = imageURLs[0]
 	}
 	messages := e.buildMessagesWithLLMContext(systemPrompt, query, sessionID, llmContext, imgs)
+	// FR-10：把装载侧给出的轮次身份平移到引擎消息坐标，压缩才能把摘要存到正确的轮次上。
+	e.attachHistoryView(ctx, messages, llmContext)
 
 	// Get tool definitions for function calling
 	tools := e.buildToolsForLLM()
@@ -515,14 +668,12 @@ func (e *AgentEngine) runReActIteration(
 		}, retErr)
 	}()
 
-	// Context window management: estimate current token count using
-	// the API-reported usage from the previous round plus a BPE delta
-	// for newly appended messages (assistant reply + tool results).
+	// 上下文窗口管理（PRD FR-06）：用上一轮 API 报告的 usage 加上对新追加消息
+	// （assistant 回复 + 工具结果）的精确计量作为当前规模，越阈则先压缩再发请求。
 	currentTokens := e.estimateCurrentTokens(*messagesPtr)
-	beforeLen := len(*messagesPtr)
-	*messagesPtr = e.manageContextWindow(ctx, *messagesPtr, round, currentTokens)
-	if len(*messagesPtr) < beforeLen {
-		currentTokens = e.tokenEstimator.EstimateMessages(*messagesPtr)
+	if managed, changed := e.manageContextWindow(ctx, *messagesPtr, round, currentTokens); changed {
+		*messagesPtr = managed
+		currentTokens = e.countContextTokens(managed)
 	}
 
 	logger.Infof(ctx, "[Agent][Round-%d/%d] Starting: %d messages, %d tools, est_tokens=%d",
@@ -537,7 +688,7 @@ func (e *AgentEngine) runReActIteration(
 
 	// 1. Think: Call LLM with function calling (includes retry + graceful degradation)
 	e.lastSentMsgCount = len(*messagesPtr)
-	resp, err := e.callLLMWithRetry(ctx, *messagesPtr, tools, state, query, state.CurrentRound, sessionID)
+	resp, err := e.callLLMWithRetry(ctx, messagesPtr, tools, state, query, state.CurrentRound, sessionID)
 	if err != nil {
 		retErr = err
 		return iterOutcomeNext, err
@@ -545,6 +696,33 @@ func (e *AgentEngine) runReActIteration(
 	if resp == nil {
 		return iterOutcomeBreak, nil
 	}
+
+	// 本轮自己的 token 估算可能是错的——历史是计量出来的，而供应商按自己的方式计数——
+	// 于是一个看起来安全的请求仍可能回来时已经撞上了窗口。压缩后重试一次，把这一轮从
+	// 浪费变成恢复。每 turn 只此一次：如果重试仍然溢出，问题就不在历史体积上
+	// （PRD FR-06 规则 1、规则 4）。
+	if !e.overflowRecovered && e.responseHitContextLimit(resp) {
+		e.overflowRecovered = true
+		logger.Warnf(ctx, "[Agent][Round-%d] 响应撞上上下文窗口 (finish=%s, prompt=%d, completion=%d)；"+
+			"压缩后重试一次", round, resp.FinishReason, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+		common.PipelineWarn(ctx, "Agent", "context_overflow_retry", map[string]interface{}{
+			"round":         round,
+			"finish_reason": resp.FinishReason,
+			"prompt_tokens": resp.Usage.PromptTokens,
+			"message_count": len(*messagesPtr),
+		})
+		*messagesPtr = e.forceCompaction(ctx, *messagesPtr, round)
+		e.lastSentMsgCount = len(*messagesPtr)
+		resp, err = e.callLLMWithRetry(ctx, messagesPtr, tools, state, query, state.CurrentRound, sessionID)
+		if err != nil {
+			retErr = err
+			return iterOutcomeNext, err
+		}
+		if resp == nil {
+			return iterOutcomeBreak, nil
+		}
+	}
+
 	response = resp
 	if response.Usage.TotalTokens > 0 {
 		e.lastUsage = response.Usage
@@ -658,8 +836,14 @@ func (e *AgentEngine) runReActIteration(
 		*messagesPtr = e.governToolResults(ctx, *messagesPtr,
 			len(*messagesPtr)-toolCallCount, query)
 	}
+	messagesBeforeScratchpad := len(*messagesPtr)
 	*messagesPtr = e.maybeCompressScratchpad(ctx, *messagesPtr, query,
 		countTotalToolCalls(state.RoundSteps))
+	if len(*messagesPtr) != messagesBeforeScratchpad {
+		// 草稿压缩把较早的工具结果折叠成一条摘要，消息下标整体前移：轮次身份视图
+		// 不再可信，本轮不再产生压缩检查点（PRD FR-10）。
+		e.invalidateHistoryView()
+	}
 	common.PipelineInfo(ctx, "Agent", "round_end", map[string]interface{}{
 		"iteration":   state.CurrentRound,
 		"round":       round,

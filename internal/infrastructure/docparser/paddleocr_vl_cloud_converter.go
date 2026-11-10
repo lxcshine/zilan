@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -144,17 +143,21 @@ func (c *PaddleOCRVLCloudReader) submitJob(ctx context.Context, req *types.ReadR
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("API status %d: %s", resp.StatusCode, readErrorPreview(resp.Body))
 	}
 
+	// 提交响应是控制面 JSON（只含 jobId），按控制面上界约束。
+	respBody, err := readCapped(resp.Body, maxJSONResponseBytes())
+	if err != nil {
+		return "", fmt.Errorf("read response: %w", err)
+	}
 	var result paddleOCRVLCloudSubmitResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return "", fmt.Errorf("decode response: %w", err)
 	}
 	if result.Data.JobID == "" {
-		return "", fmt.Errorf("API returned no jobId: %s", string(respBody))
+		return "", fmt.Errorf("API returned no jobId: %s", utils.ErrorPreviewString(respBody))
 	}
 
 	logger.Infof(context.Background(), "[PaddleOCR-VL Cloud] job submitted: jobId=%s", result.Data.JobID)
@@ -205,11 +208,18 @@ func (c *PaddleOCRVLCloudReader) pollJob(ctx context.Context, jobID string) (str
 			sleepCtx(ctx, paddleOCRVLCloudPollInterval)
 			continue
 		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
 		if resp.StatusCode != http.StatusOK {
-			logger.Errorf(context.Background(), "[PaddleOCR-VL Cloud] poll #%d status %d: %s", pollCount, resp.StatusCode, string(respBody))
+			logger.Errorf(context.Background(), "[PaddleOCR-VL Cloud] poll #%d status %d: %s", pollCount, resp.StatusCode, readErrorPreview(resp.Body))
+			resp.Body.Close()
+			sleepCtx(ctx, paddleOCRVLCloudPollInterval)
+			continue
+		}
+
+		// 轮询响应是控制面 JSON（状态与结果 URL），按控制面上界约束。
+		respBody, readErr := readCapped(resp.Body, maxJSONResponseBytes())
+		resp.Body.Close()
+		if readErr != nil {
+			logger.Errorf(context.Background(), "[PaddleOCR-VL Cloud] poll #%d read body: %v", pollCount, readErr)
 			sleepCtx(ctx, paddleOCRVLCloudPollInterval)
 			continue
 		}
@@ -269,7 +279,8 @@ func (c *PaddleOCRVLCloudReader) fetchResults(jsonlURL string) (string, map[stri
 	if resp.StatusCode != http.StatusOK {
 		return "", nil, fmt.Errorf("download jsonl status %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
+	// jsonl 里是整篇解析结果，按结果响应上界约束。
+	data, err := readCapped(resp.Body, maxResultResponseBytes())
 	if err != nil {
 		return "", nil, fmt.Errorf("read jsonl body: %w", err)
 	}
@@ -321,7 +332,9 @@ func (c *PaddleOCRVLCloudReader) downloadImages(mdContent string, imagesURL map[
 			logger.Errorf(context.Background(), "[PaddleOCR-VL Cloud] download image %s: %v", ipath, err)
 			continue
 		}
-		imgBytes, err := io.ReadAll(resp.Body)
+		// 单张图片受 maxRemoteImageSize 约束，与 image_resolver 的远程图片
+		// 下载保持一致（FR-07：视觉类响应必须有上界）。
+		imgBytes, err := readCapped(resp.Body, maxRemoteImageSize)
 		resp.Body.Close()
 		if err != nil || resp.StatusCode != http.StatusOK {
 			logger.Errorf(context.Background(), "[PaddleOCR-VL Cloud] read image %s status=%d err=%v", ipath, resp.StatusCode, err)

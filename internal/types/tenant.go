@@ -118,6 +118,9 @@ type Tenant struct {
 	RetrievalConfig *RetrievalConfig `yaml:"retrieval_config" json:"retrieval_config" gorm:"type:jsonb"`
 	// API principal config: controls how X-API-Key requests map to terminal principals.
 	APIPrincipalConfig *APIPrincipalConfig `yaml:"api_principal_config" json:"-" gorm:"type:jsonb"`
+	// 记忆治理配置（FR-02 规则 7 / FR-04 规则 1）：写入模式与 active / pending
+	// 条目上限。nil 或零值字段一律回落到全局默认，存量工作区无需数据迁移。
+	MemoryConfig *TenantMemoryConfig `yaml:"memory_config" json:"memory_config" gorm:"type:jsonb"`
 	// Creation time
 	CreatedAt time.Time `yaml:"created_at"          json:"created_at"`
 	// Last updated time

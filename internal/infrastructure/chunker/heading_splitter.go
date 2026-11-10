@@ -42,6 +42,14 @@ func splitByHeadingsImpl(text string, cfg SplitterConfig, profile *DocProfile) [
 	}
 
 	bounds := findHeadingBoundaries(text, primaryLevel)
+	// PRD FR-15 规则③：表格原子性优先于策略选择。落在 protected 区间（Markdown
+	// 表格、LaTeX 公式块、围栏代码块、图片/链接）内部的标题边界必须丢弃，否则
+	// 表格单元格里以 `#` 开头的行会被当成分节标题，把一张表切成两半。
+	// 与 heuristic_splitter.go 的处理保持一致：位于区间端点的边界保留（它本来
+	// 就和 protected 区域的起止对齐，不会切断内容）。
+	if prot := protectedSpansRune(text, protectedSpans(text)); len(prot) > 0 {
+		bounds = dropHeadingBoundsInsideSpans(bounds, prot)
+	}
 	if len(bounds) <= 1 {
 		return SplitText(text, cfg)
 	}
@@ -214,19 +222,10 @@ func findHeadingBoundaries(text string, primaryLevel int) []headingBoundary {
 	}
 
 	pos := 0
-	inFence := false
+	var fence markdownFence
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			pos += utf8.RuneCountInString(line)
-			if i < len(lines)-1 {
-				pos++ // newline
-			}
-			continue
-		}
-		if !inFence {
+		if code, _ := fence.consume(line); !code {
 			m := MarkdownHeadingPattern.FindStringSubmatch(line)
 			if m != nil {
 				level := len(m[1])
@@ -250,6 +249,34 @@ func findHeadingBoundaries(text string, primaryLevel int) []headingBoundary {
 	return bounds
 }
 
+// dropHeadingBoundsInsideSpans removes heading boundaries that fall strictly
+// inside a protected (rune-offset) span — tables, LaTeX blocks, fenced code,
+// image/link syntax. Boundaries sitting on a span edge are kept because they
+// align with the protected region's start/end and therefore don't cut it.
+// spans must be sorted by start (protectedSpans guarantees this).
+//
+// Mirrors dropBoundsInsideSpans in heuristic_splitter.go so PRD FR-15 规则③
+// (表格原子性优先于策略选择) holds for both structure-aware tiers.
+func dropHeadingBoundsInsideSpans(bounds []headingBoundary, spans []span) []headingBoundary {
+	if len(spans) == 0 {
+		return bounds
+	}
+	out := make([]headingBoundary, 0, len(bounds))
+boundLoop:
+	for _, b := range bounds {
+		for _, s := range spans {
+			if s.start >= b.runeStart {
+				break // remaining spans start at or after b — can't contain b
+			}
+			if b.runeStart < s.end {
+				continue boundLoop
+			}
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
 // observeSubHeadings walks the section's lines and feeds every Markdown
 // heading deeper than primaryLevel into the hierarchy. This keeps the
 // hierarchy state correct so the breadcrumb at the next primary section
@@ -259,14 +286,9 @@ func observeSubHeadings(runes []rune, primaryLevel int, h *HeadingHierarchy) {
 		return
 	}
 	text := string(runes)
-	inFence := false
+	var fence markdownFence
 	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
+		if code, _ := fence.consume(line); code {
 			continue
 		}
 		m := MarkdownHeadingPattern.FindStringSubmatch(line)
@@ -298,19 +320,10 @@ func sectionBreadcrumbs(sectionRunes []rune, primaryLevel int, seed HeadingHiera
 	h := seed
 	result := []sectionBreadcrumb{{runeStart: 0, breadcrumb: h.BreadcrumbWithHashes()}}
 	pos := 0
-	inFence := false
+	var fence markdownFence
 	lines := strings.Split(string(sectionRunes), "\n")
 	for i, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
-			pos += utf8.RuneCountInString(line)
-			if i < len(lines)-1 {
-				pos++
-			}
-			continue
-		}
-		if !inFence {
+		if code, _ := fence.consume(line); !code {
 			if m := MarkdownHeadingPattern.FindStringSubmatch(line); m != nil && len(m[1]) > primaryLevel {
 				h.Observe(line)
 				result = append(result, sectionBreadcrumb{

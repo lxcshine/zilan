@@ -22,6 +22,24 @@ type Reranker interface {
 	GetModelID() string
 }
 
+// PassageLimiter 由“厂商文档写明了单条 document 长度上限”的重排实现来提供。
+// 重排阶段自己构造 passage（标题 + 正文 + 图片描述/OCR + 生成问题），因此
+// 可以按上限裁剪，而不是让一条超长候选把整个请求打挂——协议层出于正确性
+// 拒绝自行截断，裁剪责任在调用方。
+type PassageLimiter interface {
+	// MaxPassageRunes 返回单次请求中一条 document 的最大字符（rune）数。
+	// 返回 0 表示没有已知上限。
+	MaxPassageRunes() int
+}
+
+// MaxPassageRunes 返回 r 的 passage 长度上限；r 未声明上限时返回 0。
+func MaxPassageRunes(r Reranker) int {
+	if limiter, ok := r.(PassageLimiter); ok {
+		return limiter.MaxPassageRunes()
+	}
+	return 0
+}
+
 type RankResult struct {
 	Index          int          `json:"index"`
 	Document       DocumentInfo `json:"document"`

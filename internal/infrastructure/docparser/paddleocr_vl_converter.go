@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -164,13 +163,14 @@ func (c *PaddleOCRVLReader) callLayoutParsing(
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", nil, fmt.Errorf("read response body: %w", err)
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("PaddleOCR-VL API status %d: %s", resp.StatusCode, readErrorPreview(resp.Body))
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("PaddleOCR-VL API status %d: %s", resp.StatusCode, string(respBody))
+	// 响应体内联整篇解析结果与 base64 图片，按结果响应上界约束。
+	respBody, err := readCapped(resp.Body, maxResultResponseBytes())
+	if err != nil {
+		return "", nil, fmt.Errorf("read response body: %w", err)
 	}
 
 	var result paddleOCRVLResponse

@@ -1,9 +1,12 @@
 package embedding
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 func TestNewEmbeddingHTTPClient_ReusesTransport(t *testing.T) {
@@ -15,10 +18,14 @@ func TestNewEmbeddingHTTPClient_ReusesTransport(t *testing.T) {
 	if first == second {
 		t.Fatal("expected distinct HTTP clients")
 	}
-	if first.Transport != second.Transport {
+	// 客户端的 Transport 现在统一是 SSRFValidatingRoundTripper 兜底包装，
+	// 连接池是否共享要看它包着的 Base。
+	firstBase := ssrfBaseTransport(t, first)
+	secondBase := ssrfBaseTransport(t, second)
+	if firstBase != secondBase {
 		t.Fatal("expected embedding HTTP clients to share a transport")
 	}
-	if first.Transport != sharedEmbeddingHTTPTransport {
+	if firstBase != http.RoundTripper(sharedEmbeddingHTTPTransport) {
 		t.Fatal("expected embedding HTTP client to use the shared transport")
 	}
 	if first.Timeout != firstTimeout {
@@ -27,6 +34,19 @@ func TestNewEmbeddingHTTPClient_ReusesTransport(t *testing.T) {
 	if second.Timeout != secondTimeout {
 		t.Fatalf("unexpected second client timeout: got %v, want %v", second.Timeout, secondTimeout)
 	}
+}
+
+// ssrfBaseTransport 取出 SSRFValidatingRoundTripper 包装的真实 transport。
+func ssrfBaseTransport(t *testing.T, client *http.Client) http.RoundTripper {
+	t.Helper()
+	wrapper, ok := client.Transport.(*secutils.SSRFValidatingRoundTripper)
+	if !ok {
+		t.Fatalf("expected *secutils.SSRFValidatingRoundTripper, got %T", client.Transport)
+	}
+	if wrapper.Base == nil {
+		t.Fatal("SSRFValidatingRoundTripper has no base transport")
+	}
+	return wrapper.Base
 }
 
 func TestValidateEmbeddingBaseURL_RejectsLoopback(t *testing.T) {

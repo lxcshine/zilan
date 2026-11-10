@@ -401,6 +401,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 				StartAt:         pc.Start,
 				EndAt:           pc.End,
 				ChunkType:       types.ChunkTypeParentText,
+				SourceLocators:  pc.SourceLocators, // FR-05 引用溯源定位
 			}
 		}
 		// Set prev/next links for parent chunks
@@ -441,6 +442,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			StartAt:         int(chunkData.Start),
 			EndAt:           int(chunkData.End),
 			ChunkType:       types.ChunkTypeText,
+			SourceLocators:  chunkData.SourceLocators, // FR-05 引用溯源定位
 		}
 
 		// Wire up ParentChunkID for child chunks
@@ -3019,10 +3021,32 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		convertResult.MarkdownContent = transcribedText
 		convertResult.IsAudio = false
 		convertResult.AudioData = nil
+
+		// FR-05 引用溯源：有分段时间戳时按段落拼接并生成 time 定位块，
+		// 使音频引用可回跳原始录音的时间区间。无分段则保持全文。
+		if transcriptionResult != nil && len(transcriptionResult.Segments) > 0 {
+			segments := make([]transcriptSegment, 0, len(transcriptionResult.Segments))
+			for _, seg := range transcriptionResult.Segments {
+				segments = append(segments, transcriptSegment{
+					Text:    seg.Text,
+					StartMs: int64(seg.Start * 1000),
+					EndMs:   int64(seg.End * 1000),
+				})
+			}
+			convertResult.MarkdownContent = transcriptWithSegments(transcribedText, segments)
+			convertResult.SourceBlocks = transcriptSourceBlocks(segments)
+			logger.Infof(ctx, "[ASR] Built %d time-locator blocks from transcript segments",
+				len(convertResult.SourceBlocks))
+		}
 	}
 
 	// Step 2: Store images and update markdown references
 	var storedImages []docparser.StoredImage
+
+	// FR-05 引用溯源：记录图片 URL 重写前的 Markdown 与定位块，
+	// 图片解析会把引用替换为 provider:// 地址，定位块必须据此重对齐。
+	parsedMarkdown := convertResult.MarkdownContent
+	sourceBlocks := convertResult.SourceBlocks
 
 	if s.imageResolver != nil && convertResult != nil {
 		fileSvc := s.resolveFileService(ctx, kb)
@@ -3051,6 +3075,20 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 		logger.Infof(ctx, "Resolved %d total images for knowledge %s", len(storedImages), knowledge.ID)
 	}
 
+	// FR-05 引用溯源：建立定位索引（解析器定位块 → 重对齐到图片 URL 重写后的 Markdown），
+	// 并为每张图片标注其在原文中的位置。best-effort：无定位块时索引为 nil。
+	sourceIndex := s.buildSourceIndex(knowledge, parsedMarkdown, sourceBlocks, convertResult.MarkdownContent, storedImages)
+	if sourceIndex != nil {
+		imagesLocated := 0
+		for _, img := range storedImages {
+			if len(img.SourceLocators) > 0 {
+				imagesLocated++
+			}
+		}
+		logger.Infof(ctx, "Source locator index built for %s: blocks=%d images_located=%d",
+			knowledge.ID, len(sourceBlocks), imagesLocated)
+	}
+
 	// Step 3: Split into chunks using Go chunker
 	chunkCfg := buildSplitterConfigFromChunking(eff.ChunkingConfig)
 
@@ -3077,11 +3115,16 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 				Start:         c.Start,
 				End:           c.End,
 				ParentIndex:   c.ParentIndex,
+				// FR-05 引用溯源：分块区间 → 原文位置（页码/bbox/表格行等）
+				SourceLocators: sourceIndex.Locators(c.Start, c.End),
 			}
 		}
 		parentChunks := make([]types.ParsedParentChunk, len(pcResult.Parents))
 		for i, p := range pcResult.Parents {
-			parentChunks[i] = types.ParsedParentChunk{Content: p.Content, Seq: p.Seq, Start: p.Start, End: p.End}
+			parentChunks[i] = types.ParsedParentChunk{
+				Content: p.Content, Seq: p.Seq, Start: p.Start, End: p.End,
+				SourceLocators: sourceIndex.Locators(p.Start, p.End),
+			}
 		}
 		processOpts.ParentChunks = parentChunks
 		logger.Infof(ctx, "Split document into %d parent + %d child chunks for knowledge %s",
@@ -3096,6 +3139,8 @@ func (s *knowledgeService) ProcessDocument(ctx context.Context, t *asynq.Task) e
 				Seq:           c.Seq,
 				Start:         c.Start,
 				End:           c.End,
+				// FR-05 引用溯源：分块区间 → 原文位置（页码/bbox/表格行等）
+				SourceLocators: sourceIndex.Locators(c.Start, c.End),
 			}
 		}
 		logger.Infof(ctx, "Split document into %d chunks for knowledge %s", len(chunks), knowledge.ID)
@@ -3138,6 +3183,10 @@ func (s *knowledgeService) convert(
 		uploadOverrides = processOverrides.ParserEngineOverrides
 	}
 	mergedOverrides := MergeParserEngineOverrides(tenantOverrides, uploadOverrides)
+	// FR-13：把知识库的 OCR 流水线（manual/smart）、流水线参数与前处理开关摊平
+	// 进 overrides，复用既有 parser_engine_overrides 通道传到 docreader，不改 proto。
+	// 越界的参数在下发前被丢弃并回落默认值，因此坏配置不会让解析失败。
+	mergedOverrides = InjectOCRPipelineOverrides(ctx, kb, mergedOverrides)
 
 	if isURL {
 		if err := secutils.ValidateURLForSSRF(payload.URL); err != nil {
@@ -3214,7 +3263,12 @@ func (s *knowledgeService) convert(
 		return nil, nil
 	}
 
-	result, err := s.callDocReaderWithTimeout(ctx, reader, req)
+	// FR-16：解析进度写进 Redis（复用既有 progressKey 约定，不新增 DB 列）；
+	// 解析阶段结束后清掉，避免留下过期的百分比。
+	progress := s.parseProgressReporter(ctx, knowledge.ID)
+	defer s.clearParseProgress(ctx, knowledge.ID)
+
+	result, err := s.callDocReaderWithTimeout(ctx, reader, req, progress)
 	if err != nil {
 		// Distinguish DocReader timeout (a knowable user-facing
 		// failure) from generic read errors so the UI can suggest
@@ -3274,7 +3328,7 @@ func (s *knowledgeService) convert(
 				retryOverrides["pdf_render_dpi"] = "300"
 				retryOverrides["ocr_precision"] = "high"
 				retryReq.ParserEngineOverrides = retryOverrides
-				if retryResult, rerr := s.callDocReaderWithTimeout(ctx, retryReader, &retryReq); rerr == nil && retryResult.Error == "" {
+				if retryResult, rerr := s.callDocReaderWithTimeout(ctx, retryReader, &retryReq, nil); rerr == nil && retryResult.Error == "" {
 					rScore, _, _ := docparser.ParseQualityFromMetadata(retryResult.Metadata)
 					// Adoption rule: a retry is accepted when it either scored
 					// better, OR (heavy engines emit no quality metadata, so
@@ -3318,6 +3372,30 @@ func (s *knowledgeService) convert(
 	if pages := result.Metadata["pages"]; pages != "" {
 		docOutput["pages"] = pages
 	}
+
+	// FR-16：docreader 触及资源上界（时长 / 内存 / 取消）时会返回**已解析的部分**
+	// 并打上 incomplete 标记。这不是失败 —— 走 failKnowledge 会把已经拿到的正文一并
+	// 丢掉；但也不能静默当成完整文档（PRD §5.3 规则 3：影响结果质量的降级必须明确
+	// 告知）。因此照常继续分块入库，同时在 Knowledge 与 chunk 元数据上打标
+	// 「解析未完成」（含原因），让 UI 能明确告知用户结果不完整。
+	// 放在质量重试之后：重试可能换掉 result，这里必须看最终采纳的那一份。
+	if result.ParseIncomplete {
+		s.markParseIncomplete(ctx, knowledge, result)
+		docOutput["parse_incomplete"] = true
+		docOutput["parse_incomplete_reason"] = result.ParseIncompleteReason
+		if result.PagesTotal > 0 {
+			docOutput["parse_pages_done"] = result.PagesDone
+			docOutput["parse_pages_total"] = result.PagesTotal
+		}
+	}
+
+	// FR-05 引用溯源：解析器未上报定位块时，按文件类型回退到结构对齐/文本透传定位。
+	// best-effort：失败仅意味着无定位信息，不影响解析结果。
+	s.attachStructureBlocks(fileType, req.FileContent, result)
+	if n := len(result.SourceBlocks); n > 0 {
+		docOutput["source_blocks"] = n
+	}
+
 	s.endStage(ctx, knowledge.ID, types.StageDocReader, docOutput)
 	return result, nil
 }
@@ -3330,8 +3408,17 @@ func (s *knowledgeService) convert(
 //
 // On timeout we annotate the error so retries / dead-letter consumers can
 // distinguish "docreader was slow" from "docreader returned an error".
+//
+// FR-16：progress 非 nil 且 reader 支持流式进度时，解析过程中会按帧回调，
+// 让「解析中」有实时百分比；不支持的实现（云端 / 命令行引擎）自动退化为普通
+// Read，行为不变。这里的 ctx deadline 会被 GRPCDocumentReader 换算成
+// parse_deadline_unix 下发给 docreader，使 Python 侧能在真正超时之前主动中止并
+// **保留已解析部分**，而不是让整个调用被掐断后什么都拿不到。
 func (s *knowledgeService) callDocReaderWithTimeout(
-	ctx context.Context, reader interfaces.DocReader, req *types.ReadRequest,
+	ctx context.Context,
+	reader interfaces.DocReader,
+	req *types.ReadRequest,
+	progress interfaces.ParseProgressFunc,
 ) (*types.ReadResult, error) {
 	timeout := 30 * time.Minute
 	if s.config != nil && s.config.KnowledgeBase != nil && s.config.KnowledgeBase.DocReaderCallTimeout > 0 {
@@ -3341,7 +3428,15 @@ func (s *knowledgeService) callDocReaderWithTimeout(
 	defer cancel()
 
 	start := time.Now()
-	result, err := reader.Read(callCtx, req)
+	var (
+		result *types.ReadResult
+		err    error
+	)
+	if pr := interfaces.AsProgressReader(reader); pr != nil && progress != nil {
+		result, err = pr.ReadWithProgress(callCtx, req, progress)
+	} else {
+		result, err = reader.Read(callCtx, req)
+	}
 	elapsed := time.Since(start)
 	if err != nil {
 		// Promote DeadlineExceeded into a clearer message; retain underlying
@@ -3356,6 +3451,108 @@ func (s *knowledgeService) callDocReaderWithTimeout(
 	}
 	logger.Infof(ctx, "[convert] docreader call ok in %s for %q", elapsed, req.FileName)
 	return result, nil
+}
+
+// --- FR-16 解析进度上报（Redis，复用既有 progressKey 约定） ------------------
+// 刻意不新增 DB 列：百分比是秒级变化的瞬时状态，写库既贵又会放大主从延迟；
+// Redis + TTL 与 faq_import_progress / kb_clone_progress 两套既有进度键同构，
+// 排查时可以直接用 utils.CheckRunningTaskStatus 读取。
+const (
+	parseProgressKeyPrefix = "knowledge_parse_progress:"
+	parseProgressTTL       = 24 * time.Hour
+)
+
+// parseProgressPayload 是写进 Redis 的进度快照。
+type parseProgressPayload struct {
+	KnowledgeID string `json:"knowledge_id"`
+	Stage       string `json:"stage"`
+	ImagesDone  int    `json:"images_done"`
+	ImagesTotal int    `json:"images_total"`
+	Percent     int    `json:"percent"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+func getParseProgressKey(knowledgeID string) string {
+	return parseProgressKeyPrefix + knowledgeID
+}
+
+// parseProgressReporter 构造进度回调；Redis 不可用时返回 nil（退化为无进度）。
+// 回调在 gRPC 接收循环里被逐帧调用，因此必须便宜：只在整数百分比变化时写一次，
+// 一个文档最多 100 次 Redis 写入。
+func (s *knowledgeService) parseProgressReporter(
+	ctx context.Context, knowledgeID string,
+) interfaces.ParseProgressFunc {
+	if s.redisClient == nil || knowledgeID == "" {
+		return nil
+	}
+	key := getParseProgressKey(knowledgeID)
+	lastPercent := -1
+	return func(done, total int) {
+		percent := 0
+		if total > 0 {
+			percent = done * 100 / total
+			if percent > 100 {
+				percent = 100
+			}
+		}
+		if percent == lastPercent {
+			return
+		}
+		lastPercent = percent
+		data, err := json.Marshal(parseProgressPayload{
+			KnowledgeID: knowledgeID,
+			Stage:       types.StageDocReader,
+			ImagesDone:  done,
+			ImagesTotal: total,
+			Percent:     percent,
+			UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			return
+		}
+		if err := s.redisClient.Set(ctx, key, data, parseProgressTTL).Err(); err != nil {
+			logger.Warnf(ctx, "[convert] failed to write parse progress for %s: %v", knowledgeID, err)
+		}
+	}
+}
+
+// clearParseProgress 删除进度键：解析阶段结束后百分比不再有意义，留着只会让
+// 排查看到过期的「卡在 37%」。best-effort，失败只影响调试。
+func (s *knowledgeService) clearParseProgress(ctx context.Context, knowledgeID string) {
+	if s.redisClient == nil || knowledgeID == "" {
+		return
+	}
+	if err := s.redisClient.Del(ctx, getParseProgressKey(knowledgeID)).Err(); err != nil {
+		logger.Warnf(ctx, "[convert] failed to clear parse progress for %s: %v", knowledgeID, err)
+	}
+}
+
+// markParseIncomplete 把「解析未完成」标注写进 Knowledge.Metadata 并落库（FR-16）。
+// 结果只是**部分解析**，因此绝不能静默当成完整文档；chunk 侧的同名标注由
+// processOpts.Metadata 透传（applyIncompleteMeta 已把键写进 result.Metadata）。
+func (s *knowledgeService) markParseIncomplete(
+	ctx context.Context, knowledge *types.Knowledge, result *types.ReadResult,
+) {
+	meta := map[string]interface{}{}
+	if parsed, err := knowledge.Metadata.Map(); err == nil && parsed != nil {
+		meta = parsed
+	}
+	meta["parse_incomplete"] = true
+	meta["parse_incomplete_reason"] = result.ParseIncompleteReason
+	if result.PagesTotal > 0 {
+		meta["parse_pages_done"] = result.PagesDone
+		meta["parse_pages_total"] = result.PagesTotal
+	}
+	knowledge.Metadata = types.NewJSON(meta)
+	knowledge.UpdatedAt = time.Now()
+	if err := s.repo.UpdateKnowledge(ctx, knowledge); err != nil {
+		logger.Warnf(ctx, "[convert] failed to persist parse_incomplete for %s: %v", knowledge.ID, err)
+	}
+	logger.Warnf(ctx,
+		"[convert] parse incomplete for %s (reason=%s pages=%d/%d chars=%d images=%d): "+
+			"keeping the partial result and flagging it as incomplete",
+		knowledge.ID, result.ParseIncompleteReason, result.PagesDone, result.PagesTotal,
+		len(result.MarkdownContent), len(result.ImageRefs))
 }
 
 // isLikelyRateLimitError performs a fuzzy classification of an error as a
@@ -3543,8 +3740,12 @@ func (s *knowledgeService) enqueueImageMultimodalTasks(
 			EnableCaption:   true,
 			Language:        lang,
 			ImageSourceType: metadata["image_source_type"],
-			Attempt:         attempt,
-			ImageIndex:      idx,
+			// FR-17⑤ 扫描页排除：页级分类（docreader FR-13 产出，逗号分隔
+			// 的每页 class）。图片向量索引据此跳过扫描页的整页渲染图。
+			PageClass:      pageClassForImage(metadata["page_classes"], img.SourceLocators),
+			Attempt:        attempt,
+			ImageIndex:     idx,
+			SourceLocators: img.SourceLocators, // FR-05 引用溯源：图片在原文中的位置
 		}
 
 		langfuse.InjectTracing(ctx, &payload)

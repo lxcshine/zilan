@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -154,7 +153,7 @@ func (e *GeminiEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 		defer resp.Body.Close()
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("GeminiEmbedder BatchEmbed read response error: %v", err)
 		return nil, fmt.Errorf("read response: %w", err)

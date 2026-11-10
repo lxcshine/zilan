@@ -47,6 +47,7 @@ import KbTagManageDrawer from './components/KbTagManageDrawer.vue';
 import type { KnowledgeProcessOverrides } from '@/types/knowledgeProcess';
 import { useUploadConfirmStore, type UploadConfirmResult } from '@/stores/uploadConfirm';
 import WikiBrowser from './wiki/WikiBrowser.vue';
+import ImageGallery from './gallery/ImageGallery.vue';
 import { getWikiStats } from '@/api/wiki';
 import {
   isKnowledgeParseInFlight,
@@ -67,7 +68,8 @@ const kbLoading = ref(false);
 const docListLoading = ref(true);
 const isFAQ = computed(() => (kbInfo.value?.type || '') === 'faq');
 const isWiki = computed(() => !!kbInfo.value?.indexing_strategy?.wiki_enabled);
-const validTabs = ['documents', 'wiki', 'graph'] as const
+// FR-18 图片画廊：所有类型知识库都新增 gallery tab（读侧功能，按 tab 切换）。
+const validTabs = ['documents', 'wiki', 'graph', 'gallery'] as const
 type KbTab = typeof validTabs[number]
 const initTab = validTabs.includes(route.query.tab as any) ? (route.query.tab as KbTab) : 'documents'
 const activeKbTab = ref<KbTab>(initTab);
@@ -2044,8 +2046,18 @@ async function createNewSession(value: string): Promise<void> {
                     </t-tooltip>
                   </span>
                 </t-tooltip>
+                <span class="breadcrumb-tab-sep">/</span>
+                <span :class="['breadcrumb-tab', { active: activeKbTab === 'gallery' }]"
+                  @click="activeKbTab = 'gallery'">{{ $t('imageGallery.tab') }}</span>
               </template>
-              <span v-else class="breadcrumb-current">{{ $t('knowledgeEditor.document.title') }}</span>
+              <!-- 非 Wiki 知识库同样提供 文档/画廊 两个 tab（FR-18）。 -->
+              <template v-else>
+                <span :class="['breadcrumb-tab', { active: activeKbTab === 'documents' }]"
+                  @click="activeKbTab = 'documents'">{{ $t('knowledgeEditor.document.title') }}</span>
+                <span class="breadcrumb-tab-sep">/</span>
+                <span :class="['breadcrumb-tab', { active: activeKbTab === 'gallery' }]"
+                  @click="activeKbTab = 'gallery'">{{ $t('imageGallery.tab') }}</span>
+              </template>
             </h2>
             <!-- 标题行右侧的动作锚点：聚拢"信息"和"设置"两个圆形按钮。 -->
             <div class="kb-title-actions">
@@ -2082,7 +2094,12 @@ async function createNewSession(value: string): Promise<void> {
           @view-graph="onViewWikiInGraph" />
       </div>
 
-      <template v-if="activeKbTab === 'documents' || !isWiki">
+      <!-- FR-18 文档图片画廊：所有知识库类型的 gallery tab。 -->
+      <div v-if="activeKbTab === 'gallery' && kbId" class="wiki-main-area">
+        <ImageGallery :kb-id="kbId" @open-source-doc="openSourceDoc" />
+      </div>
+
+      <template v-if="(activeKbTab === 'documents' || !isWiki) && activeKbTab !== 'gallery'">
         <div class="knowledge-main">
           <div class="tag-content">
             <div class="doc-card-area">

@@ -100,7 +100,9 @@ func (c *notionClient) doRequest(ctx context.Context, method, path string, body 
 			break
 		}
 
-		respBody, err := io.ReadAll(resp.Body)
+		// 响应体受上界约束（FR-07）：Notion 返回的是 JSON 控制面/内容报文，
+		// 超限直接报错，不把无界内容读进内存。
+		respBody, err := utils.ReadResponseCapped(resp.Body, utils.JSONResponseLimit())
 		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read response: %w", err)

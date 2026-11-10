@@ -266,3 +266,87 @@ func headerColumnMismatch(headers, nextUnit string) bool {
 	rowCols := firstTableRowColumnCount(nextUnit)
 	return headerCols > 0 && rowCols > 0 && headerCols != rowCols
 }
+
+// tableSeparatorLinePattern matches a Markdown header separator row such as
+// "| --- | :---: |".
+var tableSeparatorLinePattern = regexp.MustCompile(`^\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$`)
+
+// continuedTableHeader returns the header of the table that the line at rune
+// offset pos belongs to, as "column row\nseparator row\n", or "" when the line
+// is not a table data row, the table has no header, or the header is larger
+// than budget runes.
+//
+// FR-15 规则③：表头续接必须在三种策略下均生效。启发式档的分块由 bin-packer 直接
+// 按边界裁切，不经过 mergeUnits 的 headerTracker，所以当分块起点（包括 overlap
+// 对齐后回退到的行首）落在同一张表格的两行之间时会丢掉表头。此函数按原文向上回溯
+// 补齐表头，调用方把它作为合成前缀写回 Content —— Start/End 仍指向原文真实位置，
+// 与 mergeUnits 的合成表头（零长度 splitUnit）约定一致，因此 mapChildrenToSource
+// 与 restoreTextFromChunks 都能正确处理。
+//
+// 回溯遇到任何非表格行即停止，因此被分页符（\f）或空行截断的表格被视为两张表，
+// 与 headerTracker 的 endPattern 语义保持一致。
+func continuedTableHeader(runes []rune, pos, budget int) string {
+	if pos <= 0 || pos >= len(runes) {
+		return ""
+	}
+	lineStart := pos
+	for lineStart > 0 && runes[lineStart-1] != '\n' {
+		lineStart--
+	}
+	firstLine := tableLineAt(runes, lineStart)
+	// Only a data row needs continuation: the column row and the separator row
+	// carry the header themselves.
+	if !tableRowPattern.MatchString(firstLine) || tableSeparatorLinePattern.MatchString(firstLine) {
+		return ""
+	}
+
+	// Walk back over contiguous table lines to the top of the run.
+	runStart := lineStart
+	for runStart > 0 {
+		prevEnd := runStart - 1 // skip the '\n' terminating the previous line
+		prevStart := prevEnd
+		for prevStart > 0 && runes[prevStart-1] != '\n' {
+			prevStart--
+		}
+		prev := tableLineAt(runes, prevStart)
+		if !tableRowPattern.MatchString(prev) {
+			break
+		}
+		runStart = prevStart
+	}
+	if runStart == lineStart {
+		return "" // no header above this row
+	}
+
+	headerLine := tableLineAt(runes, runStart)
+	// Locate the next line by scanning rather than using len(headerLine): the
+	// header text has its CR stripped, so CRLF documents would land one rune
+	// short.
+	separatorStart := runStart
+	for separatorStart < len(runes) && runes[separatorStart] != '\n' {
+		separatorStart++
+	}
+	separatorStart++
+	if separatorStart >= len(runes) {
+		return ""
+	}
+	separatorLine := tableLineAt(runes, separatorStart)
+	if !tableSeparatorLinePattern.MatchString(separatorLine) {
+		return "" // the run does not start with a real Markdown header
+	}
+	header := headerLine + "\n" + separatorLine + "\n"
+	if budget > 0 && runeLen(header) > budget {
+		return ""
+	}
+	return header
+}
+
+// tableLineAt returns the line starting at rune offset start without its
+// trailing newline (and without a CRLF's carriage return).
+func tableLineAt(runes []rune, start int) string {
+	end := start
+	for end < len(runes) && runes[end] != '\n' {
+		end++
+	}
+	return strings.TrimRight(string(runes[start:end]), "\r")
+}

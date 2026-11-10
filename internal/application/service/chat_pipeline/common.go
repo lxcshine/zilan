@@ -7,9 +7,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/contextx"
+	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/searchutil"
@@ -47,6 +49,28 @@ func appendMemoryContext(systemPrompt, memoryContext string) string {
 		return systemPrompt
 	}
 	return strings.TrimRight(systemPrompt, " \t\r\n") + "\n\n" + memoryContext
+}
+
+// stablePromptDate 返回写入 prompt 占位符 {{current_time}} 的日期字符串。
+//
+// FR-11（Prompt 缓存前缀稳定化）：系统提示属于跨轮不变的稳定前缀，绝不能包含
+// 秒级变化的时间戳。types.RenderPromptPlaceholders 的自动填充口径是
+// "2006-01-02 15:04:05"，会让 L0 每轮都变；这里显式传入日期（与上游 v0.9.0 一致）
+// 覆盖自动填充，精确到秒的当前时间由逐轮变化区（用户消息 / runtime_context）承载。
+func stablePromptDate() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// resolveContextWindow 解析本次请求的有效上下文窗口：租户/全局 ContextConfig 的
+// MaxTokens 优先，其次按厂商与模型名取默认值。记忆召回（MEMORY_RECALL）与五层装配
+// 共用它，保证 L1 预算在两处完全一致（FR-20）。
+func resolveContextWindow(ctx context.Context, chatManage *types.ChatManage) int {
+	vendor := contextx.VendorFromStrings(chatManage.ChatModelName, "", "")
+	explicitWindow := 0
+	if cc := contextConfigFromContext(ctx, chatManage); cc != nil {
+		explicitWindow = cc.MaxTokens
+	}
+	return contextx.ResolveContextWindow(explicitWindow, nil, vendor, chatManage.ChatModelName)
 }
 
 // pipelineInfo logs pipeline info level entries.
@@ -96,6 +120,12 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		})
 	}
 
+	// FR-11 ③：把会话 ID 作为缓存路由键。同一会话的多轮请求带上同一个键，
+	// 供应商/网关才会把它们路由到同一缓存分片，稳定前缀（L0 系统指令 + L1 记忆
+	// 常驻块 + 工具定义）才可能命中缓存。CacheRetention 留空表示供应商默认短缓存；
+	// 一次性调用（摘要/压缩）应显式设置为 chat.CacheRetentionNone。
+	opt.PromptCacheKey = chat.ClampPromptCacheKey(chatManage.SessionID)
+
 	return chatModel, opt, nil
 }
 
@@ -116,10 +146,13 @@ func prepareMessagesWithHistory(ctx context.Context, chatManage *types.ChatManag
 		base = chatManage.SystemPromptOverride
 	}
 	systemPrompt := types.RenderPromptPlaceholders(base, types.PlaceholderValues{
-		"query":    chatManage.Query,
-		"language": chatManage.Language,
-		"contexts": chatManage.RenderedContexts,
+		"query":        chatManage.Query,
+		"language":     chatManage.Language,
+		"contexts":     chatManage.RenderedContexts,
+		"current_time": stablePromptDate(),
 	})
+	// 非 smart 模式不走五层装配，但 L1 记忆块已经在 MEMORY_RECALL 阶段按同一套
+	// token 预算（精确 tokenizer）裁剪过，因此这里拼接的仍是预算内的内容（FR-20）。
 	systemPrompt = appendMemoryContext(systemPrompt, chatManage.MemoryContext)
 	systemPrompt = appendRetrievedImageOutputRequirement(systemPrompt, chatManage.RenderedContexts)
 
@@ -154,25 +187,22 @@ func prepareMessagesWithHistory(ctx context.Context, chatManage *types.ChatManag
 // The resolved per-layer spend is recorded in chatManage.ContextDiagnostics.
 func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage) []chat.Message {
 	counter := contextx.CounterForModel(chatManage.ChatModelName, "", "")
-	vendor := contextx.VendorFromStrings(chatManage.ChatModelName, "", "")
-
-	explicitWindow := 0
-	if cc := contextConfigFromContext(ctx, chatManage); cc != nil {
-		explicitWindow = cc.MaxTokens
-	}
-	window := contextx.ResolveContextWindow(explicitWindow, nil, vendor, chatManage.ChatModelName)
+	window := resolveContextWindow(ctx, chatManage)
 
 	// L0 system — retrieval placeholder intentionally empty in smart mode.
 	base := chatManage.SummaryConfig.Prompt
 	if chatManage.SystemPromptOverride != "" {
 		base = chatManage.SystemPromptOverride
 	}
+	// FR-11 ②：L0 是稳定前缀，只能包含跨轮不变的内容。当前查询属于逐轮变化区，
+	// 已由下面的 L4（user 消息）承载，因此这里把 {{query}} 渲染为空，避免每轮
+	// 改写系统提示导致前缀缓存失效；{{current_time}} 同理只渲染日期。
 	systemPrompt := types.RenderPromptPlaceholders(base, types.PlaceholderValues{
-		"query":    chatManage.Query,
-		"language": chatManage.Language,
-		"contexts": "",
+		"query":        "",
+		"language":     chatManage.Language,
+		"contexts":     "",
+		"current_time": stablePromptDate(),
 	})
-	systemPrompt = appendRetrievedImageOutputRequirement(systemPrompt, chatManage.RenderedContexts)
 
 	// L2/L4 split: the retrieval block was injected into UserContent by
 	// INTO_CHAT_MESSAGE; separate it so each layer is budgeted independently.
@@ -193,7 +223,10 @@ func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage)
 
 	asm := contextx.NewAssembler(counter)
 	result := asm.Assemble(contextx.Input{
-		System:         systemPrompt,
+		System: systemPrompt,
+		// 结构化记忆块优先：装配器据此按召回评分整条裁剪、对常驻块做整块降级；
+		// MemoryContext 是没有结构化输入时的兜底文本（FR-20）。
+		MemoryPrompt:   memoryPromptFromTypes(chatManage.MemoryBlocks),
 		Memory:         chatManage.MemoryContext,
 		Retrieval:      retrieval,
 		History:        turns,
@@ -217,7 +250,9 @@ func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage)
 	chatManage.RenderedContexts = result.Retrieval
 	chatManage.ContextDiagnostics = diagToTypes(result.Diag)
 
-	// Render the final message list: system = L0 + L1, user = L2 + L4.
+	// Render the final message list: system = L0 + L1（稳定前缀），user = L2 + L4
+	// （逐轮变化区）。图片输出要求取决于本轮检索结果是否含 Markdown 图片，属于逐轮
+	// 变化信息，因此随检索块放在用户消息里，而不是写进稳定前缀（FR-11 ②）。
 	systemFinal := appendMemoryContext(result.System, result.Memory)
 	userFinal := result.Query
 	if result.Retrieval != "" {
@@ -226,6 +261,9 @@ func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage)
 		} else {
 			userFinal = result.Retrieval
 		}
+	}
+	if imageRequirement := appendRetrievedImageOutputRequirement("", result.Retrieval); imageRequirement != "" {
+		userFinal = strings.TrimRight(userFinal, " \t\r\n") + imageRequirement
 	}
 
 	chatMessages := []chat.Message{{Role: "system", Content: systemFinal}}
@@ -249,8 +287,61 @@ func prepareMessagesFiveLayer(ctx context.Context, chatManage *types.ChatManage)
 		"usable":     result.Diag.Usable,
 		"intent":     string(result.Diag.Intent),
 		"actions":    len(result.Diag.Actions),
+		// 稳定前缀（L0/L1）的预算与用量：这两层不随意图变化，是 prompt 缓存
+		// 命中率的决定因素（FR-11）；memory_* 是 L1 的裁剪归因（FR-20）。
+		"system_budget":   result.Diag.BudgetByLayer[contextx.LayerSystem],
+		"system_used":     result.Diag.UsedByLayer[contextx.LayerSystem],
+		"memory_budget":   result.Diag.BudgetByLayer[contextx.LayerMemory],
+		"memory_used":     result.Diag.UsedByLayer[contextx.LayerMemory],
+		"memory_dropped":  result.MemoryDropped,
+		"memory_degraded": result.MemoryDegraded,
+		"prefix":          chat.PromptPrefixFingerprint(chatMessages, nil),
 	})
 	return chatMessages
+}
+
+// emitTurnUsage 把本轮的模型用量与五层上下文归因推给 handler 落库（PRD FR-12）。
+//
+// 通道是 EventBus 的 chat.complete 事件：它没有任何其它订阅者，因此不会污染 SSE 流
+// （前端只消费 agent.* / answer / complete 那几类事件）。载荷是 types.TurnUsageData，
+// 带上 assistant 消息 ID，handler 据此把 usage / context_stats 写到那一行上。
+//
+// 口径（PRD FR-12 ⑤）：usage 是供应商回报值；归因来自 chatManage.ContextDiagnostics，
+// 其中的 Used 是 internal/contextx 精确 tokenizer 的计数，绝不掺入字符数估算。
+// 未开启分层预算时 ContextDiagnostics 为 nil，转换器同样返回 nil，于是那一列存 NULL。
+//
+// 调用时机必须在终局的 answer(Done) 事件之前：普通模式下 handler 收到 Done 就会立刻
+// 持久化 assistant 消息，晚发的用量会赶不上那一次写入。
+func emitTurnUsage(ctx context.Context, chatManage *types.ChatManage, usage *types.TokenUsage) {
+	if chatManage == nil || chatManage.EventBus == nil {
+		return
+	}
+	stats := types.ContextTurnStatsFromDiagnostics(
+		types.ContextTurnStatsSourcePipeline, chatManage.ContextDiagnostics)
+	if stats != nil {
+		// 转换器只看诊断，模型名与往返数由调用侧补：普通模式一轮就是一次补全调用。
+		stats.Model = chatManage.ChatModelName
+		stats.Rounds = 1
+	}
+	if usage.IsZero() && stats == nil {
+		return
+	}
+	if err := chatManage.EventBus.Emit(ctx, types.Event{
+		// ID 留空：EventBus 会自己生成一个。
+		Type:      types.EventType(event.EventChatComplete),
+		SessionID: chatManage.SessionID,
+		Data: types.TurnUsageData{
+			MessageID:    chatManage.MessageID,
+			Usage:        usage,
+			ContextStats: stats,
+		},
+	}); err != nil {
+		pipelineWarn(ctx, "TurnUsage", "emit_failed", map[string]interface{}{
+			"session_id": chatManage.SessionID,
+			"message_id": chatManage.MessageID,
+			"error":      err.Error(),
+		})
+	}
 }
 
 func withPromptCacheMetadata(

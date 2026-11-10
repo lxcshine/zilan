@@ -30,6 +30,11 @@ logs/
 
 WeKnora
 WeKnora-lite
+# 上游参考代码与归档包：仅本地比对用，不随仓库分发
+WeKnora-main/
+WeKnora-main.zip
+# 内部规划文档（与 docs/ 同策略，不对外发布）
+Zilan_*.md
 cmd/desktop/build/bin/
 /models/
 test/data/mswag.txt

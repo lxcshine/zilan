@@ -23,6 +23,11 @@ const (
 	ChunkTypeImageCaption ChunkType = "image_caption"
 	// ChunkTypeSummary 表示摘要类型的 Chunk
 	ChunkTypeSummary = "summary"
+	// ChunkTypeImageVector 图片向量 chunk（FR-17 图文共空间检索）：图片经
+	// 图文共享向量空间模型编码后写入向量索引的可检索行，携带 image_info
+	// 指向原始图片、SourceChunkID 指向归属父 chunk。字符串值与上游
+	// WeKnora v0.8 完全一致，保证与上游工具链/导出数据互操作不出现同义不同名。
+	ChunkTypeImageVector ChunkType = "image_vector"
 	// ChunkTypeEntity 表示实体类型的 Chunk
 	ChunkTypeEntity ChunkType = "entity"
 	// ChunkTypeRelationship 表示关系类型的 Chunk
@@ -156,6 +161,9 @@ type Chunk struct {
 	ContentHash string `json:"content_hash"             gorm:"type:varchar(64);index"`
 	// 图片信息，存储为 JSON
 	ImageInfo string `json:"image_info"               gorm:"type:text"`
+	// SourceLocators 引用溯源定位：分块在原始文件中的位置（页码/bbox/表格行区间等），
+	// 存储为 JSON 列，空值存 NULL；存量文档该列为 NULL，读取侧容忍
+	SourceLocators SourceLocators `json:"source_locators,omitempty" gorm:"type:json"`
 	// Chunk creation time
 	CreatedAt time.Time `json:"created_at"`
 	// Chunk last update time

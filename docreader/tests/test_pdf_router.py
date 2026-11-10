@@ -4,6 +4,9 @@ import unittest
 from PIL import Image
 
 from docreader.parser.pdf_parser import (
+    MANUAL_TEXT_LAYER_CLASSES,
+    RENDER_PAGE_CLASSES,
+    SMART_TEXT_LAYER_CLASSES,
     PDFParser,
     _classify_page,
     _filter_reading_columns,
@@ -37,11 +40,21 @@ def _make_image_only_pdf(num_pages: int = 2) -> bytes:
 
 
 class ClassifyPageTest(unittest.TestCase):
-    def test_full_page_image_is_scanned_even_with_text(self):
+    """FR-13 页面四分类：文本页 / 扫描页 / 图片页 / 混合页。"""
+
+    def test_full_page_image_without_text_is_image_page(self):
+        # 整页图片且没有文本层 -> 图片页。
+        self.assertEqual(_classify_page(2.0, 0), "image")
+        self.assertEqual(_classify_page(1.0, 3), "image")
+
+    def test_full_page_image_with_text_is_mixed_page(self):
         # Scanned newspaper: image covers the page, embedded OCR text exists.
-        self.assertEqual(_classify_page(2.0, 1620), "scanned")
+        # FR-13 之前这一类叫 "scanned"，现在细化为「混合页」：图像铺满整页
+        # 但存在文本层。手动流水线仍然只渲染不取文本层（行为不变），
+        # 智能流水线才会两者兼取。
+        self.assertEqual(_classify_page(2.0, 1620), "mixed")
         # Scanned UN doc with garbled OCR text layer (ratio ~1.0).
-        self.assertEqual(_classify_page(1.0, 1500), "scanned")
+        self.assertEqual(_classify_page(1.0, 1500), "mixed")
 
     def test_native_text_page_is_text(self):
         self.assertEqual(_classify_page(0.01, 673), "text")
@@ -53,6 +66,29 @@ class ClassifyPageTest(unittest.TestCase):
     def test_blank_page_is_text(self):
         # No image, no text -> not rendered as an image.
         self.assertEqual(_classify_page(0.0, 0), "text")
+
+    def test_thresholds_can_be_overridden_by_smart_pipeline(self):
+        # 智能流水线可以用知识库参数覆盖阈值。
+        self.assertEqual(_classify_page(0.3, 900, scan_ratio=0.25), "mixed")
+        self.assertEqual(_classify_page(0.3, 5, scan_ratio=0.25), "image")
+        self.assertEqual(_classify_page(0.3, 5, min_chars=2), "text")
+
+    def test_every_class_is_routed(self):
+        # 四个类别都必须落在「取文本层」或「整页渲染」至少一条路径上，
+        # 否则该页会被静默丢弃。
+        for cls in ("text", "scanned", "image", "mixed"):
+            in_render = cls in RENDER_PAGE_CLASSES
+            in_manual_text = cls in MANUAL_TEXT_LAYER_CLASSES
+            in_smart_text = cls in SMART_TEXT_LAYER_CLASSES
+            self.assertTrue(in_render or in_manual_text, cls)
+            self.assertTrue(in_render or in_smart_text, cls)
+        # 手动流水线：只有文本页取文本层（与 FR-13 之前一致）。
+        self.assertEqual(MANUAL_TEXT_LAYER_CLASSES, ("text",))
+        # 智能流水线：额外保留混合页文本层。
+        self.assertEqual(SMART_TEXT_LAYER_CLASSES, ("text", "mixed"))
+        self.assertEqual(
+            set(RENDER_PAGE_CLASSES), {"scanned", "image", "mixed"}
+        )
 
 
 class StripRepeatingLinesTest(unittest.TestCase):

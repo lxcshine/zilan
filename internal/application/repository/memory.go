@@ -34,8 +34,19 @@ func (r *memoryRepository) CreateFact(ctx context.Context, fact *types.MemoryFac
 	if fact.Status == "" {
 		fact.Status = types.MemoryStatusActive
 	}
+	if fact.Origin == "" {
+		fact.Origin = types.MemoryOriginManual
+	}
 	if fact.TripleHash == "" {
 		fact.TripleHash = types.ComputeTripleHash(fact.Category, fact.Subject, fact.Predicate, fact.Object)
+	}
+	if fact.NormalizedKey == "" {
+		fact.NormalizedKey = types.ComputeNormalizedKey(fact.Category, fact.Subject, fact.Predicate)
+	}
+	// 清空时序围栏（FR-01）：写入所依据的对话时间早于截止点、或任务世代已轮换，
+	// 一律拦截。被拦截时返回 types.ErrMemoryWriteFenced，服务层静默吞掉。
+	if err := r.checkWriteFence(ctx, fact.TenantID, fact.UserID, fact.CreatedAt); err != nil {
+		return err
 	}
 	return r.db.WithContext(ctx).Create(fact).Error
 }
@@ -73,6 +84,10 @@ func (r *memoryRepository) GetFactByID(
 }
 
 func (r *memoryRepository) UpdateFact(ctx context.Context, fact *types.MemoryFact) (int64, error) {
+	// 清空时序围栏（FR-01）：更新同样是一次记忆写入，必须校验。
+	if err := r.checkWriteFence(ctx, fact.TenantID, fact.UserID, time.Time{}); err != nil {
+		return 0, err
+	}
 	updates := map[string]interface{}{
 		"content":    fact.Content,
 		"object":     fact.Object,
@@ -82,6 +97,13 @@ func (r *memoryRepository) UpdateFact(ctx context.Context, fact *types.MemoryFac
 		"due_at":     fact.DueAt,
 		"updated_at": time.Now(),
 	}
+	// 来源变化只发生在管理页编辑（manual）与后台刷新之间，空值表示不改动。
+	if fact.Origin != "" {
+		updates["origin"] = fact.Origin
+	}
+	if fact.ReplacesID != "" {
+		updates["replaces_id"] = fact.ReplacesID
+	}
 	if fact.Embedding != nil {
 		updates["embedding"] = fact.Embedding
 	}
@@ -90,6 +112,8 @@ func (r *memoryRepository) UpdateFact(ctx context.Context, fact *types.MemoryFac
 		updates["triple_hash"] = fact.TripleHash
 		updates["subject"] = fact.Subject
 		updates["predicate"] = fact.Predicate
+		// 矛盾判定键随三元组一起重算（FR-03）。
+		updates["normalized_key"] = types.ComputeNormalizedKey(fact.Category, fact.Subject, fact.Predicate)
 	}
 	res := r.scopeUser(r.db.WithContext(ctx).Model(&types.MemoryFact{}), fact.TenantID, fact.UserID).
 		Where("id = ?", fact.ID).
@@ -160,6 +184,9 @@ func (r *memoryRepository) ListActiveFactsForRecall(
 	if limit <= 0 {
 		limit = types.MemoryRecallCandidateLimit
 	}
+	// 只取 active：pending（未确认的系统推断，FR-02 规则 4）、superseded（已被
+	// 取代的旧值，FR-03 规则 3）与 archived 一律不注入 prompt。常驻与语义两条
+	// 召回路径都经过这里，因此过滤只有一处。
 	db := r.scopeUser(r.db.WithContext(ctx), tenantID, userID).
 		Where("status = ?", types.MemoryStatusActive).
 		Where("updated_at >= ?", since)
@@ -269,6 +296,16 @@ func (r *memoryRepository) ListLowestImportanceFacts(
 func (r *memoryRepository) UpsertSessionSummary(ctx context.Context, summary *types.MemorySessionSummary) error {
 	now := time.Now()
 	summary.UpdatedAt = now
+
+	// L2 会话摘要同样是记忆写入，受清空时序围栏约束（FR-01 规则 3）。
+	// 对话时间优先取最后一条消息时间，缺失时退化为当下。
+	conversationAt := now
+	if summary.LastMessageAt != nil {
+		conversationAt = *summary.LastMessageAt
+	}
+	if err := r.checkWriteFence(ctx, summary.TenantID, summary.UserID, conversationAt); err != nil {
+		return err
+	}
 
 	var existing types.MemorySessionSummary
 	err := r.db.WithContext(ctx).

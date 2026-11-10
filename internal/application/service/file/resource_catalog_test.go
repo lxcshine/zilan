@@ -16,6 +16,7 @@ import (
 type catalogStub struct {
 	resource *types.StoredResource
 	ref      string
+	reused   string
 }
 
 func (c *catalogStub) Register(
@@ -33,6 +34,10 @@ func (c *catalogStub) Register(
 	}
 	c.ref = types.BuildResourcePath(c.resource.Handle)
 	return c.ref, nil
+}
+
+func (c *catalogStub) ReuseByContentHash(_ context.Context, _ uint64, _ string) (string, bool, error) {
+	return c.reused, c.reused != "", nil
 }
 
 func (c *catalogStub) Resolve(_ context.Context, _ string) (*types.StoredResource, error) {

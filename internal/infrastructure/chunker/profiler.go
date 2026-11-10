@@ -101,21 +101,21 @@ func ProfileDocument(text string) *DocProfile {
 
 	// First pass: per-line markers and length stats
 	var lengths []float64
-	inFence := false
+	var fence markdownFence
 	codeChars := 0
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 
-		// Toggle fenced-code state. We use a 3-backtick prefix detector here
-		// rather than a full regex so we don't have to fight with the
-		// protected-pattern logic later.
-		if strings.HasPrefix(trimmed, "```") {
-			inFence = !inFence
+		// Fenced-code state comes from markdownFence (see fenced_code.go) rather
+		// than a "```" prefix toggle: it pairs ``` / ~~~ correctly, ignores
+		// over-indented pseudo-fences, and keeps an unclosed fence open. Without
+		// this, `#` comment lines inside code blocks inflate MdHeadingTotal and
+		// the document is routed to the heading tier by mistake.
+		if code, delimiter := fence.consume(line); code {
 			p.HasCode = true
-			continue
-		}
-		if inFence {
-			codeChars += len([]rune(line))
+			if !delimiter {
+				codeChars += len([]rune(line))
+			}
 			continue
 		}
 

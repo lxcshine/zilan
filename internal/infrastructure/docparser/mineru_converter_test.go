@@ -55,8 +55,12 @@ func TestProcessImagesKeepsReferencedVariants(t *testing.T) {
 		"plain.jpg":   "data:image/png;base64," + b64,
 	}
 
-	refs, gotMarkdown := reader.processImages(mdContent, images)
+	// pages=0 表示页数未知，此时跳过重复图（页眉页脚 logo）判定。
+	refs, gotMarkdown, err := reader.processImages(mdContent, images, 0)
 
+	if err != nil {
+		t.Fatalf("processImages: %v", err)
+	}
 	if gotMarkdown != mdContent {
 		t.Fatalf("processImages should not rewrite markdown content")
 	}
@@ -79,7 +83,10 @@ func TestProcessImagesMatchesPathsWithSpaces(t *testing.T) {
 		"第 1 页.jpg": "data:image/png;base64," + b64,
 	}
 
-	refs, _ := reader.processImages(mdContent, images)
+	refs, _, err := reader.processImages(mdContent, images, 0)
+	if err != nil {
+		t.Fatalf("processImages: %v", err)
+	}
 	if len(refs) != 1 {
 		t.Fatalf("expected 1 image ref for path with spaces, got %d", len(refs))
 	}

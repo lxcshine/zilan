@@ -40,6 +40,12 @@ import (
 )
 
 func main() {
+	// FR-08 条 4：自定义日志格式模板必须包含消息主体字段（%msg），否则拒绝
+	// 启动并给出明确错误——缺了 %msg 的模板会让日志正文被静默丢弃。
+	if err := logger.LogFormatConfigError(); err != nil {
+		fmt.Fprintf(os.Stderr, "启动失败：%v\n", err)
+		os.Exit(1)
+	}
 	// Set Gin mode
 	if os.Getenv("GIN_MODE") == "release" {
 		gin.SetMode(gin.ReleaseMode)

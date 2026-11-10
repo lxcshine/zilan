@@ -189,6 +189,44 @@ const (
 	AuditActionBackupTenantExported AuditAction = "backup.tenant_exported"
 	AuditActionBackupRestoreStarted AuditAction = "backup.restore_started"
 	AuditActionBackupRestoreDone    AuditAction = "backup.restore_done"
+
+	// 记忆治理动作（PRD §5.2：记忆清空含围栏拦截数、批量归档/删除、
+	// 管理员侧记忆操作必须落审计日志）。
+	// AuditActionMemoryCleared 由记忆归属用户本人清空自己的记忆触发，
+	// Details 记录 {deleted_facts, deleted_summaries, fence_generation,
+	// cutoff_at, blocked_writes}。
+	AuditActionMemoryCleared AuditAction = "memory.cleared"
+	// AuditActionMemoryAdminCleared 由工作区管理员清空成员记忆触发（FR-01 围栏）。
+	AuditActionMemoryAdminCleared AuditAction = "memory.admin_cleared"
+	// AuditActionMemoryBatchArchived 覆盖批量归档（含待确认项批量拒绝）。
+	AuditActionMemoryBatchArchived AuditAction = "memory.batch_archived"
+	// AuditActionMemoryBatchDeleted 覆盖批量删除（含物理删除）。
+	AuditActionMemoryBatchDeleted AuditAction = "memory.batch_deleted"
+	// AuditActionMemoryExtractionPaused 在容量归档连续失败达阈值、自动抽取被
+	// 暂停时写入，作为对管理员的通知留痕（FR-04 异常）。ActorUserID 为空（系统）。
+	AuditActionMemoryExtractionPaused AuditAction = "memory.extraction_paused"
+
+	// 记忆管理控制台动作（FR-09 规则 5 / PRD §5.2：所有管理员侧记忆操作落审计
+	// 日志，记录操作者、操作类型、影响条目数）。读操作同样留痕——控制台暴露的是
+	// 全工作区的记忆规模，谁在什么时候看过属于可追溯范围。
+	// 这些行的 ScopeType 一律留空，资源身份写在 TargetType / TargetID /
+	// TargetUserID 上：租户审计 feed 用 UnscopedOnly 过滤，带 scope 的行不会出现在
+	// /tenants/:id/audit-log 里。
+	// AuditActionMemoryAdminOverviewViewed 对应 GET /memory/admin/overview，
+	// Details 记录 {total, user_count}。
+	AuditActionMemoryAdminOverviewViewed AuditAction = "memory.admin_overview_viewed"
+	// AuditActionMemoryAdminUsersListed 对应 GET /memory/admin/users，
+	// Details 记录 {limit, offset, count, total}。
+	AuditActionMemoryAdminUsersListed AuditAction = "memory.admin_users_listed"
+	// AuditActionMemoryAdminUserInspected 对应 GET /memory/admin/users/:user_id，
+	// TargetUserID 是被查看的成员，Details 记录 {item_count}。
+	AuditActionMemoryAdminUserInspected AuditAction = "memory.admin_user_inspected"
+	// AuditActionMemoryAdminBatchArchived 对应 POST /memory/admin/facts/batch-archive，
+	// Details 记录 {requested, affected, fact_ids}。
+	AuditActionMemoryAdminBatchArchived AuditAction = "memory.admin_batch_archived"
+	// AuditActionMemoryAdminBatchDeleted 对应 POST /memory/admin/facts/batch-delete-pending，
+	// 物理删除且只作用于 pending，Details 记录 {requested, affected, skipped}。
+	AuditActionMemoryAdminBatchDeleted AuditAction = "memory.admin_batch_deleted"
 )
 
 // AuditOutcome separates asynchronous acceptance from terminal business

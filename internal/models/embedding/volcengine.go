@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -224,7 +223,7 @@ func (e *VolcengineEmbedder) BatchEmbed(ctx context.Context, texts []string) ([]
 			return nil, fmt.Errorf("send request: %w", err)
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 		resp.Body.Close()
 		if err != nil {
 			logger.GetLogger(ctx).Errorf("VolcengineEmbedder BatchEmbed read response error: %v", err)

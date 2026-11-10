@@ -5,6 +5,21 @@ import (
 	"encoding/json"
 )
 
+// 检索侧共享的默认值与上限常量（FR-19）。集中定义避免同一字面量在
+// 多处各自漂移（例如扩池逻辑与 GetEffectiveEmbeddingTopK 的默认值）。
+const (
+	// DefaultRetrievalTopK 是向量召回的默认条数上限。
+	DefaultRetrievalTopK = 50
+	// MaxRequestedResults 是单次检索请求允许要求的最大结果数。
+	MaxRequestedResults = 200
+
+	// DefaultFAQExpandCount 是 FAQ 迭代检索的默认展开轮数。
+	DefaultFAQExpandCount = 5
+	// MaxFAQExpandCount 是 FAQ 展开轮数的硬上限，防止租户配置把
+	// 单次问答放大成几十轮向量检索。
+	MaxFAQExpandCount = 20
+)
+
 // RetrievalConfig holds the global retrieval/search configuration for a tenant.
 // This replaces the retrieval-related fields previously scattered in ConversationConfig
 // and ChatHistoryConfig. Both knowledge search and message search share these parameters.
@@ -70,6 +85,13 @@ type RetrievalConfig struct {
 	// Default: 0.15. Sensible range: 0.05..0.4.
 	FeedbackLearnRate float64 `json:"feedback_learn_rate,omitempty"`
 
+	// FAQExpandCount 控制 FAQ 类型知识库“列表展开”的轮数（FR-19②）。
+	// FAQ 库首次召回不足 matchCount 时会进入迭代检索，每轮把 TopK 翻倍
+	// 重新展开一次候选列表；本字段就是这个展开轮数的上限。
+	// 默认 DefaultFAQExpandCount(5)，钳制区间 [1, MaxFAQExpandCount(20)]。
+	// 0 表示沿用默认值，保持既有会话行为不变。
+	FAQExpandCount int `json:"faq_expand_count,omitempty"`
+
 	// KBClassProfiles maps an auto-detected KB class ("paper", "manual",
 	// "faq", "regulation", "general") to retrieval parameter presets applied
 	// when every KB in scope shares that class and the intent profile does
@@ -80,9 +102,23 @@ type RetrievalConfig struct {
 // GetEffectiveEmbeddingTopK returns EmbeddingTopK with a fallback default.
 func (c *RetrievalConfig) GetEffectiveEmbeddingTopK() int {
 	if c == nil || c.EmbeddingTopK <= 0 {
-		return 50
+		return DefaultRetrievalTopK
 	}
 	return c.EmbeddingTopK
+}
+
+// GetEffectiveFAQExpandCount 返回 FAQ 列表的展开轮数，带默认值与上限钳制。
+// 非正值（含未配置）回落到 DefaultFAQExpandCount，超过 MaxFAQExpandCount
+// 的值被钳到上限，避免租户误配把一次问答放大成大量向量检索。
+func (c *RetrievalConfig) GetEffectiveFAQExpandCount() int {
+	n := DefaultFAQExpandCount
+	if c != nil && c.FAQExpandCount > 0 {
+		n = c.FAQExpandCount
+	}
+	if n > MaxFAQExpandCount {
+		n = MaxFAQExpandCount
+	}
+	return n
 }
 
 // GetEffectiveVectorThreshold returns VectorThreshold with a fallback default.

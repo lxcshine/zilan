@@ -266,7 +266,8 @@ func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata) string {
 // Supported placeholders:
 //   - {{knowledge_bases}}
 //   - {{web_search_status}} -> "Enabled" or "Disabled"
-//   - {{current_time}} -> current time string
+//   - {{current_time}} -> current date (YYYY-MM-DD only, keeps the prompt prefix
+//     byte-stable across turns; see FR-11 prompt-cache prefix stabilization)
 //   - {{language}} -> user language name (e.g. "Chinese (Simplified)", "English")
 //   - {{skills}} -> formatted skills metadata (if any)
 func renderPromptPlaceholdersWithStatus(
@@ -337,7 +338,12 @@ func BuildSystemPromptWithOptions(
 		template = GetProgressiveRAGSystemPrompt(cfg)
 	}
 
-	currentTime := time.Now().Format(time.RFC3339)
+	// FR-11（Prompt 缓存前缀稳定化）：系统提示是跨轮不变的稳定前缀，绝不能写入
+	// 秒级变化的时间戳——否则每一轮前缀字节都不同，供应商侧的 prompt 缓存永远命中
+	// 不了。这里只渲染日期（与上游 v0.9.0 的 {{current_time}} 口径一致）；精确到秒
+	// 的当前时间由 observe.go 的 <runtime_context> 块随当前用户消息下发，也就是把
+	// 逐轮变化的内容放在稳定前缀之后（FR-11 ②）。
+	currentTime := time.Now().Format("2006-01-02")
 	language := ""
 	if options != nil {
 		language = options.Language

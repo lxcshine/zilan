@@ -255,10 +255,12 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 	}
 
 	// Build channel tasks.
+	// run 同时返回结果与错误：某个通道失败时它的结果（可能为空也可能部分
+	// 可用）与失败原因都要交给上层，由上层决定“降级继续”而不是整轮失败。
 	type channelTask struct {
 		channel string
 		weight  float64
-		run     func() []*types.SearchResult
+		run     func() ([]*types.SearchResult, error)
 	}
 	tasks := make([]channelTask, 0, 8)
 
@@ -267,7 +269,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 		tasks = append(tasks, channelTask{
 			channel: types.ChannelVector,
 			weight:  w,
-			run: func() []*types.SearchResult {
+			run: func() ([]*types.SearchResult, error) {
 				return p.searchPlugin.SearchChannel(ctx, chatManage, queryText, embed(queryText), false, true)
 			},
 		})
@@ -278,7 +280,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 		tasks = append(tasks, channelTask{
 			channel: types.ChannelKeyword,
 			weight:  w,
-			run: func() []*types.SearchResult {
+			run: func() ([]*types.SearchResult, error) {
 				return p.searchPlugin.SearchChannel(ctx, chatManage, queryText, nil, true, false)
 			},
 		})
@@ -290,7 +292,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 			tasks = append(tasks, channelTask{
 				channel: types.ChannelHyde,
 				weight:  w,
-				run: func() []*types.SearchResult {
+				run: func() ([]*types.SearchResult, error) {
 					return p.searchPlugin.SearchChannel(ctx, chatManage, chatManage.HydeDocument, embed(chatManage.HydeDocument), false, true)
 				},
 			})
@@ -309,7 +311,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 				tasks = append(tasks, channelTask{
 					channel: types.ChannelMultiQuery,
 					weight:  w,
-					run: func() []*types.SearchResult {
+					run: func() ([]*types.SearchResult, error) {
 						return p.searchPlugin.SearchChannel(ctx, chatManage, query, embed(query), false, false)
 					},
 				})
@@ -323,7 +325,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 			tasks = append(tasks, channelTask{
 				channel: types.ChannelStepBack,
 				weight:  w,
-				run: func() []*types.SearchResult {
+				run: func() ([]*types.SearchResult, error) {
 					return p.searchPlugin.SearchChannel(ctx, chatManage, chatManage.StepBackQuery, embed(chatManage.StepBackQuery), false, false)
 				},
 			})
@@ -336,7 +338,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 			tasks = append(tasks, channelTask{
 				channel: types.ChannelSparse,
 				weight:  w,
-				run: func() []*types.SearchResult {
+				run: func() ([]*types.SearchResult, error) {
 					expanded := expandQueryTerms(queryText)
 					return p.searchPlugin.SearchChannel(ctx, chatManage, expanded, nil, true, false)
 				},
@@ -350,7 +352,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 			tasks = append(tasks, channelTask{
 				channel: types.ChannelGraph,
 				weight:  w,
-				run: func() []*types.SearchResult {
+				run: func() ([]*types.SearchResult, error) {
 					entityCM := chatManage.Clone()
 					entityCM.SearchResult = nil
 					noop := func() *PluginError { return nil }
@@ -358,9 +360,11 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 						pipelineWarn(ctx, "SearchParallel", "graph_channel_error", map[string]interface{}{
 							"error": err.Err.Error(),
 						})
-						return nil
+						// 图谱通道失败属于降级：已经召回的实体结果仍然返回，
+						// 失败原因交给上层汇总，不影响其他通道。
+						return entityCM.SearchResult, err.Err
 					}
-					return entityCM.SearchResult
+					return entityCM.SearchResult, nil
 				},
 			})
 		}
@@ -378,7 +382,7 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 				tasks = append(tasks, channelTask{
 					channel: channelName,
 					weight:  w,
-					run: func() []*types.SearchResult {
+					run: func() ([]*types.SearchResult, error) {
 						return p.searchPlugin.SearchChannel(ctx, chatManage, entity, embed(entity), false, false)
 					},
 				})
@@ -389,38 +393,63 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 	// Execute all channels in parallel.
 	parallelTasks := make([]ParallelTask, 0, len(tasks))
 	channelResults := make(map[string][]*types.SearchResult)
+	// taskResults 按任务下标保存召回列表。同名通道会出现多次（multi_query 的
+	// 每个查询变体、比较意图的每个实体各占一个任务），若只按通道名存 map，
+	// 后一个任务会覆盖前一个，融合时同一份列表被重复计入多次、权重被放大。
+	taskResults := make([][]*types.SearchResult, len(tasks))
 	var resultMu sync.Mutex
 
-	for _, t := range tasks {
-		t := t
+	for i, t := range tasks {
+		i, t := i, t
 		parallelTasks = append(parallelTasks, ParallelTask{
-			Name: "channel_" + t.channel,
+			Name: fmt.Sprintf("channel_%s_%d", t.channel, i),
 			Run: func() *PluginError {
-				res := t.run()
+				res, runErr := t.run()
 				resultMu.Lock()
+				taskResults[i] = res
 				channelResults[t.channel] = res
 				resultMu.Unlock()
 				pipelineInfo(ctx, "SearchParallel", "channel_done", map[string]interface{}{
 					"channel":      t.channel,
 					"result_count": len(res),
+					"has_error":    runErr != nil,
 				})
+				if runErr != nil {
+					// 通道级失败一律按“降级”处理：已经拿到的结果保留，失败
+					// 通过 PluginError 上报给 RunParallel 汇总，绝不因为一个
+					// 通道（例如 web_search / graph）挂掉就丢掉其他通道的召回。
+					return &PluginError{
+						Err:         runErr,
+						Description: fmt.Sprintf("retrieval channel %s degraded", t.channel),
+						ErrorType:   "channel_degraded",
+					}
+				}
 				return nil
 			},
 		})
 	}
 
 	errs := RunParallel(parallelTasks...)
-	for name, err := range errs {
-		logger.Warnf(ctx, "[SearchParallel] %s error: %v", name, err.Err)
+	// 降级通道清单：既写结构化流水线日志（可观测位置），也带进本轮
+	// complete 事件，便于把“结果变少”与“某条腿挂了”对应起来。
+	degraded := make([]string, 0, len(errs))
+	for name, perr := range errs {
+		degraded = append(degraded, name)
+		logger.Warnf(ctx, "[SearchParallel] %s degraded, keeping results from other channels: %v", name, perr.Err)
+		pipelineWarn(ctx, "SearchParallel", "channel_degraded", map[string]interface{}{
+			"channel": name,
+			"error":   perr.Err.Error(),
+		})
 	}
+	sort.Strings(degraded)
 
 	// Store per-channel results for observability and downstream stages.
 	chatManage.ChannelResults = channelResults
 
-	// Build weighted lists for fusion.
+	// Build weighted lists for fusion（按任务下标取，避免同名通道互相覆盖）。
 	lists := make([]channelRankedList, 0, len(tasks))
-	for _, t := range tasks {
-		if res, ok := channelResults[t.channel]; ok && len(res) > 0 {
+	for i, t := range tasks {
+		if res := taskResults[i]; len(res) > 0 {
 			lists = append(lists, channelRankedList{
 				Channel: t.channel,
 				Weight:  t.weight,
@@ -429,8 +458,13 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 		}
 	}
 
-	// Weighted RRF fusion.
-	fused := fuseChannelsWithWeightedRRF(ctx, lists, 60)
+	// Weighted RRF fusion。融合常数 k 取自工作区级检索配置（FR-19①），
+	// 未配置时 GetEffectiveRRFK 回落到 60，与既有硬编码行为完全一致；
+	// fuseChannelsWithWeightedRRF 内部仍保留 k<=0 → 60 的兜底。
+	// 通道权重来自 plan.ChannelWeight，而 plan 在构建时已叠加租户配置
+	// RetrievalConfig.ChannelWeights / IntentProfiles（见 retrieval_intent.go
+	// applyProfile），因此权重同样是工作区级可配的，不再依赖代码常量。
+	fused := fuseChannelsWithWeightedRRF(ctx, lists, retrievalConfigFromContext(ctx).GetEffectiveRRFK())
 
 	// Apply document-level evidence boost when enabled (e.g. summary intent).
 	if plan.UseDocBoost {
@@ -440,14 +474,21 @@ func (p *PluginSearchParallel) multiChannelSearch(ctx context.Context,
 	chatManage.SearchResult = fused
 
 	pipelineInfo(ctx, "SearchParallel", "complete", map[string]interface{}{
-		"session_id":    chatManage.SessionID,
-		"channel_count": len(lists),
-		"fused_results": len(fused),
-		"error_count":   len(errs),
-		"mode":          "multi_channel",
+		"session_id":        chatManage.SessionID,
+		"channel_count":     len(lists),
+		"fused_results":     len(fused),
+		"error_count":       len(errs),
+		"degraded_channels": degraded,
+		"mode":              "multi_channel",
 	})
 
 	if len(chatManage.SearchResult) == 0 {
+		if len(degraded) > 0 {
+			// 一条结果都没有、且确实存在通道失败：把失败向上传播，不要把
+			// 基础设施故障伪装成“没有检索到相关内容”。
+			return ErrSearchNothing.WithError(fmt.Errorf(
+				"all retrieval channels failed: %s", strings.Join(degraded, ", ")))
+		}
 		return ErrSearchNothing
 	}
 

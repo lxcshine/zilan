@@ -211,6 +211,10 @@ func (s *knowledgeBaseService) authorizeKBAccess(
 // validateSameEmbeddingModel rejects multi-KB searches that span more than
 // one resolved embedding-model identity key. Single-KB calls no-op.
 //
+// identity key 现在包含向量维度（见 ResolveEmbeddingModelKeys），因此
+// “同名同 endpoint 但维度不同”的两个模型也会被拒绝——这是有意的行为变更：
+// 跨维度混检要么报错要么静默零命中，绝不能看起来“能跑”。
+//
 // Wiki-only / graph-only KBs (empty resolved key) are tolerated: if every
 // KB lacks an embedding model, validation passes and HybridSearch returns
 // an empty result set via the allBaseParamsEmpty fast path.
@@ -245,8 +249,9 @@ func (s *knowledgeBaseService) validateSameEmbeddingModel(
 				"kb_count":    len(kbs),
 			}, "multi-KB search rejected: embedding models differ")
 			return apperrors.NewBadRequestError(
-				"selected knowledge bases use different embedding models; " +
-					"multi-KB search requires every knowledge base to share a single embedding model")
+				"selected knowledge bases use different embedding models or vector dimensions; " +
+					"multi-KB search requires every knowledge base to share a single embedding model " +
+					"and a single vector dimension (indexes of different widths cannot be searched together)")
 		}
 	}
 	return nil

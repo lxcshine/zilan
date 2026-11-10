@@ -9,6 +9,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
+// 附件（attachment://）不走这里的授权：read_file 的会话附件由
+// internal/application/attachment.Reader 按 messages.attachments 清单鉴权，
+// 与知识库的 KB/文档/标签范围是两套互不相干的边界。
 func effectiveSearchTargetTagIDs(target *types.SearchTarget) []string {
 	if target == nil {
 		return nil

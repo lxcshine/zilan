@@ -234,9 +234,25 @@ func (c *RemoteAPIChat) buildProviderOpenAIRequest(
 	return out, nil
 }
 
-func (c *RemoteAPIChat) shapeProviderRequest(body any, req openai.ChatCompletionRequest, messages []Message) (any, error) {
-	if !c.adapter.ForceRawHTTP() {
-		return body, nil
+// shapeProviderRequest 施加供应商特定的请求体改写，并在 JSON 对象形态上注入
+// prompt 缓存标记（FR-11 ③）。
+//
+// 缓存标记只能写在 map[string]any 上：cache_control 断点是消息内容块里的字段，
+// 而 go-openai v1.41.2 的 ChatCompletionRequest 结构体既没有该字段，也没有
+// prompt_cache_key。因此走 SDK 的供应商拿不到断点（仍能享受供应商基于前缀的
+// 自动缓存 + 会话亲和 header），raw HTTP 路径则完整生效。
+func (c *RemoteAPIChat) shapeProviderRequest(
+	body any, req openai.ChatCompletionRequest, messages []Message, opts *ChatOptions,
+) (any, error) {
+	if c.adapter.ForceRawHTTP() {
+		shaped, err := c.buildProviderOpenAIRequest(body, req.Messages, messages)
+		if err != nil {
+			return nil, err
+		}
+		body = shaped
 	}
-	return c.buildProviderOpenAIRequest(body, req.Messages, messages)
+	if payload, ok := body.(map[string]any); ok {
+		applyPromptCacheMarkers(payload, opts, c.cacheSupport)
+	}
+	return body, nil
 }

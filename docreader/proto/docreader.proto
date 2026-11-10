@@ -43,25 +43,51 @@ message ImageRef {
   bytes  image_data = 5;     // inline bytes fallback
 }
 
+// 引用溯源定位（FR-05）：解析结果中的一段区间 -> 原文件位置。
+// start/end 是 markdown_content 的码点偏移（end 为开区间），locator_json 是
+// 定位信息的 JSON 编码（形态见 internal/types/source_locator.go）。
+message SourceBlock {
+  uint32 start = 1;
+  uint32 end = 2;
+  string locator_json = 3;
+}
+
 message ReadResponse {
   string markdown_content = 1;
   repeated ImageRef image_refs = 2;
   string image_dir_path = 3;
   map<string, string> metadata = 4;
   string error = 5;
+  repeated SourceBlock source_blocks = 6;
+  // FR-16：解析未完成标记。为 true 时 markdown_content / image_refs 只是
+  // 「已解析出来的部分」，不是完整文档，调用方必须显式告知用户。
+  bool incomplete = 7;
+  // FR-16：未完成原因，取值 "timeout" | "memory" | "cancelled"。
+  string incomplete_reason = 8;
 }
 
-// Metadata header for a streamed read. Sent exactly once, before any image.
+// Metadata header for a streamed read. Sent once before any image; when the
+// stream is aborted by a resource bound (FR-16) a second meta frame carrying
+// only the progress/incomplete fields is sent after the last image.
 message ReadStreamMeta {
   string markdown_content = 1;
   string image_dir_path = 2;
   map<string, string> metadata = 3;
   string error = 4;
   uint32 image_count = 5; // best-effort total image count (0 if unknown)
+  repeated SourceBlock source_blocks = 6;
+  // FR-16：流式解析进度（已产出 / 应产出的页数），供调用方换算百分比。
+  uint32 pages_done = 7;
+  uint32 pages_total = 8;
+  // FR-16：超时长 / 超内存 / 被取消而中止时为 true，此时结果只是部分解析。
+  bool incomplete = 9;
+  // FR-16：未完成原因，取值 "timeout" | "memory" | "cancelled"。
+  string incomplete_reason = 10;
 }
 
-// One frame of a ReadStream. The first frame carries `meta`; every subsequent
-// frame carries a single `image`.
+// One frame of a ReadStream. The first frame carries `meta`; the frames that
+// follow carry a single `image` each; an aborted stream ends with one more
+// `meta` frame carrying only the progress / incomplete fields (FR-16).
 message ReadStreamResponse {
   oneof payload {
     ReadStreamMeta meta = 1;

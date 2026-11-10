@@ -24,7 +24,32 @@ type ReadResult struct {
 	Error           string
 	IsAudio         bool   // true when the result contains raw audio data needing ASR transcription
 	AudioData       []byte // raw audio bytes for ASR processing
+	// SourceBlocks 由解析器上报：Markdown 输出的 rune 区间 → 原文位置（页/行/表格行等），
+	// 用于引用溯源定位（FR-05）。best-effort：为空时链路照常工作。
+	SourceBlocks []SourceBlock
+	// ParseIncomplete 表示解析在触及资源上界（时长 / 内存）或被取消时中止，
+	// MarkdownContent 与 ImageRefs 只是**已解析出来的部分**（FR-16）。
+	// 这种降级必须显式告知用户，绝不能当成完整结果静默入库（PRD §5.3 规则 3）。
+	ParseIncomplete bool
+	// ParseIncompleteReason 取值 "timeout" | "memory" | "cancelled"。
+	ParseIncompleteReason string
+	// PagesDone / PagesTotal 是解析器上报的页级进度；PagesTotal 为 0 表示未知。
+	PagesDone  int
+	PagesTotal int
 }
+
+// FR-16：ParseIncompleteReason 的取值，与 docreader 侧字符串严格一致。
+const (
+	ParseIncompleteTimeout   = "timeout"
+	ParseIncompleteMemory    = "memory"
+	ParseIncompleteCancelled = "cancelled"
+)
+
+// ParseDeadlineOverrideKey 是下发给 docreader 的「解析截止时刻」（Unix 秒）。
+// Go 侧按调用 ctx 的 deadline 计算后经 parser_engine_overrides 传入，Python 侧
+// 在逐页渲染循环内检查：超限即中止产出、保留已解析部分并回传 incomplete 标记
+// （FR-16 与 FR-07 时长上界的协同点）。它是纯控制信息，解析器不会把它当引擎参数。
+const ParseDeadlineOverrideKey = "parse_deadline_unix"
 
 // ImageRef represents an image reference extracted from the document.
 type ImageRef struct {
@@ -87,6 +112,9 @@ type ParsedChunk struct {
 	// >= 0 means this is a child chunk referencing the parent at this index
 	// in the ParentChunks slice of ProcessChunksOptions.
 	ParentIndex int
+
+	// SourceLocators 由 processChunks 依据解析器定位块计算：分块文本在原始文件中的位置。
+	SourceLocators SourceLocators
 }
 
 // EmbeddingContent returns the text that should be sent to the embedding
@@ -110,6 +138,8 @@ type ParsedParentChunk struct {
 	Seq     int
 	Start   int
 	End     int
+	// SourceLocators 由 processChunks 依据解析器定位块计算：父块文本在原始文件中的位置。
+	SourceLocators SourceLocators
 }
 
 type ParsedImage struct {

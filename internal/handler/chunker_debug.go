@@ -89,6 +89,11 @@ type PreviewChunkingStats struct {
 }
 
 // PreviewChunkingResponse is the body returned by /chunker/preview.
+//
+// FR-15 规则④（切分策略与结果在知识库详情页可见）由这四个字段承载：
+// SelectedTier 是实际命中的档位，TierChain 是本次尝试的档位顺序，Rejected 说明
+// 每一档被 ValidateChunks 拒绝的原因，Profile 是驱动选档的文档画像指标。前端
+// KBChunkingDebug.vue 直接渲染它们，字段名属于对外契约，改名即为破坏性变更。
 type PreviewChunkingResponse struct {
 	SelectedTier chunker.StrategyTier    `json:"selected_tier"`
 	TierChain    []chunker.StrategyTier  `json:"tier_chain"`

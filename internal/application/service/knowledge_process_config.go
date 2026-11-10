@@ -73,6 +73,16 @@ func ValidateProcessOverrides(
 	overrides *types.KnowledgeProcessOverrides,
 	fileTypes []string,
 ) error {
+	// FR-13：OCR 流水线与前处理参数在入队解析前再校验一次。放在 overrides
+	// 判空之前，因此不论这次上传有没有带覆盖项都会检查知识库自身的配置。
+	// 这里只校验、不写库、也不触发任何重解析（PRD §5.4）。
+	if kb != nil {
+		cfg := kb.ImageProcessingConfig
+		if err := ValidateOCRPipelineConfig(ctx, &cfg); err != nil {
+			return werrors.NewBadRequestError(err.Error())
+		}
+	}
+
 	if overrides == nil {
 		return nil
 	}

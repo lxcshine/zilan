@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -157,8 +156,7 @@ func (p *DuckDuckGoProvider) searchAPI(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("duckduckgo API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("duckduckgo API returned status %d: %s", resp.StatusCode, readErrorPreview(resp.Body))
 	}
 
 	var apiResponse struct {
@@ -174,7 +172,11 @@ func (p *DuckDuckGoProvider) searchAPI(
 			Text     string `json:"Text"`
 		} `json:"Results"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResponse); err != nil {
+	bodyBytes, err := readCapped(resp.Body, maxJSONResponseBytes())
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if err := json.Unmarshal(bodyBytes, &apiResponse); err != nil {
 		return nil, fmt.Errorf("failed to decode API response: %w", err)
 	}
 

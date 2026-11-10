@@ -149,13 +149,22 @@ func TestClient_TokenNeverLoggedInFull(t *testing.T) {
 }
 
 func TestRedactToken(t *testing.T) {
+	// FR-08 条 1：脱敏形式不得包含 token 的任何片段（含首尾截断形式）。
 	tests := []struct{ in, want string }{
-		{"short", "***"},
-		{"abcdef1234567890", "abcdef...7890"},
+		{"", "[unset]"},
+		{"short", "[redacted len=5]"},
+		{"abcdef1234567890", "[redacted len=16]"},
 	}
 	for _, tt := range tests {
 		if got := redactToken(tt.in); got != tt.want {
 			t.Errorf("redactToken(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+	const token = "tok-super-secret-value-1234"
+	got := redactToken(token)
+	for _, fragment := range []string{token[:6], token[len(token)-4:], "super"} {
+		if strings.Contains(got, fragment) {
+			t.Errorf("redactToken leaked token fragment %q in %q", fragment, got)
 		}
 	}
 }

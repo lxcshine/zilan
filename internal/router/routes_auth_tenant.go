@@ -179,10 +179,14 @@ func RegisterMyInvitationRoutes(r *gin.RouterGroup, invitationHandler *handler.T
 // the request context, so no additional role gate is needed — a user can
 // only ever see and modify their own memories (GDPR self-service).
 //
+// /memory/admin/* 是例外：工作区管理员代成员清空记忆、批量归档/删除成员记忆
+// （PRD §5.1），以及 FR-09 的记忆管理控制台（工作区级聚合视图 + 批量治理），
+// 因此挂 g.Admin() 角色门；服务层再校验一次角色，双重保险。
+//
 // memoryHandler may be nil in environments built without the memory
 // dependency wired; that's a no-op registration which is preferable to a
 // startup crash.
-func RegisterMemoryRoutes(r *gin.RouterGroup, memoryHandler *handler.MemoryHandler) {
+func RegisterMemoryRoutes(r *gin.RouterGroup, memoryHandler *handler.MemoryHandler, g *rbacGuards) {
 	if memoryHandler == nil {
 		return
 	}
@@ -193,10 +197,46 @@ func RegisterMemoryRoutes(r *gin.RouterGroup, memoryHandler *handler.MemoryHandl
 		memory.GET("/soul", memoryHandler.GetSoulCard)
 		memory.GET("/profile", memoryHandler.GetProfileCard)
 		memory.GET("/agent-tips", memoryHandler.GetAgentTips)
+		// 容量自动归档等治理事件的一次性提示（FR-04 规则 5）。
+		memory.GET("/notices", memoryHandler.ListMemoryNotices)
+		memory.POST("/notices/ack", memoryHandler.AckMemoryNotices)
 		memory.GET("/facts", memoryHandler.ListMemoryFacts)
+		// 记忆管理页创建（来源 manual → 直接 active，PRD §3.2）。
+		memory.POST("/facts", memoryHandler.CreateMemoryFact)
+		memory.POST("/facts/batch", memoryHandler.BatchMemoryFacts)
 		memory.PUT("/facts/:id", memoryHandler.UpdateMemoryFact)
 		memory.DELETE("/facts/:id", memoryHandler.DeleteMemoryFact)
+		// 取代链详情：当前值、历史值、变更时间（FR-03 规则 4）。
+		memory.GET("/facts/:id/chain", memoryHandler.GetMemoryFactChain)
+		// 确认门控（FR-02 规则 5）：确认/拒绝仅记忆归属用户本人。
+		memory.POST("/facts/:id/confirm", memoryHandler.ConfirmMemoryFact)
+		memory.POST("/facts/:id/reject", memoryHandler.RejectMemoryFact)
+		memory.POST("/facts/:id/restore", memoryHandler.RestoreMemoryFact)
 		memory.DELETE("", memoryHandler.DeleteAllMemories)
+
+		if g != nil {
+			// /memory/admin/* 全部套 g.Admin()：工作区管理员代成员操作
+			// （既有两个端点）+ FR-09 记忆管理控制台。服务层会再校验一次
+			// 管理员身份并拒绝 API Key 主体，双重保险。
+			//
+			// 控制台刻意不提供跨工作区聚合入口：所有查询都由仓储层写死
+			// tenant_id 条件，工作区边界不依赖调用方传参（FR-09 规则 4）。
+			// 若将来要开跨工作区视图，必须叠加 middleware.RequireCrossTenantAccess(cfg)
+			// （集群开关 + 超级权限属性双条件，缺一拒绝），且只返回聚合计数。
+			admin := memory.Group("/admin", g.Admin())
+			{
+				// FR-09 记忆管理控制台：只输出聚合计数，不输出记忆正文。
+				admin.GET("/overview", memoryHandler.AdminMemoryOverview)
+				admin.GET("/users", memoryHandler.AdminListMemoryUsers)
+				// GET 与既有 DELETE 同路径不同方法，gin 的方法树互不干扰。
+				admin.GET("/users/:user_id", memoryHandler.AdminGetMemoryUser)
+				admin.POST("/facts/batch-archive", memoryHandler.AdminBatchArchiveMemoryFacts)
+				admin.POST("/facts/batch-delete-pending", memoryHandler.AdminBatchDeletePendingMemoryFacts)
+
+				admin.DELETE("/users/:user_id", memoryHandler.ClearMemberMemory)
+				admin.POST("/users/:user_id/facts/batch", memoryHandler.BatchMemberMemoryFacts)
+			}
+		}
 	}
 }
 

@@ -409,8 +409,10 @@
                     :rag-enabled="formData.indexingStrategy?.vectorEnabled || formData.indexingStrategy?.keywordEnabled"
                     :all-models="allModels"
                     :table-metadata-instructions="formData.chunkingConfig.tableMetadataInstructions"
+                    :image-vector-enabled="formData.multimodalConfig.imageVectorEnabled"
                     @update:question-generation="handleQuestionGenerationUpdate"
                     @update:table-metadata-instructions="(value: string) => { if (formData) formData.chunkingConfig.tableMetadataInstructions = value }"
+                    @update:image-vector-enabled="(value: boolean) => { if (formData) formData.multimodalConfig.imageVectorEnabled = value }"
                   />
                 </div>
 
@@ -745,6 +747,8 @@ const initFormData = (type: 'document' | 'faq' = 'document') => {
       enabled: false,
       vllmModelId: '',
       descriptionLanguage: '',
+      // FR-17 图文共空间检索：图片向量索引开关（默认关闭，opt-in）
+      imageVectorEnabled: false,
       customInstructions: ''
     },
     asrConfig: {
@@ -868,6 +872,8 @@ const loadKBData = async () => {
         enabled: !!kb.vlm_config?.enabled,
         vllmModelId: kb.vlm_config?.model_id || '',
         descriptionLanguage: kb.vlm_config?.description_language || '',
+        // FR-17 图文共空间检索：从知识库 image_processing_config 读取开关状态
+        imageVectorEnabled: !!(kb as any).image_processing_config?.image_vector_enabled,
         customInstructions: kb.vlm_config?.custom_instructions || ''
       },
       asrConfig: {
@@ -1203,6 +1209,13 @@ const buildSubmitData = () => {
       : '',
     description_language: formData.value.multimodalConfig.descriptionLanguage || '',
     custom_instructions: formData.value.multimodalConfig.customInstructions || ''
+  }
+
+  // FR-17 图文共空间检索：图片向量索引开关随 image_processing_config 提交。
+  // 开关默认关闭（§5.4 存量兼容）；开启只影响新解析文档，重解析入口沿用
+  // 文档列表已有的手动/批量重解析功能。
+  data.image_processing_config = {
+    image_vector_enabled: formData.value.multimodalConfig.imageVectorEnabled || false
   }
 
   // 添加ASR语音识别配置

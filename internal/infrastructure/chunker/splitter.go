@@ -18,6 +18,13 @@ import (
 // This invariant is relied on by document-reconstruction code paths
 // (knowledge.go:2278+ for summary generation, UI highlighting, etc.).
 //
+// One documented exception: a continued table header is prepended to Content
+// as a *synthetic* prefix that occupies no source positions (mergeUnits does
+// this, and so does the heuristic tier via continuedTableHeader). For those
+// chunks runeLen(Content) > End-Start, and the source text is the trailing
+// End-Start runes of Content — the convention searchutil/chunkmerge.go and
+// mapChildrenToSource both rely on.
+//
 // ContextHeader is a separately-tracked context string (e.g. a Markdown
 // heading breadcrumb) that should be prepended at embedding/retrieval time
 // but is NOT part of Content. Keeping the two apart preserves the
@@ -663,7 +670,7 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 	var children []ChildChunk
 	childSeq := 0
 	for _, parent := range parents {
-		subs := SplitText(parent.Content, childCfg)
+		subs := mapChildrenToSource(parent, SplitText(parent.Content, childCfg))
 
 		parentIndex := -1
 		if len(subs) > 1 || (len(subs) == 1 && subs[0].Content != parent.Content) {
@@ -672,13 +679,7 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 		}
 
 		for _, sub := range subs {
-			// Adjust offsets: sub positions are relative to parent content,
-			// shift to document-level offsets.
-			// Use additive shift (not Content-length based) so that chunks with
-			// prepended context headers keep correct positional tracking.
 			sub.Seq = childSeq
-			sub.Start += parent.Start
-			sub.End += parent.Start
 			children = append(children, ChildChunk{
 				Chunk:       sub,
 				ParentIndex: parentIndex,
@@ -687,6 +688,31 @@ func SplitTextParentChild(text string, parentCfg, childCfg SplitterConfig) Paren
 		}
 	}
 	return ParentChildResult{Parents: newParents, Children: children}
+}
+
+// mapChildrenToSource translates offsets in parent.Content to document offsets.
+// A parent may start with a synthetic table header that occupies no source
+// positions. Keep that context in Content, but exclude it from the mapped span
+// and discard children that contain only this synthetic prefix.
+//
+// Zilan note (FR-05/FR-15): this replaces the previous `sub.Start += parent.Start`
+// additive shift. mergeUnits prepends continued table headers as zero-length
+// units, so for those parents runeLen(Content) > End-Start and the additive
+// shift pushed every child offset right by the header length — the child then
+// pointed at the neighbouring rows instead of its own text when
+// sourceIndex.Locators(child.Start, child.End) resolved the citation.
+func mapChildrenToSource(parent Chunk, children []Chunk) []Chunk {
+	offset := parent.End - runeLen(parent.Content)
+	out := children[:0]
+	for _, child := range children {
+		child.Start = max(parent.Start, offset+child.Start)
+		child.End += offset
+		if child.End <= child.Start {
+			continue
+		}
+		out = append(out, child)
+	}
+	return out
 }
 
 // ExtractImageRefs extracts markdown image references from text.

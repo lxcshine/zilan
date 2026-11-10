@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/agent/compaction"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/event"
@@ -92,6 +93,10 @@ Now generate the final answer:`, query, imageRequirement)
 		Content: finalPrompt,
 	})
 
+	// PRD FR-06 规则 7：达到最大迭代次数（或 LLM 失败降级）时的最终答案合成，同样先压缩
+	// 再发送。
+	messages = e.compactFinalAnswerContext(ctx, messages, len(state.RoundSteps))
+
 	// Generate a single ID for this entire final answer stream
 	answerID := generateEventID("answer")
 	logger.Debugf(ctx, "[Agent][FinalAnswer] AnswerID: %s", answerID)
@@ -131,6 +136,8 @@ Now generate the final answer:`, query, imageRequirement)
 		})
 		return err
 	}
+	// 最终答案合成本身也是一次模型往返，同样计入本轮总量（PRD FR-12）。
+	e.accumulateTurnUsage(llmResult.Usage)
 
 	if !answerDoneEmitted {
 		e.eventBus.Emit(ctx, event.Event{
@@ -153,6 +160,34 @@ Now generate the final answer:`, query, imageRequirement)
 	})
 	state.FinalAnswer = fullAnswer
 	return nil
+}
+
+// compactFinalAnswerContext 在最终答案合成前压缩上下文（PRD FR-06 规则 7）。
+//
+// 合成用的消息把每条工具结果渲染为 user 消息，因此不存在 tool_call / 工具结果的配对问题；
+// 压缩本身是一次不携带任何 tools 的摘要调用，因此**不会重放工具调用**，也不会触碰任何
+// 外部状态（规则 6）。最后一条是合成指令，切点永远保留它。
+//
+// 规则 9：ctx 已取消时直接返回原消息，不发起任何模型调用。
+func (e *AgentEngine) compactFinalAnswerContext(
+	ctx context.Context, messages []chat.Message, round int,
+) []chat.Message {
+	if ctx.Err() != nil {
+		return messages
+	}
+	settings := e.compactor.Settings()
+	if !settings.ShouldCompact(e.countContextTokens(messages)) {
+		return messages
+	}
+	// 合成用的消息列表是临时拼装的（每条工具结果渲染为 user 消息），下标与装载历史时的
+	// 轮次区间毫无关系：这次压缩不得产出检查点，否则摘要会被写到错误的 assistant 行上
+	// （PRD FR-10）。
+	e.invalidateHistoryView()
+	if compacted, ok := e.runCompaction(ctx, messages, round, compaction.ReasonFinalAnswer); ok {
+		return compacted
+	}
+	degraded, _ := e.degradeContext(ctx, messages, round)
+	return degraded
 }
 
 // handleMaxIterations generates a final answer when the agent loop exhausted all iterations
@@ -198,6 +233,11 @@ func (e *AgentEngine) emitCompletionEvent(
 			TotalSteps:      len(state.RoundSteps),
 			TotalDurationMs: time.Since(startTime).Milliseconds(),
 			MessageID:       messageID, // Include message ID for proper message update
+			// 本轮的用量与上下文归因（PRD FR-12）。挂在 Extra 上而不是新增事件：
+			// EventAgentComplete 每条退出路径恰好发一次（见 executeLoop 的
+			// completionEmitted 守卫），于是归因也恰好落库一次。进程内传递，
+			// 值就是 *types.TokenUsage / *types.ContextTurnStats 本身。
+			Extra: e.turnAccountingExtra(),
 		},
 	})
 

@@ -140,6 +140,12 @@ type PipelineState struct {
 	// disabled or nothing scored high enough.
 	MemoryContext string `json:"-"`
 
+	// MemoryBlocks 是 MemoryContext 的结构化来源（FR-20 上下文预算 × 记忆预算统一
+	// 调度）：五层预算装配器据此按召回评分"整条"裁剪、对常驻块做"整块保留 / 整块
+	// 降级为摘要"两态切换，而不是把渲染文本从尾部硬截断。与 MemoryContext 同源于
+	// MEMORY_RECALL 阶段；只读，瞬态，不持久化。
+	MemoryBlocks *MemoryPrompt `json:"-"`
+
 	// --- ima-grade retrieval state ---
 
 	// Plan is the per-request retrieval strategy resolved by ROUTE_RETRIEVAL.
@@ -208,6 +214,34 @@ type ContextDiagnostics struct {
 	Budget         ContextLayerBudget `json:"budget"`
 	Used           ContextLayerBudget `json:"used"`
 	Actions        []string           `json:"actions"`
+}
+
+// MemoryPromptBlock 是 L1 记忆注入的结构化单元（FR-20）。它与
+// contextx.MemoryBlock 一一对应：types 不能反向依赖 contextx（会形成
+// types → contextx → models/chat → types 的导入环），因此这里保留一份镜像，
+// 由 chat_pipeline 在装配前转换。
+type MemoryPromptBlock struct {
+	// Text 是该条记忆渲染后的文本（不含结尾换行）。
+	Text string `json:"text"`
+	// Summary 是常驻条目的"摘要降级形式"；空表示不可降级。
+	Summary string `json:"summary,omitempty"`
+	// Score 是召回评分：预算不足时按它从低到高整条移除。
+	Score float64 `json:"score"`
+	// Resident 标记常驻块条目（只走整块保留 / 整块降级两态）。
+	Resident bool `json:"resident,omitempty"`
+}
+
+// MemoryPromptSection 是记忆块的一个分节。分节顺序与节内顺序都固定，
+// 保证 L1 渲染结果字节稳定（FR-11 ④）。
+type MemoryPromptSection struct {
+	Title  string              `json:"title"`
+	Blocks []MemoryPromptBlock `json:"blocks"`
+}
+
+// MemoryPrompt 是 MEMORY_RECALL 阶段产出的结构化 L1 记忆块。
+type MemoryPrompt struct {
+	Header   string                `json:"header,omitempty"`
+	Sections []MemoryPromptSection `json:"sections,omitempty"`
 }
 
 // PipelineContext holds runtime context for the current pipeline execution.
@@ -331,6 +365,7 @@ func (c *ChatManage) Clone() *ChatManage {
 			SystemPromptOverride: c.SystemPromptOverride,
 			RenderedContexts:     c.RenderedContexts,
 			MemoryContext:        c.MemoryContext,
+			MemoryBlocks:         c.MemoryBlocks, // 只读快照，跨克隆共享
 			Entity:               entity,
 			EntityKBIDs:          entityKBIDs,
 			EntityKnowledge:      entityKnowledge,

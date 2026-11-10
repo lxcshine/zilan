@@ -110,6 +110,10 @@ type ChunkRepository interface {
 	// Filter by kbIDs and/or knowledgeIDs. At least one of them must be non-empty.
 	// Returns up to `limit` chunks sorted by updated_at descending.
 	ListRecentDocumentChunksWithQuestions(ctx context.Context, tenantID uint64, kbIDs []string, knowledgeIDs []string, limit int) ([]*types.Chunk, error)
+
+	// ListImageAssets returns one de-duplicated page of a knowledge base's
+	// images from the chunk_images projection (FR-18 画廊)。
+	ListImageAssets(ctx context.Context, tenantID uint64, kbID string, q *types.ImageAssetQuery) ([]types.ImageAssetRow, int64, error)
 }
 
 // ChunkService defines the interface for chunk service operations
@@ -148,4 +152,8 @@ type ChunkService interface {
 	// DeleteGeneratedQuestion deletes a single generated question from a chunk by question ID
 	// This updates the chunk metadata and removes the corresponding vector index
 	DeleteGeneratedQuestion(ctx context.Context, chunkID string, questionID string) error
+	// ListImagesByKnowledgeBaseID lists one page of a KB's image assets for
+	// the gallery (FR-18), de-duplicated per image and filtered per the
+	// caller's constraints.
+	ListImagesByKnowledgeBaseID(ctx context.Context, kbID string, page *types.Pagination, filter *types.ImageListFilter) (*types.PageResult, error)
 }

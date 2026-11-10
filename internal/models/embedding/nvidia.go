@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -176,7 +175,7 @@ func (e *NvidiaEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 	}
 
 	// Read response
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("NvidiaEmbedder EmbedBatch read response error: %v", err)
 		return nil, fmt.Errorf("read response: %w", err)

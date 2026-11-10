@@ -110,12 +110,31 @@ func MemoryProfileSectionOf(fact *MemoryFact) string {
 	}
 }
 
-// Memory fact statuses.
+// Memory fact statuses (PRD §3.2 状态机为唯一权威定义)。
 const (
 	MemoryStatusActive   = "active"
 	MemoryStatusDone     = "done"     // todos only: completed
 	MemoryStatusArchived = "archived" // hidden from recall, kept for audit
+	// MemoryStatusPending 是系统推断（origin=extracted）产生、尚未被用户确认的
+	// 记忆。pending **永不注入 prompt**（常驻与语义两条召回路径都过滤），
+	// 只在记忆管理页的「待确认」分组可见（FR-02）。
+	MemoryStatusPending = "pending"
+	// MemoryStatusSuperseded 是被新记忆取代的旧值：保留原文、取代者引用与
+	// 取代时间，不注入 prompt，可被用户恢复或删除（FR-03）。
+	MemoryStatusSuperseded = "superseded"
 )
+
+// MemoryStatusHiddenFromPrompt 报告该状态是否禁止注入 prompt（PRD §3.2 状态语义表）：
+// pending（未确认的系统推断，FR-02 规则 4）、superseded（已被取代，FR-03 规则 3）
+// 与 archived 一律不注入。空状态视为可注入，兼容存量数据与既有构造。
+func MemoryStatusHiddenFromPrompt(status string) bool {
+	switch status {
+	case MemoryStatusPending, MemoryStatusSuperseded, MemoryStatusArchived:
+		return true
+	default:
+		return false
+	}
+}
 
 // IsResidentMemoryCategory reports whether the category bypasses semantic
 // scoring and is unconditionally injected into every turn ("常驻注入", PRD
@@ -143,8 +162,10 @@ const (
 	DefaultSessionSummaryHalfLife = 7 * 24 * time.Hour
 	// DefaultMemoryRecallLimit is the default top-k of injected memories.
 	DefaultMemoryRecallLimit = 8
-	// MaxFactsPerUser bounds active facts per (tenant,user); the service
-	// evicts the lowest-importance facts beyond this cap.
+	// MaxFactsPerUser is the hard ceiling for the per-(tenant,user) active
+	// memory set. The effective cap is DefaultMemoryMaxActiveItems (200) and can
+	// be raised per workspace up to this ceiling; overflow is archived by
+	// retention rank (see MemoryRetentionRank), never physically deleted.
 	MaxFactsPerUser = 2000
 	// MemoryRecallCandidateLimit caps how many candidate rows the repository
 	// returns for in-Go rescoring.
@@ -219,10 +240,22 @@ type MemoryFact struct {
 	TripleHash string `json:"-" gorm:"type:varchar(64)"`
 	// Content is the canonical human-readable rendering ("用户负责 Project X"),
 	// used as the embedding input and for prompt injection / display.
-	Content        string     `json:"content"`
-	Confidence     float64    `json:"confidence"`
-	Importance     float64    `json:"importance"`
-	Status         string     `json:"status" gorm:"type:varchar(16)"`
+	Content    string  `json:"content"`
+	Confidence float64 `json:"confidence"`
+	Importance float64 `json:"importance"`
+	Status     string  `json:"status" gorm:"type:varchar(16)"`
+	// Origin 是记忆来源三分类（explicit / extracted / manual），决定新记忆的
+	// 初始状态（FR-02）。存量行在迁移中回填为 extracted。
+	Origin string `json:"origin" gorm:"type:varchar(16)"`
+	// NormalizedKey 是矛盾判定键 sha256(category|subject|predicate)，同键不同值
+	// 即视为矛盾，走取代链（FR-03）。空串表示无可比较的属性维度，不参与判定。
+	NormalizedKey string `json:"-" gorm:"type:varchar(64);index"`
+	// ReplacesID 指向本条待确认记忆拟取代的 active 记忆；确认时才真正取代
+	// （FR-03：pending 不立即取代 active）。
+	ReplacesID string `json:"replaces_id,omitempty" gorm:"type:varchar(36)"`
+	// SupersededBy / SupersededAt 记录取代链：谁在什么时候取代了本条（FR-03）。
+	SupersededBy   string     `json:"superseded_by,omitempty" gorm:"type:varchar(36)"`
+	SupersededAt   *time.Time `json:"superseded_at,omitempty"`
 	AccessCount    int        `json:"access_count"`
 	LastAccessedAt *time.Time `json:"last_accessed_at,omitempty"`
 	// DueAt is the deadline for todo-category facts; nil otherwise.
@@ -337,6 +370,13 @@ type MemoryExtractPayload struct {
 	// the rows are stored without vectors and recall degrades to
 	// recency/importance ordering.
 	EmbeddingModelID string `json:"embedding_model_id,omitempty"`
+	// ConversationAt 是本次抽取所依据的对话发生时间，入队时捕获。落库前与
+	// 清空围栏的截止点比较：早于截止点说明用户已清空该段对话之前的记忆，
+	// 写入被静默丢弃（FR-01 规则 3/4）。零值表示入队时刻。
+	ConversationAt time.Time `json:"conversation_at,omitempty"`
+	// FenceGeneration 是入队时捕获的围栏世代令牌。落库时与当前世代比对，
+	// 不符说明入队后发生过清空，任务携带的推断已失效（FR-01 in-flight 校验）。
+	FenceGeneration string `json:"fence_generation,omitempty"`
 }
 
 // ExtractedMemoryItem is one LLM-extracted memory candidate before upsert.

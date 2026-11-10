@@ -5,12 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/models/imageprep"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
@@ -61,9 +61,12 @@ type AliyunEmbedInput struct {
 	Contents []AliyunContent `json:"contents"`
 }
 
-// AliyunContent represents a single content item in the input
+// AliyunContent represents a single content item in the input.
+// Image 字段（data URI）供图文共同空间嵌入使用（FR-17）：DashScope
+// multimodal-embedding 的每个 content 携带 text 或 image 之一。
 type AliyunContent struct {
-	Text string `json:"text,omitempty"`
+	Text  string `json:"text,omitempty"`
+	Image string `json:"image,omitempty"`
 }
 
 // AliyunEmbedResponse represents an Aliyun DashScope embedding response
@@ -218,7 +221,7 @@ func (e *AliyunEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 		defer resp.Body.Close()
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		logger.GetLogger(ctx).Errorf("AliyunEmbedder BatchEmbed read response error: %v", err)
 		return nil, fmt.Errorf("read response: %w", err)
@@ -256,6 +259,53 @@ func (e *AliyunEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 // GetModelName returns the model name
 func (e *AliyunEmbedder) GetModelName() string {
 	return e.modelName
+}
+
+// EmbedImages 将一批图片编码为与文本同一向量空间的向量（FR-17）。
+// DashScope multimodal-embedding 的图片输入为 data URI；请求/响应结构
+// 与文本嵌入完全一致，只是每个 content 的 text 换成 image。
+func (e *AliyunEmbedder) EmbedImages(ctx context.Context, images []imageprep.Image) ([][]float32, error) {
+	contents := make([]AliyunContent, 0, len(images))
+	for _, img := range images {
+		contents = append(contents, AliyunContent{Image: img.DataURI()})
+	}
+	reqBody := AliyunEmbedRequest{
+		Model: e.modelName,
+		Input: AliyunEmbedInput{Contents: contents},
+	}
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	resp, err := e.doRequestWithRetry(ctx, jsonData)
+	if err != nil {
+		return nil, fmt.Errorf("send request: %w", err)
+	}
+	if resp.Body != nil {
+		defer resp.Body.Close()
+	}
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errResp AliyunErrorResponse
+		if json.Unmarshal(body, &errResp) == nil && errResp.Message != "" {
+			return nil, fmt.Errorf("API error: %s - %s", errResp.Code, errResp.Message)
+		}
+		return nil, fmt.Errorf("EmbedImages API error: Http Status %s", resp.Status)
+	}
+	var response AliyunEmbedResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+	embeddings := make([][]float32, len(images))
+	for _, emb := range response.Output.Embeddings {
+		if emb.TextIndex >= 0 && emb.TextIndex < len(embeddings) {
+			embeddings[emb.TextIndex] = emb.Embedding
+		}
+	}
+	return embeddings, nil
 }
 
 func (e *AliyunEmbedder) supportsDimensionsParam() bool {

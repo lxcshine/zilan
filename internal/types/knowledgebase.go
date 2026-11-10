@@ -402,6 +402,52 @@ func ParseProviderScheme(filePath string) string {
 type ImageProcessingConfig struct {
 	// Model ID
 	ModelID string `yaml:"model_id" json:"model_id"`
+
+	// --- FR-13 OCR 流水线可配置化 -----------------------------------------
+	// 以下字段全部挂在本结构体既有的 JSON 列上，不需要数据库迁移。旧数据的
+	// JSON 里没有这些键，反序列化后为零值，经 Resolve* 一律回落到
+	// 「手动流水线 + 前处理关闭」，即 FR-13 之前的行为（PRD §5.4）。
+
+	// OCRPipelineID 选择 OCR 流水线：""/"manual" 为手动，"smart" 为智能。
+	// 未知的 id 由 NormalizeOCRPipelineID 回落到手动，因此存着一个本版本已
+	// 下线的流水线名也不会让文档解析失败。
+	OCRPipelineID string `yaml:"ocr_pipeline,omitempty" json:"ocr_pipeline,omitempty"`
+	// OCRPipelineParams 保存所选流水线的可调参数，键为 SlotKey(pipelineID, key)
+	// 生成的「<pipeline>.<key>」。整张表随知识库一起存取：流水线不再声明的键
+	// 在运行时被忽略，因此旧配置永远可读，保存时也不被改写。
+	OCRPipelineParams map[string]any `yaml:"ocr_pipeline_params,omitempty" json:"ocr_pipeline_params,omitempty"`
+	// PreprocessMode 是 OCR 前处理开关：off（默认）/auto/always。
+	PreprocessMode string `yaml:"preprocess_mode,omitempty" json:"preprocess_mode,omitempty"`
+	// PreprocessParams 保存前处理步骤参数（去噪/纠偏/对比度增强/留白），
+	// 键为裸名（如 "denoise.sigma"）。默认全部关闭。
+	PreprocessParams map[string]any `yaml:"preprocess_params,omitempty" json:"preprocess_params,omitempty"`
+
+	// --- FR-17 图文共空间检索 ---------------------------------------------
+	// ImageVectorEnabled 图片向量索引开关：开启后图片经图文共享向量空间
+	// 模型编码写入向量索引，文本查询可直接检索到图表/示意图/产品图。
+	// 默认关闭（§5.4 存量兼容）；开关只影响新解析的文档，存量文档需手动
+	// 或批量重解析后才会生成图片向量，存量库在重解析前零变化。
+	ImageVectorEnabled bool `yaml:"image_vector_enabled,omitempty" json:"image_vector_enabled,omitempty"`
+}
+
+// ResolveOCRPipeline 返回知识库生效的 OCR 流水线 id（等价于
+// ResolveOCRPipelineID(&cfg)，便于值语义调用方使用）。
+func (c ImageProcessingConfig) ResolveOCRPipeline() OCRPipelineID {
+	return ResolveOCRPipelineID(&c)
+}
+
+// EnsureOCRDefaults 把 OCR 流水线相关字段补成显式默认值。仅在保存路径调用，
+// 读取路径一律经 Resolve* 兜底，因此存量数据不会被静默改写。
+func (c *ImageProcessingConfig) EnsureOCRDefaults() {
+	if c == nil {
+		return
+	}
+	c.OCRPipelineID = ResolveOCRPipelineID(c).String()
+	if strings.TrimSpace(c.PreprocessMode) == "" {
+		c.PreprocessMode = PreprocessModeOff
+	} else {
+		c.PreprocessMode = NormalizePreprocessMode(c.PreprocessMode)
+	}
 }
 
 // Value implements the driver.Valuer interface, used to convert ChunkingConfig to database value
@@ -642,6 +688,11 @@ func (kb *KnowledgeBase) EnsureDefaults() {
 	if kb.ExtractConfig != nil && kb.ExtractConfig.Enabled && !kb.IndexingStrategy.GraphEnabled {
 		kb.IndexingStrategy.GraphEnabled = true
 	}
+	// FR-13：把 OCR 流水线与前处理开关补成显式默认值（manual / off）。
+	// 存量知识库的 JSON 里没有这两个键，规范化后与 FR-13 之前的行为一致；
+	// 这里只补默认值，不做取值校验（校验在保存路径上，见
+	// service.ValidateOCRPipelineConfig），因此不会把旧配置判成非法。
+	kb.ImageProcessingConfig.EnsureOCRDefaults()
 }
 
 // KBCapabilities describes the functional features a knowledge base exposes.
@@ -703,6 +754,12 @@ func (kb *KnowledgeBase) IsWikiEnabled() bool {
 // IsVectorEnabled checks if vector (semantic) search is enabled.
 func (kb *KnowledgeBase) IsVectorEnabled() bool {
 	return kb != nil && kb.IndexingStrategy.VectorEnabled
+}
+
+// IsImageVectorEnabled 报告该知识库是否开启图文共空间检索（FR-17）。
+// 仅当同时开启向量索引时才有意义——图片向量与文本共享同一向量索引。
+func (kb *KnowledgeBase) IsImageVectorEnabled() bool {
+	return kb != nil && kb.ImageProcessingConfig.ImageVectorEnabled
 }
 
 // IsKeywordEnabled checks if keyword (BM25) search is enabled.

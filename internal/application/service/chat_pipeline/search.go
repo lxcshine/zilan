@@ -2,6 +2,7 @@ package chatpipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -312,6 +313,10 @@ func logSearchScoreSample(ctx context.Context, action string, results []*types.S
 // SearchChannel runs a single-channel KB retrieval using the given query
 // text / embedding and vector/keyword switches. It is the building block for
 // multi-channel recall in CHUNK_SEARCH_PARALLEL.
+//
+// 错误契约（FR-19⑤）：返回的结果与错误是**并存**的。部分知识库/分组检索失败
+// 时，已成功通道的结果照常返回，失败被聚合成一个 error 一并交给调用方，由调用
+// 方决定降级还是整轮失败——绝不再把残缺结果当成完整结果静默吞掉。
 func (p *PluginSearch) SearchChannel(
 	ctx context.Context,
 	chatManage *types.ChatManage,
@@ -319,13 +324,45 @@ func (p *PluginSearch) SearchChannel(
 	queryEmbedding []float32,
 	disableVector bool,
 	disableKeyword bool,
-) []*types.SearchResult {
+) ([]*types.SearchResult, error) {
 	return p.searchByTargetsWithOpts(ctx, chatManage, &types.SearchParams{
 		QueryText:            queryText,
 		QueryEmbedding:       queryEmbedding,
 		DisableVectorMatch:   disableVector,
 		DisableKeywordsMatch: disableKeyword,
 	})
+}
+
+// searchErrorCollector 汇总一次检索中各并发子任务（模型分组 / 单目标）的失败。
+// 检索是“多条腿”的：一条腿挂了不该丢掉其他腿的结果，但也不能让上层以为拿到
+// 的是完整结果，因此这里把失败收集起来，最后与结果一并返回。
+type searchErrorCollector struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+// add 记录一次失败。reason 用于拼出可读的聚合错误信息。
+func (c *searchErrorCollector) add(reason string, err error) {
+	if c == nil || err == nil {
+		return
+	}
+	c.mu.Lock()
+	c.errs = append(c.errs, fmt.Errorf("%s: %w", reason, err))
+	c.mu.Unlock()
+}
+
+// join 返回聚合错误；没有任何失败时返回 nil。
+func (c *searchErrorCollector) join() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("retrieval returned partial results (%d failures): %w",
+		len(c.errs), errors.Join(c.errs...))
 }
 
 // searchByTargets performs KB searches using pre-computed SearchTargets.
@@ -337,7 +374,15 @@ func (p *PluginSearch) searchByTargets(
 	ctx context.Context,
 	chatManage *types.ChatManage,
 ) []*types.SearchResult {
-	return p.searchByTargetsWithOpts(ctx, chatManage, nil)
+	results, err := p.searchByTargetsWithOpts(ctx, chatManage, nil)
+	if err != nil {
+		// 单路检索保持既有“降级可用”的行为：结果照用，失败显式记录到
+		// 流水线告警（可观测位置），不再静默丢弃。
+		pipelineWarn(ctx, "Search", "partial_retrieval_failure", map[string]interface{}{
+			"error": err.Error(),
+		})
+	}
+	return results
 }
 
 // searchByTargetsWithOpts is the channel-aware variant of searchByTargets.
@@ -349,10 +394,12 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 	ctx context.Context,
 	chatManage *types.ChatManage,
 	opts *types.SearchParams,
-) []*types.SearchResult {
+) ([]*types.SearchResult, error) {
 	if len(chatManage.SearchTargets) == 0 {
-		return nil
+		return nil, nil
 	}
+	// 收集各并发子任务的失败，最后与结果一并返回（保留成功腿 + 附带错误）。
+	var errs searchErrorCollector
 
 	queryText := strings.TrimSpace(chatManage.RewriteQuery)
 	var queryEmbedding []float32
@@ -386,6 +433,7 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 		pipelineWarn(ctx, "Search", "batch_kb_fetch_error", map[string]interface{}{
 			"error": err.Error(),
 		})
+		errs.add("batch fetch knowledge bases", err)
 	}
 
 	// Resolve actual model identities (name + endpoint) so that cross-tenant
@@ -426,6 +474,7 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 							"kb_id":     targets[0].KnowledgeBaseID,
 							"error":     err.Error(),
 						})
+						errs.add("query embedding", err)
 					} else {
 						localEmbedding = emb
 					}
@@ -476,6 +525,14 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 							"kb_ids": fullKBIDs,
 							"error":  err.Error(),
 						})
+						errs.add(fmt.Sprintf("hybrid search kb=%v", fullKBIDs), err)
+						// 部分失败：仍然把 res 里已拿到的结果并入（契约要求
+						// “保留成功腿 + 附带错误”），不因一条腿失败丢弃全部。
+						if len(res) > 0 {
+							mu.Lock()
+							results = append(results, res...)
+							mu.Unlock()
+						}
 						return
 					}
 					pipelineInfo(ctx, "Search", "combined_kb_result", map[string]interface{}{
@@ -493,7 +550,7 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 				innerWg.Add(1)
 				go func(t *types.SearchTarget) {
 					defer innerWg.Done()
-					p.searchSingleTarget(ctx, chatManage, t, queryText, localEmbedding, disableVector, disableKeyword, &mu, &results)
+					p.searchSingleTarget(ctx, chatManage, t, queryText, localEmbedding, disableVector, disableKeyword, &mu, &results, &errs)
 				}(target)
 			}
 
@@ -504,9 +561,10 @@ func (p *PluginSearch) searchByTargetsWithOpts(
 	wg.Wait()
 
 	pipelineInfo(ctx, "Search", "kb_result_summary", map[string]interface{}{
-		"total_hits": len(results),
+		"total_hits":  len(results),
+		"error_count": len(errs.errs),
 	})
-	return results
+	return results, errs.join()
 }
 
 // searchSingleTarget performs hybrid retrieval inside one constrained target.
@@ -520,6 +578,7 @@ func (p *PluginSearch) searchSingleTarget(
 	disableKeyword bool,
 	mu *sync.Mutex,
 	results *[]*types.SearchResult,
+	errs *searchErrorCollector,
 ) {
 	if t.Type == types.SearchTargetTypeKnowledge && len(t.KnowledgeIDs) == 0 {
 		return
@@ -559,6 +618,13 @@ func (p *PluginSearch) searchSingleTarget(
 			"query":       params.QueryText,
 			"error":       err.Error(),
 		})
+		errs.add(fmt.Sprintf("hybrid search kb=%s", t.KnowledgeBaseID), err)
+		// 与合并检索路径一致：失败腿已取回的结果仍然保留。
+		if len(res) > 0 {
+			mu.Lock()
+			*results = append(*results, res...)
+			mu.Unlock()
+		}
 		return
 	}
 	pipelineInfo(ctx, "Search", "kb_result", map[string]interface{}{

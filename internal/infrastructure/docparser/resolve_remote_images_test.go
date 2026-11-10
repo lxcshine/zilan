@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Tencent/WeKnora/internal/utils"
 )
 
 // mockFileService is a minimal FileService implementation for testing.
@@ -47,6 +49,9 @@ func (m *mockFileService) WriteFileToPath(ctx context.Context, filePath string, 
 func TestResolveRemoteImages_NormalDownload(t *testing.T) {
 	// Whitelist localhost for this test so the test server is reachable
 	t.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost")
+	// 白名单是 sync.Once 缓存的：包内更早运行的测试（例如 PingMarker 探测不可达
+	// 端点）可能已经用当时的空环境变量把它固化，这里必须显式重置，t.Setenv 才生效。
+	utils.ResetSSRFWhitelistForTest()
 
 	// Create a test HTTP server that serves a real PNG image.
 	pngData := createTestPNG(200, 200)
@@ -112,6 +117,9 @@ func TestResolveRemoteImages_SSRFBlocked(t *testing.T) {
 func TestResolveRemoteImages_NonImageContentType(t *testing.T) {
 	// Whitelist localhost for this test so the test server is reachable
 	t.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost")
+	// 白名单是 sync.Once 缓存的：包内更早运行的测试（例如 PingMarker 探测不可达
+	// 端点）可能已经用当时的空环境变量把它固化，这里必须显式重置，t.Setenv 才生效。
+	utils.ResetSSRFWhitelistForTest()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -161,6 +169,9 @@ func TestResolveRemoteImages_ProviderSchemeSkipped(t *testing.T) {
 func TestResolveRemoteImages_MultipleImages(t *testing.T) {
 	// Whitelist localhost for this test so the test server is reachable
 	t.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost")
+	// 白名单是 sync.Once 缓存的：包内更早运行的测试（例如 PingMarker 探测不可达
+	// 端点）可能已经用当时的空环境变量把它固化，这里必须显式重置，t.Setenv 才生效。
+	utils.ResetSSRFWhitelistForTest()
 
 	pngData := createTestPNG(256, 256)
 	callCount := 0
@@ -216,6 +227,9 @@ func TestResolveRemoteImages_NoImages(t *testing.T) {
 func TestResolveRemoteImages_Server404(t *testing.T) {
 	// Whitelist localhost for this test so the test server is reachable
 	t.Setenv("SSRF_WHITELIST", "127.0.0.1,localhost")
+	// 白名单是 sync.Once 缓存的：包内更早运行的测试（例如 PingMarker 探测不可达
+	// 端点）可能已经用当时的空环境变量把它固化，这里必须显式重置，t.Setenv 才生效。
+	utils.ResetSSRFWhitelistForTest()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

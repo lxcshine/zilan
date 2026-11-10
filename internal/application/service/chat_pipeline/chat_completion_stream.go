@@ -113,6 +113,20 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 		answerID := fmt.Sprintf("%s-answer", uuid.New().String()[:8])
 		thinkingOpen := false
 
+		// 本轮用量采集（PRD FR-12）。供应商在终局 chunk 上回报 usage，这里逐 chunk
+		// 取最后一个非空值；发出时机必须早于 answer(Done)，因此单独用一个闭包收口，
+		// 三条退出路径（正常收尾 / ctx 取消 / 通道关闭）都保证恰好发一次。
+		var turnUsage *types.TokenUsage
+		usageEmitted := false
+		flushTurnUsage := func() {
+			if usageEmitted {
+				return
+			}
+			usageEmitted = true
+			emitTurnUsage(context.WithoutCancel(ctx), chatManage, turnUsage)
+		}
+		defer flushTurnUsage()
+
 		closeThinking := func() {
 			if !thinkingOpen {
 				return
@@ -174,6 +188,10 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 					return
 				}
 
+				if response.Usage != nil {
+					turnUsage = response.Usage
+				}
+
 				if response.ResponseType == types.ResponseTypeError {
 					pipelineError(ctx, "Stream", "stream_error", map[string]interface{}{
 						"session_id": chatManage.SessionID,
@@ -219,6 +237,10 @@ func (p *PluginChatCompletionStream) OnEvent(ctx context.Context,
 					response.Content = answerDecoder.Feed(response.Content)
 					if response.Done {
 						response.Content += answerDecoder.Flush()
+						// 先把本轮用量推给 handler，再发终局的 answer(Done)：普通模式下
+						// handler 收到 Done 就会立刻持久化 assistant 消息，顺序反了这一轮
+						// 的 usage / context_stats 就赶不上那次写入（PRD FR-12）。
+						flushTurnUsage()
 					}
 					closeThinking()
 					eventBus.Emit(ctx, types.Event{

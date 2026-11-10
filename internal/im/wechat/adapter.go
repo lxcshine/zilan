@@ -24,6 +24,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/im"
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/gin-gonic/gin"
 )
 
@@ -177,7 +178,7 @@ func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io
 	}
 
 	// Read and decrypt with AES-128-ECB
-	encryptedData, err := io.ReadAll(resp.Body)
+	encryptedData, err := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	resp.Body.Close()
 	if err != nil {
 		return nil, "", fmt.Errorf("read encrypted file: %w", err)
@@ -290,7 +291,7 @@ func (a *Adapter) ilinkPost(ctx context.Context, path string, payload interface{
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("ilink api %s returned status %d: %s", path, resp.StatusCode, string(respBody))

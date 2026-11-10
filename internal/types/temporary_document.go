@@ -1,6 +1,10 @@
 package types
 
 import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -49,6 +53,32 @@ type TemporaryDocument struct {
 
 func (TemporaryDocument) TableName() string { return "temporary_documents" }
 
+// TemporaryDocumentImageDescriptionsKey 是 Metadata 下缓存视觉模型图片理解结果的键
+// （PRD FR-22 ⑤）。它属于服务端缓存，绝不能出现在任何对客户端的响应里。
+const TemporaryDocumentImageDescriptionsKey = "attachment_image_descriptions"
+
+// ForClient 返回一份剥离了服务端缓存的副本，用于 API 响应。接收者本身不被修改。
+func (d *TemporaryDocument) ForClient() *TemporaryDocument {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	var metadata map[string]json.RawMessage
+	if len(d.Metadata) == 0 || json.Unmarshal(d.Metadata, &metadata) != nil {
+		return &out
+	}
+	if _, ok := metadata[TemporaryDocumentImageDescriptionsKey]; !ok {
+		return &out
+	}
+	delete(metadata, TemporaryDocumentImageDescriptionsKey)
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return &out
+	}
+	out.Metadata = JSON(encoded)
+	return &out
+}
+
 func (d *TemporaryDocument) BeforeCreate(_ *gorm.DB) error {
 	if d.ID == "" {
 		d.ID = uuid.NewString()
@@ -84,6 +114,46 @@ type TemporaryDocumentImage struct {
 	OriginalRef string `json:"original_ref,omitempty"`
 	URL         string `json:"url"`
 	MimeType    string `json:"mime_type,omitempty"`
+}
+
+// ViewableImages 按编号顺序列出 Agent 可以查看的图片：解析文本里已存储的图片；
+// 如果上传本身就是图片且解析器没有存任何图片，则退回上传文件本身。
+func (d *TemporaryDocument) ViewableImages() []TemporaryDocumentImage {
+	var refs []TemporaryDocumentImage
+	_ = json.Unmarshal(d.ImageRefs, &refs)
+	images := refs[:0]
+	for _, ref := range refs {
+		if strings.TrimSpace(ref.URL) != "" {
+			images = append(images, ref)
+		}
+	}
+	if len(images) == 0 && strings.HasPrefix(d.MimeType, "image/") && strings.TrimSpace(d.ResourceRef) != "" {
+		images = append(images, TemporaryDocumentImage{URL: d.ResourceRef, MimeType: d.MimeType})
+	}
+	return images
+}
+
+var markdownImageRefPattern = regexp.MustCompile(`!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)`)
+
+// NumberAttachmentImages 给每个指向 images 的 markdown 图片标注它的 1 起始编号，
+// 这样读到文本的人知道该请求哪一张图。无法识别的引用保持原样。
+func NumberAttachmentImages(content string, images []TemporaryDocumentImage) string {
+	if len(images) == 0 || !strings.Contains(content, "![") {
+		return content
+	}
+	positions := make(map[string]int, len(images))
+	for i, image := range images {
+		if _, seen := positions[image.URL]; !seen {
+			positions[image.URL] = i + 1
+		}
+	}
+	return markdownImageRefPattern.ReplaceAllStringFunc(content, func(match string) string {
+		groups := markdownImageRefPattern.FindStringSubmatch(match)
+		if n, ok := positions[groups[1]]; ok {
+			return fmt.Sprintf("%s [image #%d]", match, n)
+		}
+		return match
+	})
 }
 
 type TemporaryDocumentTaskPayload struct {

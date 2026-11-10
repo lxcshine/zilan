@@ -67,6 +67,14 @@ class DocReaderConfig:
     pdf_jpeg_quality: int
     pdf_render_max_edge: int
 
+    # FR-16 流式解析的资源上界（与 FR-07 协同）：超限时中止产出并保留已解析
+    # 部分，同时把「解析未完成」标注回传，绝不产出看似完整实则残缺的结果。
+    # 内存上界：进程 RSS 超过该值即中止逐页渲染（MB，0 表示不检查）。
+    parse_memory_limit_mb: int
+    # 时长上界：服务侧兜底值（秒，0 表示不限制）。正常部署由 Go 侧按
+    # DocReaderCallTimeout 计算截止时间，经 parse_deadline_unix override 下发。
+    parse_time_limit_seconds: int
+
     # Proxy
     external_http_proxy: str
     external_https_proxy: str
@@ -117,6 +125,11 @@ def load_config() -> DocReaderConfig:
     # dense CJK text legible for OCR while keeping page images well under ~1MB.
     pdf_render_max_edge = _get_int(["DOCREADER_PDF_RENDER_MAX_EDGE"], 2000)
 
+    # FR-16：流式解析的时长 / 内存上界。默认 4096MB 与容器常见配额同量级，
+    # 触发后中止逐页渲染并保留已解析部分（不抛异常、不产出残缺的「完整」结果）。
+    parse_memory_limit_mb = _get_int(["DOCREADER_PARSE_MEMORY_MB"], 4096)
+    parse_time_limit_seconds = _get_int(["DOCREADER_PARSE_TIME_LIMIT_SECONDS"], 0)
+
     external_http_proxy = _get_str(
         ["DOCREADER_EXTERNAL_HTTP_PROXY", "EXTERNAL_HTTP_PROXY"], ""
     )
@@ -145,6 +158,8 @@ def load_config() -> DocReaderConfig:
         pdf_render_dpi=pdf_render_dpi,
         pdf_jpeg_quality=pdf_jpeg_quality,
         pdf_render_max_edge=pdf_render_max_edge,
+        parse_memory_limit_mb=parse_memory_limit_mb,
+        parse_time_limit_seconds=parse_time_limit_seconds,
         external_http_proxy=external_http_proxy,
         external_https_proxy=external_https_proxy,
         image_output_dir=image_output_dir,
@@ -173,6 +188,8 @@ def dump_config(mask_secrets: bool = True) -> Dict[str, Any]:
         "DOCREADER_PDF_RENDER_DPI": cfg.pdf_render_dpi,
         "DOCREADER_PDF_JPEG_QUALITY": cfg.pdf_jpeg_quality,
         "DOCREADER_PDF_RENDER_MAX_EDGE": cfg.pdf_render_max_edge,
+        "DOCREADER_PARSE_MEMORY_MB": cfg.parse_memory_limit_mb,
+        "DOCREADER_PARSE_TIME_LIMIT_SECONDS": cfg.parse_time_limit_seconds,
         "DOCREADER_EXTERNAL_HTTP_PROXY": cfg.external_http_proxy,
         "DOCREADER_EXTERNAL_HTTPS_PROXY": cfg.external_https_proxy,
         "DOCREADER_IMAGE_OUTPUT_DIR": cfg.image_output_dir,
@@ -185,3 +202,25 @@ def print_config() -> None:
     logger.info("DocReader env/config (effective values):")
     for k in sorted(d.keys()):
         logger.info("%s=%s", k, d[k])
+    _print_preprocess_config()
+
+
+def _print_preprocess_config() -> None:
+    """打印 OCR 前处理（FR-13）的进程级默认值，便于排查「配置了却没生效」。
+
+    真正的生效值可能来自知识库级的 parser_engine_overrides，这里打印的是
+    没有任何覆盖时的兜底值（默认 mode=off、三个步骤全关）。
+    失败只影响日志，绝不影响启动。
+    """
+    try:
+        from docreader.parser import image_preprocess
+
+        effective = image_preprocess.effective_thresholds()
+        logger.info(
+            "DocReader OCR preprocess defaults: %s (available=%s deskew=%s)",
+            image_preprocess.summarize(effective),
+            image_preprocess.is_available(),
+            image_preprocess.deskew_available(),
+        )
+    except Exception as exc:  # pragma: no cover - 防御性
+        logger.warning("OCR preprocess defaults unavailable: %s", exc)

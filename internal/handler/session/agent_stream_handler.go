@@ -411,6 +411,16 @@ func (h *AgentStreamHandler) handleReferences(ctx context.Context, evt event.Eve
 					searchResult.Metadata = metadata
 				}
 
+				// FR-05 引用溯源：解析 source_locators（容忍缺失/格式错误）
+				if rawLocs, ok := refMap["source_locators"]; ok && rawLocs != nil {
+					if locBytes, err := json.Marshal(rawLocs); err == nil {
+						var locs types.SourceLocators
+						if err := json.Unmarshal(locBytes, &locs); err == nil {
+							searchResult.SourceLocators = locs
+						}
+					}
+				}
+
 				h.knowledgeRefs = append(h.knowledgeRefs, searchResult)
 			}
 		}
@@ -589,6 +599,22 @@ func (h *AgentStreamHandler) handleSessionTitle(ctx context.Context, evt event.E
 	return nil
 }
 
+// applyTurnUsage 把一轮的用量与归因写到 assistant 消息的内存态上，持久化由调用方负责
+// （两条路径的写入时机不同，见 qa.go 与 handleComplete）。
+//
+// 只覆盖非空值：供应商没有回报 usage 时保留原有列，不用 NULL 抹掉先前写入的数字。
+func applyTurnUsage(msg *types.Message, usage *types.TokenUsage, stats *types.ContextTurnStats) {
+	if msg == nil {
+		return
+	}
+	if usage != nil && !usage.IsZero() {
+		msg.Usage = usage
+	}
+	if stats != nil && !stats.Empty() {
+		msg.ContextStats = stats
+	}
+}
+
 // handleComplete handles agent complete events
 func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event) error {
 	data, ok := evt.Data.(event.AgentCompleteData)
@@ -598,6 +624,10 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// 本轮的 token 用量与上下文归因（PRD FR-12）。普通模式下这个 Extra 由 qa.go 从
+	// chat.complete 事件转挂过来，Agent 模式下由引擎直接挂上，两条路径同一个形状。
+	turnUsage, turnStats := types.TurnUsageFromExtra(data.Extra)
 
 	// Update assistant message with final data
 	if data.MessageID == h.assistantMessageID {
@@ -624,6 +654,10 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 				h.assistantMessage.AgentSteps = agenttools.SanitizeAgentStepsForStorage(steps)
 			}
 		}
+
+		// Agent 模式：completeAssistantMessage 在 AgentQA 返回之后才跑（见 qa.go 的
+		// defer），因此这里只改内存态，落库由那次 UpdateMessage 一并完成。
+		applyTurnUsage(h.assistantMessage, turnUsage, turnStats)
 	}
 
 	// Fallback: if no answer events were streamed but we have a final answer,
@@ -667,16 +701,24 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 	}
 
 	// Send completion event to stream manager so SSE can detect completion
+	completeData := map[string]interface{}{
+		"total_steps":       data.TotalSteps,
+		"total_duration_ms": data.TotalDurationMs,
+	}
+	// 本轮用量随 complete 事件一起推给前端（PRD FR-12）：既放进 Data 供 map 消费者
+	// 读取，也放到强类型的 Usage 字段上，由 buildStreamResponse 提升到
+	// StreamResponse.Usage。归因明细不推流——它随消息持久化，由会话详情接口带出。
+	if turnUsage != nil {
+		completeData["usage"] = turnUsage
+	}
 	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
 		ID:        evt.ID,
 		Type:      types.ResponseTypeComplete,
 		Content:   "",
 		Done:      true,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
-			"total_steps":       data.TotalSteps,
-			"total_duration_ms": data.TotalDurationMs,
-		},
+		Data:      completeData,
+		Usage:     turnUsage,
 	}); err != nil {
 		logger.GetLogger(h.ctx).Errorf("Append complete event to stream failed: %v", err)
 	}

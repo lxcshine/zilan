@@ -144,6 +144,9 @@ var toolHandlePolicies = map[string]toolHandlePolicy{
 	// "url"/"knowledge_id" with unrelated semantics.
 	"read_skill":           {},
 	"execute_skill_script": {},
+	// read_file 读的是会话附件（用户上传的文件），内容形态未知且属于不可信参考数据。
+	// 只压缩已知持久 ID，不按 source key 挖掘输出。
+	"read_file": {},
 }
 
 // HasToolPolicy reports whether a tool has an explicit model-handle policy.

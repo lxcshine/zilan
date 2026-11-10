@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -81,11 +80,11 @@ func (c *MarkerReader) Read(ctx context.Context, req *types.ReadRequest) (*types
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("marker API status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("marker API status %d: %s", resp.StatusCode, readErrorPreview(resp.Body))
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	// 响应体是整篇解析结果（可能内联 base64 图片），按结果响应上界约束。
+	respBody, err := readCapped(resp.Body, maxResultResponseBytes())
 	if err != nil {
 		return nil, fmt.Errorf("marker read response: %w", err)
 	}
@@ -218,11 +217,11 @@ func (c *DoclingReader) Read(ctx context.Context, req *types.ReadRequest) (*type
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("docling API status %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("docling API status %d: %s", resp.StatusCode, readErrorPreview(resp.Body))
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	// 响应体是整篇解析结果，按结果响应上界约束。
+	respBody, err := readCapped(resp.Body, maxResultResponseBytes())
 	if err != nil {
 		return nil, fmt.Errorf("docling read response: %w", err)
 	}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/datasource"
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // Client wraps the Feishu Open Platform API for document/wiki operations.
@@ -117,16 +118,11 @@ func (c *Client) getTenantAccessToken(ctx context.Context) (string, error) {
 	}
 	c.tokenExpAt = time.Now().Add(ttl)
 
-	prefixLen := 8
-	if len(result.TenantAccessToken) < prefixLen {
-		prefixLen = len(result.TenantAccessToken)
-	}
-	suffixLen := 4
-	if len(result.TenantAccessToken) < suffixLen {
-		suffixLen = len(result.TenantAccessToken)
-	}
-	logger.Infof(ctx, "[Feishu] got tenant_access_token: %s...%s expire=%ds",
-		result.TenantAccessToken[:prefixLen], result.TenantAccessToken[len(result.TenantAccessToken)-suffixLen:], result.Expire)
+	// 凭据的任何片段都不得入日志（FR-08 条 1），首尾截断形式同样算片段：
+	// 拿到首 8 位 + 末 4 位足以大幅缩小暴力猜解空间。这里只记录长度与
+	// 有效期，两者已足够诊断"token 是否拿到、多久过期"。
+	logger.Infof(ctx, "[Feishu] got tenant_access_token (len=%d) expire=%ds",
+		len(result.TenantAccessToken), result.Expire)
 
 	return c.tokenCache, nil
 }
@@ -205,7 +201,8 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 			return lastErr
 		}
 
-		respBody, readErr := io.ReadAll(resp.Body)
+		// 响应体受上界约束（FR-07）：飞书 API 返回 JSON，超限直接报错。
+		respBody, readErr := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 		resp.Body.Close()
 		if readErr != nil {
 			lastErr = fmt.Errorf("read response body: %w", readErr)
@@ -712,7 +709,7 @@ func (c *Client) downloadRawBytes(ctx context.Context, path string) ([]byte, err
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, secutils.MaxErrorPreviewBytes))
 			resp.Body.Close()
 			wait := parseRetryAfter(resp.Header.Get("Retry-After"), feishuRetryBackoff[min(attempt, len(feishuRetryBackoff)-1)])
 			lastErr = fmt.Errorf("download rate limited: status=429 body=%s", truncate(string(body), 500))
@@ -726,7 +723,7 @@ func (c *Client) downloadRawBytes(ctx context.Context, path string) ([]byte, err
 		}
 
 		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, secutils.MaxErrorPreviewBytes))
 			resp.Body.Close()
 			lastErr = fmt.Errorf("download server error: status=%d body=%s", resp.StatusCode, truncate(string(body), 500))
 			if attempt < feishuMax5xxRetries {
@@ -739,7 +736,7 @@ func (c *Client) downloadRawBytes(ctx context.Context, path string) ([]byte, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, secutils.MaxErrorPreviewBytes))
 			resp.Body.Close()
 			logger.Errorf(ctx, "[Feishu] download GET %s → status=%d body=%s", path, resp.StatusCode, truncate(string(body), 500))
 			return nil, fmt.Errorf("download failed: status=%d body=%s", resp.StatusCode, string(body))

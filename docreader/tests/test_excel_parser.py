@@ -274,6 +274,67 @@ class ExcelImageFilterTest(unittest.TestCase):
         self.assertIn("99.9", document.content)
 
 
+class ExcelSourceBlocksTest(unittest.TestCase):
+    """FR-05 引用溯源：Excel 每行文本块的 sheet/行号定位。"""
+
+    def _workbook(self) -> bytes:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "明细"
+        ws["A1"] = "名称"
+        ws["B1"] = "数量"
+        # 第 2 行整行留空：dropna 会跳过，但行号必须保持物理行号
+        ws["A3"] = "螺栓"
+        ws["B3"] = 12
+        ws["A4"] = "螺母"
+        ws["B4"] = 3
+        ws2 = wb.create_sheet("汇总")
+        ws2["A1"] = "合计"
+        ws2["A2"] = 15
+        bio = io.BytesIO()
+        wb.save(bio)
+        return bio.getvalue()
+
+    def test_source_blocks_cover_rows_with_physical_numbers(self):
+        document = ExcelParser().parse_into_text(self._workbook())
+
+        blocks = document.source_blocks
+        self.assertEqual(len(blocks), len(document.chunks))
+
+        by_row = {(b["locator"]["sheet"], b["locator"]["row_start"]): b for b in blocks}
+        self.assertEqual(
+            sorted((sheet, row) for sheet, row in by_row),
+            [("明细", 1), ("明细", 3), ("明细", 4), ("汇总", 1), ("汇总", 2)],
+            "空行跳过后行号仍是 1-based 物理行号",
+        )
+        for b in blocks:
+            loc = b["locator"]
+            self.assertEqual(loc["type"], "sheet")
+            self.assertEqual(loc["row_start"], loc["row_end"])
+
+    def test_source_blocks_offsets_match_content(self):
+        document = ExcelParser().parse_into_text(self._workbook())
+
+        for chunk, block in zip(document.chunks, document.source_blocks):
+            self.assertEqual(chunk.start, block["start"])
+            self.assertEqual(chunk.end, block["end"])
+            self.assertEqual(document.content[block["start"] : block["end"]], chunk.content)
+
+        blocks = sorted(document.source_blocks, key=lambda b: b["start"])
+        for prev, cur in zip(blocks, blocks[1:]):
+            self.assertLessEqual(prev["end"], cur["start"], "块区间按顺序无缝覆盖")
+
+    def test_source_blocks_to_proto_wire(self):
+        from docreader.source_wire import source_blocks_to_proto
+
+        document = ExcelParser().parse_into_text(self._workbook())
+        protos = source_blocks_to_proto(document)
+        self.assertEqual(len(protos), len(document.source_blocks))
+        for proto in protos:
+            self.assertGreater(proto.end, proto.start)
+            self.assertIn('"type": "sheet"', proto.locator_json)
+
+
 class ExcelParserTest(unittest.TestCase):
     def test_parse_phantom_shared_strings_workbook(self):
         document = ExcelParser().parse_into_text(_xlsx_with_phantom_shared_strings())

@@ -46,8 +46,14 @@ func NewAssembler(counter *Counter) *Assembler {
 // Input carries the raw per-layer content plus optional content-specific
 // shrink callbacks.
 type Input struct {
-	System         string
-	Memory         string
+	System string
+	// Memory 是已渲染的 L1 记忆块文本（兜底口径）。当 MemoryPrompt 非空时，
+	// 装配器改用结构化裁剪，本字段被忽略。
+	Memory string
+	// MemoryPrompt 是结构化的 L1 记忆块（文本 + 召回评分 + 是否常驻）。
+	// 提供它才能做"按相关性整条移除 + 常驻块整块降级"（FR-20），
+	// 而不是把渲染结果从尾部硬截断。
+	MemoryPrompt   MemoryPrompt
 	Retrieval      string
 	History        []Turn
 	HistorySummary string
@@ -74,17 +80,28 @@ type Result struct {
 	History   []Turn
 	Query     string
 	Diag      Diagnostics
+	// MemoryDropped 是因 L1 预算被整条移除的语义记忆条目数（FR-20 可观测）。
+	MemoryDropped int
+	// MemoryDegraded 报告常驻块是否整块降级为摘要形式。该决策是
+	// (常驻块成本, L1 预算) 的纯函数，因此在一个会话内天然稳定：
+	// 决策不变 → L1 渲染字节不变 → 稳定前缀不变（FR-11）。
+	MemoryDegraded bool
 }
 
 // Assemble applies the five-layer budget architecture:
 //
 //	L0 system    — fixed; hard-truncated at a boundary if it exceeds its share
-//	L1 memory    — fixed; tail-truncated (entries are relevance-ordered)
+//	L1 memory    — fixed; relevance-truncated entry-wise (structured blocks),
+//	               resident block kept whole or degraded whole (FR-20)
 //	L2 retrieval — elastic; shrunk via ShrinkRetrieval (tiering), then truncated
 //	L3 history   — elastic; old rounds compressed to summary, sticky preserved
 //	L4 query     — fixed; tail-truncated (tool results are pre-summarized upstream)
 //
 // Elastic layers yield unused budget to each other before any shrinking.
+//
+// 缓存前缀稳定性（FR-11）：L0/L1 的预算不随意图变化（见 budget.go），且这两层的
+// 裁剪都是 (内容, 预算) 的纯函数——相同输入必得相同字节输出；弹性互借只发生在
+// L2/L3/L4。Diagnostics.Actions 只用于可观测，绝不进入 prompt。
 func (a *Assembler) Assemble(in Input) Result {
 	budget := Allocate(in.Window, in.Intent, in.ReserveOutput, in.Override)
 	diag := Diagnostics{
@@ -98,21 +115,25 @@ func (a *Assembler) Assemble(in Input) Result {
 
 	// --- Fixed layers first: count, then truncate to their guaranteed share ---
 	system := a.fitFixed(in.System, budget.System, LayerSystem, &diag)
-	memory := a.fitFixed(in.Memory, budget.Memory, LayerMemory, &diag)
+	memory, memoryFit := a.fitMemory(in, budget.Memory, &diag)
 	query := a.fitFixed(in.Query, budget.Query, LayerQuery, &diag)
 
+	// L1 的让渡额 = L1 预算 − 记忆实际用量；由于记忆裁剪只按"整条/整块"发生，
+	// 让渡额天然是块粒度的，不会逐轮出现几 token 的抖动（FR-20 ③）。
 	fixedUsed := diag.UsedByLayer[LayerSystem] + diag.UsedByLayer[LayerMemory] + diag.UsedByLayer[LayerQuery]
 
 	// --- Elastic layers: redistribute slack between L2 and L3 ---
+	// 弹性池 = 可用窗口 − 固定层"实际"用量：L0/L1/L4 没用满的额度整体让渡给
+	// L2/L3（FR-20 ③）。因为 L1 的裁剪只按整条/整块发生，让渡额也是块粒度的，
+	// 不会出现逐轮几 token 的抖动。
 	elasticBudget := budget.Usable - fixedUsed
 	if elasticBudget < 0 {
 		elasticBudget = 0
 	}
 	l2Budget := budget.Retrieval
 	l3Budget := budget.History
-	if l2Budget+l3Budget > elasticBudget {
-		// Fixed layers ate into the elastic pool; scale down proportionally.
-		total := l2Budget + l3Budget
+	if total := l2Budget + l3Budget; total != elasticBudget {
+		// 按 profile 的相对权重双向缩放：固定层超支时收紧，固定层有富余时放开。
 		if total <= 0 {
 			total = 1
 		}
@@ -171,26 +192,57 @@ func (a *Assembler) Assemble(in Input) Result {
 	diag.UsedByLayer[LayerHistory] = a.countHistory(history)
 
 	return Result{
-		System:    system,
-		Memory:    memory,
-		Retrieval: retrieval,
-		History:   history,
-		Query:     query,
-		Diag:      diag,
+		System:         system,
+		Memory:         memory,
+		Retrieval:      retrieval,
+		History:        history,
+		Query:          query,
+		Diag:           diag,
+		MemoryDropped:  memoryFit.Dropped,
+		MemoryDegraded: memoryFit.Degraded,
 	}
 }
 
 // fitFixed counts a fixed layer and truncates it to its budget when needed.
+// 幂等：相同 (content, budget) 必得相同输出，且不引入任何随轮变化的信息
+// （时间戳、随机顺序等），这是稳定前缀字节级稳定的前提（FR-11 ①）。
 func (a *Assembler) fitFixed(content string, budget int, layer Layer, diag *Diagnostics) string {
 	diag.BudgetByLayer[layer] = budget
 	used := a.Counter.Count(content)
 	if used > budget {
 		content = TruncateToTokens(content, budget, a.Counter)
 		diag.Actions = append(diag.Actions, fmt.Sprintf("%s truncated %d -> %d tokens", layer, used, budget))
-		used = budget
+		used = a.Counter.Count(content)
 	}
 	diag.UsedByLayer[layer] = used
 	return content
+}
+
+// fitMemory 是 L1（记忆层）的专用裁剪，替代通用的尾部硬截断（FR-20）：
+//   - 提供结构化记忆块时：按召回评分从低到高整条移除，常驻块整块保留或整块降级；
+//   - 只有渲染文本时：退化为尾部硬截断（兜底，保证任何输入都不会突破 L1 预算）。
+//
+// 与 fitFixed 一样是纯函数：相同输入多轮渲染字节一致。
+func (a *Assembler) fitMemory(in Input, budget int, diag *Diagnostics) (string, MemoryFitResult) {
+	diag.BudgetByLayer[LayerMemory] = budget
+
+	var fit MemoryFitResult
+	if !in.MemoryPrompt.IsEmpty() {
+		fit = a.FitMemory(in.MemoryPrompt, budget)
+	} else {
+		fit.Text = in.Memory
+		fit.Used = a.Counter.Count(in.Memory)
+		if fit.Used > budget {
+			fit.Text = TruncateToTokens(in.Memory, budget, a.Counter)
+			fit.Actions = append(fit.Actions,
+				fmt.Sprintf("%s truncated %d -> %d tokens", LayerMemory, fit.Used, budget))
+			fit.Used = a.Counter.Count(fit.Text)
+		}
+	}
+
+	diag.UsedByLayer[LayerMemory] = fit.Used
+	diag.Actions = append(diag.Actions, fit.Actions...)
+	return fit.Text, fit
 }
 
 // countHistory sums tokens over history turns (user + assistant + framing).

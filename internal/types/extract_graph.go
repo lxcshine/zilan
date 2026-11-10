@@ -19,6 +19,10 @@ type GraphNode struct {
 	Name       string   `json:"name,omitempty"`
 	Chunks     []string `json:"chunks,omitempty"`
 	Attributes []string `json:"attributes,omitempty"`
+	// 检索身份字段只服务于图谱查询（graph-search），不属于抽取配置，
+	// 因此不参与 JSON / YAML 序列化，也不会出现在抽取提示词里。
+	ID          string `json:"-" yaml:"-"`
+	KnowledgeID string `json:"-" yaml:"-"`
 }
 
 // GraphRelation represents the relation of the graph
@@ -26,6 +30,11 @@ type GraphRelation struct {
 	Node1 string `json:"node1,omitempty"`
 	Node2 string `json:"node2,omitempty"`
 	Type  string `json:"type,omitempty"`
+	// Node1 / Node2 只用于展示；下面三个身份字段才真正指向文档实例，
+	// 同样不参与序列化。
+	ID       string `json:"-" yaml:"-"`
+	SourceID string `json:"-" yaml:"-"`
+	TargetID string `json:"-" yaml:"-"`
 }
 
 type GraphData struct {

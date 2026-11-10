@@ -67,7 +67,7 @@ const (
 
 type CustomFormatter struct {
 	ForceColor bool   // 是否强制使用颜色，即使在非终端环境下
-	Template   string // 自定义日志格式模板，通过 LOG_FORMAT 环境变量配置，为空则使用内置默认格式
+	Template   string // 自定义日志格式模板，通过 ZILAN_LOG_FORMAT（旧名 LOG_FORMAT，已废弃）配置，为空则使用内置默认格式
 	// 模板占位符：%d=时间 %level=级别 %thread=goroutine %logger=caller %traceId=请求ID %msg=消息+结构化字段
 
 	// threadNeeded 缓存模板是否引用了 %thread，避免每条日志都调用一次 runtime.Stack。
@@ -268,8 +268,13 @@ func ConfigureFromEnv() {
 		forceColor = (fi.Mode() & os.ModeCharDevice) != 0
 	}
 
-	// 设置日志格式而不修改全局时区
-	tmpl := resolveLogFormatFromEnv()
+	// 设置日志格式而不修改全局时区。模板校验失败时先回落默认格式继续输出
+	// （保证这条错误本身看得见），入口程序再通过 LogFormatConfigError 拒绝启动。
+	tmpl, tmplErr := resolveLogFormatFromEnv()
+	logFormatConfigErr = tmplErr
+	if tmplErr != nil {
+		fmt.Fprintf(os.Stderr, "logger: %v\n", tmplErr)
+	}
 	appLogger.SetFormatter(&CustomFormatter{
 		ForceColor:   forceColor,
 		Template:     tmpl,
@@ -346,11 +351,53 @@ func resolveLogPathFromEnv() string {
 	return defaultMacAppLogPath()
 }
 
-// resolveLogFormatFromEnv 从环境变量 LOG_FORMAT 读取自定义日志格式模板。
+// 日志格式模板的环境变量名。ZILAN_LOG_FORMAT 优先，LOG_FORMAT 已废弃但仍兼容。
+const (
+	logFormatEnv           = "ZILAN_LOG_FORMAT"
+	deprecatedLogFormatEnv = "LOG_FORMAT"
+)
+
+// logFormatConfigErr 记录最近一次 ConfigureFromEnv 的模板校验错误，
+// 由 loggerMu 保护。包初始化（init）时不能直接退出进程——那会让所有
+// 引用本包的测试与工具都起不来，因此错误先记在这里，由服务入口在启动
+// 早期通过 LogFormatConfigError 取出并拒绝启动（FR-08 条 4）。
+var logFormatConfigErr error
+
+// LogFormatConfigError 返回当前日志格式模板的校验错误，nil 表示配置有效。
+// 服务入口应在启动早期调用：模板缺少 %msg 时必须拒绝启动并给出明确错误，
+// 否则日志正文会被静默丢弃。
+func LogFormatConfigError() error {
+	loggerMu.Lock()
+	defer loggerMu.Unlock()
+	return logFormatConfigErr
+}
+
+// resolveLogFormatFromEnv 读取自定义日志格式模板。
+// 优先 ZILAN_LOG_FORMAT（用 LookupEnv，显式设为空串也算"已设置"），
+// 未设置时才回落到已废弃的 LOG_FORMAT 并给出提示。
 // 为空则使用内置默认格式；非空则作为模板，支持占位符：
 // %d=时间 %level=级别 %thread=goroutine %logger=caller %traceId=请求ID %msg=消息+结构化字段
-func resolveLogFormatFromEnv() string {
-	return strings.TrimSpace(os.Getenv("LOG_FORMAT"))
+//
+// 非空模板必须包含 %msg：消息主体是日志存在的理由，缺了它等于把日志正文藏起来。
+func resolveLogFormatFromEnv() (string, error) {
+	name := logFormatEnv
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		name = deprecatedLogFormatEnv
+		raw = os.Getenv(name)
+	}
+	tmpl := strings.TrimSpace(raw)
+	if tmpl == "" {
+		return "", nil
+	}
+	if !strings.Contains(tmpl, "%msg") {
+		return "", fmt.Errorf("日志格式模板 %s=%q 必须包含 %%msg（消息主体字段），"+
+			"否则日志正文会被丢弃；请修正该环境变量，或将其清空以使用默认格式", name, tmpl)
+	}
+	if name == deprecatedLogFormatEnv {
+		fmt.Fprintf(os.Stderr, "logger: %s 已废弃，请改用 %s\n", deprecatedLogFormatEnv, logFormatEnv)
+	}
+	return tmpl, nil
 }
 
 func defaultMacAppLogPath() string {

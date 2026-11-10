@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -9,7 +10,6 @@ import (
 	"image"
 	"image/color"
 	"image/png"
-	"bytes"
 	"strings"
 	"sync"
 	"time"
@@ -62,8 +62,8 @@ type captchaChallenge struct {
 }
 
 type captchaService struct {
-	challenges sync.Map // captchaID -> *captchaChallenge
-	tokens     sync.Map // captchaToken -> expiry
+	challenges    sync.Map // captchaID -> *captchaChallenge
+	tokens        sync.Map // captchaToken -> expiry
 	challengeType string
 }
 

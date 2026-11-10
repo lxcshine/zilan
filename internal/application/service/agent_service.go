@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent/approval"
 	"github.com/Tencent/WeKnora/internal/agent/skills"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/application/attachment"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -176,6 +177,9 @@ func (s *agentService) CreateAgentEngine(
 		return nil, fmt.Errorf("failed to register tools: %w", err)
 	}
 	s.registerMCPTools(ctx, toolRegistry, config, eventBus, sessionID, assistantMessageID)
+	// FR-22 ③：会话带有已存储附件时，为 read_file 挂上 attachment://，
+	// 让 Agent 按需读取文档/图片，而不是一次性把所有附件塞进上下文。
+	attachmentReader := s.registerAttachmentReader(ctx, toolRegistry, sessionID)
 
 	// 3. Resolve knowledge base and selected document metadata
 	kbInfos, selectedDocs := s.resolveKBAndDocInfos(ctx, config)
@@ -206,9 +210,20 @@ func (s *agentService) CreateAgentEngine(
 	// reliably support images in tool role messages across providers).
 	if config.VLMModelID != "" {
 		if vlmModel, err := s.modelService.GetVLMModel(ctx, config.VLMModelID); err == nil {
-			engine.SetImageDescriber(func(ctx context.Context, imgBytes []byte, prompt string) (string, error) {
+			describe := func(ctx context.Context, imgBytes []byte, prompt string) (string, error) {
 				return vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
-			})
+			}
+			engine.SetImageDescriber(describe)
+			// FR-22 ⑤：只有对话模型自己看不见图时，才给附件读取挂上图片理解。
+			// 视觉模型能直接看图，不必再多付一次 VLM 调用。
+			if attachmentReader != nil && !s.chatModelSupportsVision(ctx, chatModel) {
+				tenantID, _ := types.TenantIDFromContext(ctx)
+				attachmentReader.Images = &attachment.ImageReader{
+					Model:     config.VLMModelID,
+					Describe:  describe,
+					Cache:     newAgentAttachmentDescriptionCache(s.db, tenantID),
+				}
+			}
 			logger.Infof(ctx, "VLM image describer set for MCP tool result analysis (model: %s)", config.VLMModelID)
 		} else {
 			logger.Warnf(ctx, "Failed to load VLM model %s for MCP image fallback: %v", config.VLMModelID, err)

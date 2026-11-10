@@ -38,6 +38,14 @@ type ChatOptions struct {
 	ToolChoice          string          `json:"tool_choice,omitempty"`         // "auto", "required", "none", or specific tool
 	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"` // 是否允许并行工具调用（默认 nil 表示由模型决定）
 	Format              json.RawMessage `json:"format,omitempty"`              // 响应格式定义
+	// CacheRetention 控制供应商侧 prompt 缓存的 TTL 偏好（FR-11 ③）。空值表示
+	// 使用供应商默认的短缓存；CacheRetentionNone 显式关闭本次请求的缓存标记
+	// （摘要/压缩类一次性调用应当使用它，避免支付无谓的缓存写入成本）。
+	CacheRetention CacheRetention `json:"-"`
+	// PromptCacheKey 是缓存路由键（通常填会话 ID）：同一会话的多轮请求带上同一个
+	// 键，供应商/网关就能把它们路由到同一个缓存分片，稳定前缀才可能命中。
+	// 仅在供应商支持时下发（见 resolvePromptCacheSupport），长度会被裁剪到 64。
+	PromptCacheKey string `json:"-"`
 }
 
 // MessageContentPart represents a part of multi-content message

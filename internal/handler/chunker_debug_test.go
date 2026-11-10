@@ -197,3 +197,134 @@ func TestPreviewChunking_ChunkTruncation(t *testing.T) {
 		t.Errorf("stats.truncated_to should reflect ORIGINAL count > %d, got %v", previewMaxChunks, truncated)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// FR-15 规则④：切分策略与结果必须在知识库详情页可见。预览接口是这条规则的
+// 数据来源，它必须回传命中的策略档、尝试过的策略链、每档被拒的原因以及文档画像。
+// ---------------------------------------------------------------------------
+
+func fr15HeadingSample() string {
+	var sb strings.Builder
+	sb.WriteString("# 第一章 总览\n\n")
+	for i := 0; i < 5; i++ {
+		sb.WriteString("## 小节 " + string(rune('A'+i)) + "\n\n")
+		sb.WriteString(strings.Repeat("这一段的正文内容用来撑满一个小节。", 20))
+		sb.WriteString("\n\n")
+	}
+	return sb.String()
+}
+
+func TestPreviewChunking_FR15_ExposesTierChainAndProfile(t *testing.T) {
+	w, parsed := postPreview(t, PreviewChunkingRequest{
+		Text: fr15HeadingSample(),
+		ChunkingConfig: PreviewChunkingPayload{
+			ChunkSize:    600,
+			ChunkOverlap: 60,
+			Separators:   []string{"\n\n", "\n"},
+			Strategy:     "auto",
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", w.Code, w.Body.String())
+	}
+	data := parsed["data"].(map[string]any)
+
+	if got, _ := data["selected_tier"].(string); got != string(chunker.TierHeading) {
+		t.Errorf("selected_tier = %v, want %s", data["selected_tier"], chunker.TierHeading)
+	}
+	chain, ok := data["tier_chain"].([]any)
+	if !ok || len(chain) == 0 {
+		t.Fatalf("tier_chain must list the attempted tiers, got %v", data["tier_chain"])
+	}
+	if chain[0] != string(chunker.TierHeading) {
+		t.Errorf("tier_chain[0] = %v, want %s", chain[0], chunker.TierHeading)
+	}
+	if chain[len(chain)-1] != string(chunker.TierLegacy) {
+		t.Errorf("tier_chain must end with the legacy fallback, got %v", chain[len(chain)-1])
+	}
+	// rejected is present (nil/null when nothing was rejected) so the UI can
+	// always render the row.
+	if _, present := data["rejected"]; !present {
+		t.Error("rejected must be part of the response contract")
+	}
+
+	profile, ok := data["profile"].(map[string]any)
+	if !ok {
+		t.Fatalf("profile must be an object, got %T", data["profile"])
+	}
+	if total, _ := profile["md_heading_total"].(float64); total < 3 {
+		t.Errorf("profile.md_heading_total = %v, want >= 3", profile["md_heading_total"])
+	}
+	for _, key := range []string{"total_chars", "total_lines", "form_feed_count", "chinese_chapter_count", "detected_langs"} {
+		if _, present := profile[key]; !present {
+			t.Errorf("profile is missing %s — the debug panel renders it", key)
+		}
+	}
+}
+
+func TestPreviewChunking_FR15_RejectionReasonsVisible(t *testing.T) {
+	// Twelve sibling H1 sections that are each far below the tiny-chunk floor:
+	// the heading tier is rejected and the chain falls back to legacy.
+	var sb strings.Builder
+	for i := 0; i < 12; i++ {
+		sb.WriteString("# H" + string(rune('0'+i)) + "\nshort body.\n\n")
+	}
+	w, parsed := postPreview(t, PreviewChunkingRequest{
+		Text: sb.String(),
+		ChunkingConfig: PreviewChunkingPayload{
+			ChunkSize:    400,
+			ChunkOverlap: 20,
+			Separators:   []string{"\n\n", "\n"},
+			Strategy:     "auto",
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", w.Code, w.Body.String())
+	}
+	data := parsed["data"].(map[string]any)
+	if got, _ := data["selected_tier"].(string); got != string(chunker.TierLegacy) {
+		t.Errorf("selected_tier = %v, want %s after rejection", data["selected_tier"], chunker.TierLegacy)
+	}
+	rejected, ok := data["rejected"].([]any)
+	if !ok || len(rejected) == 0 {
+		t.Fatalf("rejected should explain the fallback, got %v", data["rejected"])
+	}
+	first, ok := rejected[0].(map[string]any)
+	if !ok {
+		t.Fatalf("rejected[0] must be an object, got %T", rejected[0])
+	}
+	if first["tier"] != string(chunker.TierHeading) {
+		t.Errorf("rejected[0].tier = %v, want %s", first["tier"], chunker.TierHeading)
+	}
+	if reason, _ := first["reason"].(string); reason == "" {
+		t.Errorf("rejected[0].reason must be non-empty: %v", first)
+	}
+}
+
+// 存量兼容（PRD §5.4）：知识库没有显式选择策略时前端传空字符串，预览必须显示
+// legacy 档，且 tier_chain 不包含任何结构感知档位。
+func TestPreviewChunking_FR15_EmptyStrategyStaysLegacy(t *testing.T) {
+	w, parsed := postPreview(t, PreviewChunkingRequest{
+		Text: fr15HeadingSample(),
+		ChunkingConfig: PreviewChunkingPayload{
+			ChunkSize:    600,
+			ChunkOverlap: 60,
+			Separators:   []string{"\n\n", "\n"},
+			Strategy:     "",
+		},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d body=%s", w.Code, w.Body.String())
+	}
+	data := parsed["data"].(map[string]any)
+	if got, _ := data["selected_tier"].(string); got != string(chunker.TierLegacy) {
+		t.Errorf("selected_tier = %v, want %s for an empty (存量) strategy", data["selected_tier"], chunker.TierLegacy)
+	}
+	chain, ok := data["tier_chain"].([]any)
+	if !ok || len(chain) != 1 || chain[0] != string(chunker.TierLegacy) {
+		t.Errorf("tier_chain = %v, want [legacy] only", data["tier_chain"])
+	}
+	if data["profile"] == nil {
+		t.Error("profile should still be materialized so the panel shows document stats")
+	}
+}

@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/models/provider"
 	"github.com/Tencent/WeKnora/internal/models/utils"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 )
 
@@ -116,12 +116,14 @@ func (e *WeKnoraCloudEmbedder) BatchEmbed(ctx context.Context, texts []string) (
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("weknoracloud embedder: status %d: %s", resp.StatusCode, secutils.ReadErrorPreview(resp.Body))
+	}
+
+	// 响应体受上界约束（FR-07）：超限直接报错，不把无界内容读进内存。
+	respBytes, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("weknoracloud embedder: read response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("weknoracloud embedder: status %d: %s", resp.StatusCode, string(respBytes))
 	}
 
 	var embedResp weKnoraCloudEmbedResponse

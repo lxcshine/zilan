@@ -1,0 +1,2 @@
+ALTER TABLE messages DROP COLUMN IF EXISTS context_stats;
+ALTER TABLE messages DROP COLUMN IF EXISTS usage;

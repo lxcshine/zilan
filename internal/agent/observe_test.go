@@ -164,7 +164,7 @@ func TestAppendToolResults_PreservesReasoningContent(t *testing.T) {
 	})
 }
 
-func TestAppendToolResults_AddsDynamicImageRequirementToCustomSystemPrompt(t *testing.T) {
+func TestAppendToolResults_AddsDynamicImageRequirementAfterStablePrefix(t *testing.T) {
 	engine := &AgentEngine{}
 	prior := []chat.Message{
 		{Role: "system", Content: "Custom agent prompt."},
@@ -182,17 +182,23 @@ func TestAppendToolResults_AddsDynamicImageRequirementToCustomSystemPrompt(t *te
 	}
 
 	out := engine.appendToolResults(prior, step)
-	require.Len(t, out, 4)
-	assert.Contains(t, out[0].Content, "Custom agent prompt.")
-	assert.Contains(t, out[0].Content, agentRetrievedImageRequirementMarker)
-	assert.Contains(t, out[0].Content, "MUST include at least one relevant Markdown image")
-	assert.Contains(t, out[0].Content, "ASCII half-width parentheses")
-	assert.Equal(t, "tool", out[3].Role)
-	assert.Contains(t, out[3].Content, "![流程图](resource://AbCdEfGhIjKlMnOpQrStUv)")
+	require.Len(t, out, 5)
+	// 稳定前缀不得被改写：系统提示保持字节级不变，厂商 prompt 缓存才不会被击穿（FR-11）。
+	assert.Equal(t, "Custom agent prompt.", out[0].Content)
+	assert.Equal(t, "user", out[2].Role)
+	assert.Contains(t, out[2].Content, agentRetrievedImageRequirementMarker)
+	assert.Contains(t, out[2].Content, "MUST include at least one relevant Markdown image")
+	assert.Contains(t, out[2].Content, "ASCII half-width parentheses")
+	assert.Equal(t, "tool", out[4].Role)
+	assert.Contains(t, out[4].Content, "![流程图](resource://AbCdEfGhIjKlMnOpQrStUv)")
 
-	// A later image-bearing step must not duplicate the system requirement.
+	// A later image-bearing step must not duplicate the requirement.
 	out = engine.appendToolResults(out, step)
-	assert.Equal(t, 1, strings.Count(out[0].Content, agentRetrievedImageRequirementMarker))
+	markerCount := 0
+	for _, msg := range out {
+		markerCount += strings.Count(msg.Content, agentRetrievedImageRequirementMarker)
+	}
+	assert.Equal(t, 1, markerCount)
 }
 
 func TestBuildRuntimeContextBlock_PinnedDocuments(t *testing.T) {

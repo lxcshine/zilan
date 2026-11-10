@@ -22,6 +22,9 @@ type ResourceRepository interface {
 	GetByID(ctx context.Context, id string) (*types.StoredResource, error)
 	GetByHandle(ctx context.Context, handle string) (*types.StoredResource, error)
 	GetByTenantLocation(ctx context.Context, tenantID uint64, locationHash string) (*types.StoredResource, error)
+	// GetActiveByContentHash resolves identical bytes already registered
+	// under any physical location（FR-18 规则 5：相同图片字节复用同一资源句柄）。
+	GetActiveByContentHash(ctx context.Context, tenantID uint64, contentHash string) (*types.StoredResource, error)
 	MarkDeleted(ctx context.Context, id string) error
 	CreateBinding(ctx context.Context, binding *types.ResourceBinding) error
 	CreateGrant(ctx context.Context, grant *types.ResourceAccessGrant) error
@@ -43,6 +46,10 @@ type ResourceRegistration struct {
 // locations and manages their access capabilities.
 type ResourceCatalog interface {
 	Register(ctx context.Context, tenantID uint64, physicalPath string, meta ResourceRegistration) (string, error)
+	// ReuseByContentHash resolves identical bytes already registered, so a
+	// repeated payload reuses one stored object instead of being written again
+	//（FR-18 规则 5）。ok is false when no live resource carries the hash.
+	ReuseByContentHash(ctx context.Context, tenantID uint64, contentHash string) (ref string, ok bool, err error)
 	Resolve(ctx context.Context, reference string) (*types.StoredResource, error)
 	ResolvePath(ctx context.Context, value string) (string, *types.StoredResource, error)
 	Bind(ctx context.Context, reference, ownerType, ownerID, relation string) error

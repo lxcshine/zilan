@@ -22,10 +22,14 @@ func TestNewSSRFSafeTransport_SharedAcrossClients(t *testing.T) {
 	if first == second {
 		t.Fatal("expected distinct HTTP clients")
 	}
-	if first.Transport != second.Transport {
+	// 客户端的 Transport 现在统一是 SSRFValidatingRoundTripper 兜底包装，
+	// 连接池共享与否要看它包着的 Base。
+	firstBase := unwrapSSRFBase(t, first)
+	secondBase := unwrapSSRFBase(t, second)
+	if firstBase != secondBase {
 		t.Fatal("expected clients to share the same transport")
 	}
-	if first.Transport != http.RoundTripper(shared) {
+	if firstBase != http.RoundTripper(shared) {
 		t.Fatal("expected client to use the supplied shared transport")
 	}
 	if first.Timeout != 15*time.Second {
@@ -46,10 +50,24 @@ func TestNewSSRFSafeHTTPClient_HasDedicatedTransport(t *testing.T) {
 	if client.Transport == nil {
 		t.Fatal("expected a transport to be set")
 	}
-	if _, ok := client.Transport.(*http.Transport); !ok {
-		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	base := unwrapSSRFBase(t, client)
+	if _, ok := base.(*http.Transport); !ok {
+		t.Fatalf("expected *http.Transport under the SSRF wrapper, got %T", base)
 	}
 	if client.CheckRedirect == nil {
 		t.Fatal("expected SSRF redirect policy to be set")
 	}
+}
+
+// unwrapSSRFBase 取出 SSRFValidatingRoundTripper 包装的真实 transport。
+func unwrapSSRFBase(t *testing.T, client *http.Client) http.RoundTripper {
+	t.Helper()
+	wrapper, ok := client.Transport.(*SSRFValidatingRoundTripper)
+	if !ok {
+		t.Fatalf("expected *SSRFValidatingRoundTripper, got %T", client.Transport)
+	}
+	if wrapper.Base == nil {
+		t.Fatal("SSRFValidatingRoundTripper has no base transport")
+	}
+	return wrapper.Base
 }

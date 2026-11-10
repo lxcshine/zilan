@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/Tencent/WeKnora/internal/agent/compaction"
 	"github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -14,6 +15,14 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/types"
 )
+
+// checkpointAwareEngine 是引擎的可选能力（PRD FR-10）：接受本轮的轮次身份视图，
+// 并把压缩产出的检查点写回会话。声明成局部接口是为了不把这两个 setter 加进
+// interfaces.AgentEngine——那会要求每一个引擎替身都实现压缩检查点。
+type checkpointAwareEngine interface {
+	SetContextCheckpointSink(sink types.ContextCheckpointSink)
+	SetHistoryCheckpointView(view *compaction.HistoryView)
+}
 
 // AgentQA performs agent-based question answering with conversation history and streaming support
 // customAgent is optional - if provided, uses custom agent configuration instead of tenant defaults
@@ -124,17 +133,26 @@ func (s *sessionService) AgentQA(
 	// tried last turn — except final_answer, which is replayed as the trailing
 	// canonical assistant message.
 	var llmContext []chat.Message
+	// historyView 是本轮装载历史得到的轮次身份视图，压缩据此产出可持久化的检查点
+	// （PRD FR-10）。
+	var historyView *compaction.HistoryView
+	checkpointReused := false
 	if agentConfig.MultiTurnEnabled {
 		historyTurns := agentConfig.HistoryTurns
 		if historyTurns <= 0 {
 			historyTurns = 5
 		}
-		llmContext, err = LoadAgentHistory(ctx, s.messageRepo, sessionID, historyTurns)
-		if err != nil {
-			logger.Warnf(ctx, "Failed to load agent history from DB: %v, continuing without history", err)
+		history, loadErr := LoadAgentHistory(ctx, s.messageRepo, sessionID, historyTurns)
+		if loadErr != nil {
+			logger.Warnf(ctx, "Failed to load agent history from DB: %v, continuing without history", loadErr)
 			llmContext = []chat.Message{}
+		} else {
+			llmContext = history.Messages
+			historyView = history.View
+			checkpointReused = history.Reused
 		}
-		logger.Infof(ctx, "Loaded %d history messages from DB (turns=%d)", len(llmContext), historyTurns)
+		logger.Infof(ctx, "Loaded %d history messages from DB (turns=%d, checkpoint_reused=%v)",
+			len(llmContext), historyTurns, checkpointReused)
 	} else {
 		logger.Infof(ctx, "Multi-turn disabled for this agent, running without history")
 		llmContext = []chat.Message{}
@@ -154,6 +172,13 @@ func (s *sessionService) AgentQA(
 	if err != nil {
 		logger.Errorf(ctx, "Failed to create agent engine: %v", err)
 		return err
+	}
+
+	// FR-10：把轮次身份视图与检查点写入通道交给引擎，压缩产出的摘要才能落到它所覆盖
+	// 的那一轮上，并在下一轮（乃至会话恢复后）被复用。
+	if aware, ok := engine.(checkpointAwareEngine); ok {
+		aware.SetHistoryCheckpointView(historyView)
+		aware.SetContextCheckpointSink(NewMessageCheckpointSink(s.messageRepo, sessionID))
 	}
 
 	// Route image data based on agent model's vision capability

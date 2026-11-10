@@ -25,7 +25,9 @@ type channelRankedList struct {
 //
 //	rrf(d) = Σ_c  w_c / (k + rank_c(d))
 //
-// where k is the RRF smoothing constant (default 60). Documents absent from a
+// where k is the RRF smoothing constant. k 由调用方从工作区级检索配置
+// （RetrievalConfig.GetEffectiveRRFK）取得；传入非正数时兜底为 60，即
+// 配置缺省时的历史默认值，保证默认行为不变。Documents absent from a
 // channel contribute 0 for that channel. The fused list is sorted by rrf desc.
 //
 // Design notes (section 2.4 of the retrieval optimization):
@@ -42,6 +44,7 @@ func fuseChannelsWithWeightedRRF(
 	k int,
 ) []*types.SearchResult {
 	if k <= 0 {
+		// 兜底：配置里没写 RRFK（或写了非正数）时沿用历史默认值 60。
 		k = 60
 	}
 

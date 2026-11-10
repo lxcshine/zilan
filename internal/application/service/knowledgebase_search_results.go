@@ -84,10 +84,31 @@ func (s *knowledgeBaseService) processSearchResults(ctx context.Context,
 	// Build final search results
 	searchResults := s.assembleSearchResults(ctx, chunks, chunkMap, knowledgeMap, index, skipEnrichment)
 
+	// FR-17 图文共空间检索：在任何合并/富化改写 ImageInfo 之前，把
+	// image_vector 行（图片腿命中）摘录为图片证据——自身行保留为
+	// pictorial 命中，同库文本行继承 MatchedImages，供后续图片重排与
+	// 视觉上下文注入使用。
+	searchutil.CaptureImageEvidence(searchResults)
+
 	searchutil.EnrichSearchResultsImageInfo(ctx, s.chunkRepo, tenantID, searchResults)
 
-	logger.Infof(ctx, "Search results processed, total: %d", len(searchResults))
+	// FR-17 图片腿过滤：陈旧/低于图片腿阈值的 image_vector 行在此移除
+	// （文本行不受影响，图片行被移除不阻断文本检索——§5.3）。这里不掌握
+	// 调用方的向量阈值，传 0 让 filterImageHits 应用图片腿自身的下限
+	// （ImageVectorThreshold）。
+	searchResults, keptImages := filterImageHits(ctx, searchResults, 0)
+
+	logger.Infof(ctx, "Search results processed, total: %d (kept image hits: %d)", len(searchResults), keptImages)
 	return searchResults, nil
+}
+
+// vectorScoreForMatchType 记录向量命中的原始相似度（FR-17）：仅向量腿
+// 命中行的 Score 即向量分，其余（关键词/父子/相邻等）行无向量分。
+func vectorScoreForMatchType(matchType types.MatchType, score float64) float64 {
+	if matchType == types.MatchTypeEmbedding {
+		return score
+	}
+	return 0
 }
 
 // chunkIndex holds pre-computed lookup structures for processing search results.
@@ -307,27 +328,29 @@ func (s *knowledgeBaseService) buildSearchResult(chunk *types.Chunk,
 	matchedContent string,
 ) *types.SearchResult {
 	return &types.SearchResult{
-		ID:                chunk.ID,
-		Content:           chunk.Content,
-		KnowledgeID:       chunk.KnowledgeID,
-		ChunkIndex:        chunk.ChunkIndex,
-		KnowledgeTitle:    knowledge.Title,
-		StartAt:           chunk.StartAt,
-		EndAt:             chunk.EndAt,
-		Seq:               chunk.ChunkIndex,
-		Score:             score,
-		MatchType:         matchType,
-		Metadata:          knowledge.GetMetadata(),
-		ChunkType:         string(chunk.ChunkType),
-		ParentChunkID:     chunk.ParentChunkID,
-		ImageInfo:         chunk.ImageInfo,
+		ID:                   chunk.ID,
+		Content:              chunk.Content,
+		KnowledgeID:          chunk.KnowledgeID,
+		ChunkIndex:           chunk.ChunkIndex,
+		KnowledgeTitle:       knowledge.Title,
+		StartAt:              chunk.StartAt,
+		EndAt:                chunk.EndAt,
+		Seq:                  chunk.ChunkIndex,
+		Score:                score,
+		VectorScore:          vectorScoreForMatchType(matchType, score),
+		MatchType:            matchType,
+		Metadata:             knowledge.GetMetadata(),
+		ChunkType:            string(chunk.ChunkType),
+		ParentChunkID:        chunk.ParentChunkID,
+		ImageInfo:            chunk.ImageInfo,
 		KnowledgeFilename:    knowledge.FileName,
 		KnowledgeSource:      knowledge.Source,
 		KnowledgeChannel:     knowledge.Channel,
 		KnowledgeDescription: knowledge.Description,
-		ChunkMetadata:     chunk.Metadata,
-		MatchedContent:    matchedContent,
-		KnowledgeBaseID:   knowledge.KnowledgeBaseID,
+		ChunkMetadata:        chunk.Metadata,
+		MatchedContent:       matchedContent,
+		KnowledgeBaseID:      knowledge.KnowledgeBaseID,
+		SourceLocators:       chunk.SourceLocators, // FR-05 引用溯源定位
 	}
 }
 

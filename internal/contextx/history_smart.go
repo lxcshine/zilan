@@ -199,6 +199,53 @@ func DefaultSmartHistoryConfig() SmartHistoryConfig {
 	return SmartHistoryConfig{RecentRounds: 4, ChunkRounds: 6, MaxSummaryTokens: 800}
 }
 
+// Normalize fills zero-valued fields with the defaults. SmartCompress and its
+// callers must agree on the effective config: the caller needs SplitPoint to
+// know which rounds were folded into the summary, so the running summary can be
+// cached as a compaction checkpoint instead of being recomputed every turn.
+func (c SmartHistoryConfig) Normalize() SmartHistoryConfig {
+	d := DefaultSmartHistoryConfig()
+	if c.RecentRounds <= 0 {
+		c.RecentRounds = d.RecentRounds
+	}
+	if c.ChunkRounds <= 0 {
+		c.ChunkRounds = d.ChunkRounds
+	}
+	if c.MaxSummaryTokens <= 0 {
+		c.MaxSummaryTokens = d.MaxSummaryTokens
+	}
+	return c
+}
+
+// SplitPoint returns the [old | recent] boundary of a history of historyLen
+// rounds: rounds before it are candidates for the running summary, rounds from
+// it on are kept verbatim. A result <= 0 means there is nothing to compress,
+// and SmartCompress will not call the summarizer at all.
+func (c SmartHistoryConfig) SplitPoint(historyLen int) int {
+	split := historyLen - c.Normalize().RecentRounds
+	if split < 0 {
+		return 0
+	}
+	return split
+}
+
+// SmartCompressReport reports what one incremental compression actually did.
+// A caller may only cache the returned summary as a compaction checkpoint for
+// the rounds that were genuinely folded into it (CompressedRounds), otherwise
+// rounds would be dropped from the context without anything standing in for
+// them.
+type SmartCompressReport struct {
+	// CompressedRounds is the number of old rounds folded into the summary.
+	// Zero means the summarizer was never called (nothing compressible, or no
+	// summarize function), so no round is covered by the summary.
+	CompressedRounds int
+	// StickyKeptRounds is the number of old rounds kept verbatim because they
+	// carry durable information (decisions, deadlines, key numbers).
+	StickyKeptRounds int
+	// SummarizeCalls is the number of summarizer round-trips (map + reduce).
+	SummarizeCalls int
+}
+
 const mapSummaryPrompt = `You are compressing old conversation rounds into a dense running summary.
 
 Rules:
@@ -239,27 +286,31 @@ func SmartCompress(
 	summarize SummarizeFunc,
 	counter *Counter,
 ) (summary string, kept []Turn, err error) {
-	if cfg.RecentRounds <= 0 || cfg.ChunkRounds <= 0 || cfg.MaxSummaryTokens <= 0 {
-		d := DefaultSmartHistoryConfig()
-		if cfg.RecentRounds <= 0 {
-			cfg.RecentRounds = d.RecentRounds
-		}
-		if cfg.ChunkRounds <= 0 {
-			cfg.ChunkRounds = d.ChunkRounds
-		}
-		if cfg.MaxSummaryTokens <= 0 {
-			cfg.MaxSummaryTokens = d.MaxSummaryTokens
-		}
-	}
+	summary, kept, _, err = SmartCompressWithReport(ctx, history, existingSummary, cfg, summarize, counter)
+	return summary, kept, err
+}
+
+// SmartCompressWithReport is SmartCompress plus a report of what was actually
+// folded into the summary. A caller caching the summary as a compaction
+// checkpoint (PRD FR-10) needs it: only rounds that genuinely reached the
+// summarizer are covered by the summary.
+func SmartCompressWithReport(
+	ctx context.Context,
+	history []Turn,
+	existingSummary string,
+	cfg SmartHistoryConfig,
+	summarize SummarizeFunc,
+	counter *Counter,
+) (summary string, kept []Turn, report SmartCompressReport, err error) {
+	cfg = cfg.Normalize()
 	if counter == nil {
 		counter = NewCounter(VendorGeneric)
 	}
 
-	if len(history) <= cfg.RecentRounds {
-		return existingSummary, history, nil
+	splitAt := cfg.SplitPoint(len(history))
+	if splitAt <= 0 {
+		return existingSummary, history, report, nil
 	}
-
-	splitAt := len(history) - cfg.RecentRounds
 	old, recent := history[:splitAt], history[splitAt:]
 
 	// Sticky rounds in the old region are kept verbatim, not summarized.
@@ -272,6 +323,7 @@ func SmartCompress(
 			compressible = append(compressible, t)
 		}
 	}
+	report.StickyKeptRounds = len(sticky)
 
 	summary = existingSummary
 	if len(compressible) > 0 && summarize != nil {
@@ -287,10 +339,11 @@ func SmartCompress(
 				b.WriteString("User: " + t.User + "\nAssistant: " + t.Assistant + "\n\n")
 			}
 			part, mapErr := summarize(ctx, fmt.Sprintf(mapSummaryPrompt, cfg.MaxSummaryTokens/2, b.String()))
+			report.SummarizeCalls++
 			if mapErr != nil {
 				// Best effort: on LLM failure keep the raw rounds rather than
 				// losing information.
-				return existingSummary, history, mapErr
+				return existingSummary, history, SmartCompressReport{}, mapErr
 			}
 			part = strings.TrimSpace(part)
 			if part != "" {
@@ -302,12 +355,14 @@ func SmartCompress(
 		if len(partials) > 0 {
 			merged, redErr := summarize(ctx, fmt.Sprintf(reduceSummaryPrompt,
 				cfg.MaxSummaryTokens, existingSummary, strings.Join(partials, "\n---\n")))
+			report.SummarizeCalls++
 			if redErr != nil {
-				return existingSummary, history, redErr
+				return existingSummary, history, SmartCompressReport{}, redErr
 			}
 			if merged = strings.TrimSpace(merged); merged != "" {
 				summary = merged
 			}
+			report.CompressedRounds = len(compressible)
 		}
 	}
 
@@ -319,5 +374,5 @@ func SmartCompress(
 	// Final order: sticky rounds (chronological) then recent rounds.
 	kept = append(kept, sticky...)
 	kept = append(kept, recent...)
-	return summary, kept, nil
+	return summary, kept, report, nil
 }

@@ -57,6 +57,16 @@ type MessageService interface {
 
 	// GetChatHistoryKBStats returns statistics about the chat history knowledge base (indexed message count, etc.)
 	GetChatHistoryKBStats(ctx context.Context) (*types.ChatHistoryKBStats, error)
+
+	// GetLatestContextCheckpoint returns the newest assistant message of the session
+	// carrying a context compaction checkpoint (PRD FR-10), or nil when there is none.
+	GetLatestContextCheckpoint(ctx context.Context, sessionID string) (*types.Message, error)
+
+	// SaveContextCheckpoint writes the compaction checkpoint onto one assistant message
+	// of the session, replacing any earlier checkpoint there (PRD FR-10).
+	SaveContextCheckpoint(
+		ctx context.Context, sessionID, messageID string, checkpoint *types.ContextCheckpoint,
+	) error
 }
 
 // MessageRepository defines the message repository interface
@@ -95,4 +105,12 @@ type MessageRepository interface {
 	GetKnowledgeIDsBySessionID(ctx context.Context, sessionID string) ([]string, error)
 	// UpdateMessageKnowledgeID updates the knowledge_id field for a message
 	UpdateMessageKnowledgeID(ctx context.Context, messageID string, knowledgeID string) error
+	// UpdateMessageContextCheckpoint writes only the context_checkpoint column of an
+	// assistant message (PRD FR-10). It errors when no such row exists in the session.
+	UpdateMessageContextCheckpoint(
+		ctx context.Context, sessionID, messageID string, checkpoint *types.ContextCheckpoint,
+	) error
+	// GetLatestContextCheckpoint returns the newest assistant message of the session
+	// carrying a context compaction checkpoint (PRD FR-10), or nil when there is none.
+	GetLatestContextCheckpoint(ctx context.Context, sessionID string) (*types.Message, error)
 }

@@ -984,6 +984,67 @@ func applyKnowledgeBaseEnvOverrides(cfg *Config) {
 			cfg.KnowledgeBase.DocReaderCallTimeout = d
 		}
 	}
+	// FR-14 ③：外层 DocReader 调用超时必须严格大于 MinerU 的内层解析预算，
+	// 否则会出现"内层还在跑、外层已放弃"的资源浪费。
+	cfg.KnowledgeBase.DocReaderCallTimeout = ensureDocReaderTimeoutCoversMinerU(
+		cfg.KnowledgeBase.DocReaderCallTimeout, MinerUInnerBudget())
+}
+
+// MinerU 的内层解析预算（FR-14 ③）。真正的预算由
+// internal/infrastructure/docparser 持有，这里按同一组环境变量与默认值独立
+// 计算：config 不能 import docparser（那会把 models/agent/sandbox 整棵依赖树
+// 拖进配置层，并且一旦其中任何包反过来 import config 就会成环）。
+// 常量与 docparser 的一致性由 mineru_inner_budget_test.go 守护。
+const (
+	// minerUInnerTimeoutEnv 自建 MinerU 单次解析预算的环境变量。
+	minerUInnerTimeoutEnv = "WEKNORA_MINERU_TIMEOUT"
+	// minerUCloudInnerTimeoutEnv 云端批次时长预算的环境变量。
+	minerUCloudInnerTimeoutEnv = "WEKNORA_MINERU_CLOUD_TIMEOUT"
+
+	// defaultMinerUInnerTimeout 自建 MinerU 的内层预算默认值（1000s）。
+	defaultMinerUInnerTimeout = 1000 * time.Second
+	// defaultMinerUCloudInnerTimeout 云端批次的内层预算默认值（30min）。
+	defaultMinerUCloudInnerTimeout = 30 * time.Minute
+
+	// docReaderTimeoutHeadroom 抬升外层超时时预留的余量：外层除等待内层解析，
+	// 还要覆盖上传、产物下载与结果落库。
+	docReaderTimeoutHeadroom = 5 * time.Minute
+)
+
+// MinerUInnerBudget 返回 MinerU 解析的内层时长预算，取自建与云端两条路径中
+// 较大者（外层必须能覆盖最慢的那条）。env 未设置、非法或非正时回落默认值，
+// 与 docparser 的解析规则一致：配置错误只会更严格，不会被静默放大。
+func MinerUInnerBudget() time.Duration {
+	self := durationFromEnvOr(minerUInnerTimeoutEnv, defaultMinerUInnerTimeout)
+	cloud := durationFromEnvOr(minerUCloudInnerTimeoutEnv, defaultMinerUCloudInnerTimeout)
+	if cloud > self {
+		return cloud
+	}
+	return self
+}
+
+func durationFromEnvOr(env string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(env))
+	if value == "" {
+		return fallback
+	}
+	if d, err := time.ParseDuration(value); err == nil && d > 0 {
+		return d
+	}
+	return fallback
+}
+
+// ensureDocReaderTimeoutCoversMinerU 保证外层超时严格大于内层预算：
+// 相等或倒挂时告警并抬升到 内层 + docReaderTimeoutHeadroom。
+func ensureDocReaderTimeoutCoversMinerU(outer, inner time.Duration) time.Duration {
+	if inner <= 0 || outer > inner {
+		return outer
+	}
+	raised := inner + docReaderTimeoutHeadroom
+	fmt.Printf("Warning: knowledge_base.docreader_call_timeout (%s) must be strictly greater than "+
+		"the MinerU inner parse budget (%s, from %s / %s); raising it to %s\n",
+		outer, inner, minerUInnerTimeoutEnv, minerUCloudInnerTimeoutEnv, raised)
+	return raised
 }
 
 func applyAgentEnvOverrides(cfg *Config) {

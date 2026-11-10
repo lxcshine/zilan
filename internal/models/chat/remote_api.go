@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -36,6 +35,9 @@ type RemoteAPIChat struct {
 	adapter providerAdapter
 	// thinkingOverride 来自 extra_config.thinking_control，非 nil 时覆盖 adapter.Thinking()。
 	thinkingOverride ThinkingStrategy
+	// cacheSupport 是该供应商已验证的 prompt 缓存标记能力（FR-11 ③），
+	// 构造时按 provider/model + extra_config 解析一次。
+	cacheSupport promptCacheSupport
 }
 
 // NewRemoteAPIChat 创建远程 API 聊天实例
@@ -89,6 +91,11 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 			modelName = override
 		}
 	}
+
+	// 会话亲和 header（FR-11 ③）：必须在自定义 header 包装之后再套一层，
+	// 否则会被 CustomHeaders 的包装覆盖掉。上下文里没有缓存路由键时该层完全透传。
+	config.HTTPClient = wrapSessionAffinityClient(config.HTTPClient)
+
 	if providerName == provider.ProviderWeKnoraCloud {
 		if chatConfig.AppID == "" {
 			return nil, fmt.Errorf("WeKnoraCloud provider: AppID is required")
@@ -110,6 +117,7 @@ func NewRemoteAPIChat(chatConfig *ChatConfig) (*RemoteAPIChat, error) {
 		customHeaders:    chatConfig.CustomHeaders,
 		adapter:          resolveProvider(providerName, modelName),
 		thinkingOverride: parseThinkingOverride(chatConfig.ExtraConfig),
+		cacheSupport:     resolvePromptCacheSupport(providerName, modelName, chatConfig.ExtraConfig),
 	}, nil
 }
 
@@ -146,7 +154,7 @@ func (c *RemoteAPIChat) buildOutbound(
 	if customBody != nil {
 		body = customBody
 	}
-	body, err = c.shapeProviderRequest(body, req, messages)
+	body, err = c.shapeProviderRequest(body, req, messages, opts)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -169,6 +177,9 @@ func (c *RemoteAPIChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	// 调用方若显式设置了更短或更长的 deadline，都会被原样尊重。
 	timeoutCtx, cancel := withLLMTimeout(ctx, defaultChatTimeout)
 	defer cancel()
+	// 缓存路由键随上下文下传：raw HTTP 路径直接读取，SDK 路径由
+	// sessionAffinityDoer 在发出请求前读取（FR-11 ③）。
+	timeoutCtx = withSessionAffinity(timeoutCtx, promptCacheRoutingKey(opts))
 
 	body, endpoint, useRawHTTP, err := c.buildOutbound(messages, opts, false)
 	if err != nil {
@@ -228,6 +239,9 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 	// 注入用户自定义 header（保留头会在工具内部自动跳过）
 	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
 
+	// 会话亲和 header：让同一会话的多轮请求落到同一缓存分片（FR-11 ③）。
+	AttachSessionAffinityHeaders(httpReq, sessionAffinityFromContext(ctx))
+
 	logger.Infof(ctx, "[LLM Request] Remote HTTP, endpoint=%s, model=%s",
 		endpoint, c.modelName)
 
@@ -238,11 +252,11 @@ func (c *RemoteAPIChat) chatWithRawHTTP(ctx context.Context, endpoint string, cu
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, secutils.ReadErrorPreview(resp.Body))
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	// 响应体受上界约束（FR-07）：超限直接报错，不把无界内容读进内存。
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -267,6 +281,7 @@ func (c *RemoteAPIChat) ChatStream(ctx context.Context, messages []Message, opts
 	// 仅在调用方未设置 deadline 时附加兜底超时；流式调用默认超时更长，
 	// 因为带思考/推理的模型可能数十秒甚至几分钟才产出首 token。
 	timeoutCtx, cancel := withLLMTimeout(ctx, defaultStreamTimeout)
+	timeoutCtx = withSessionAffinity(timeoutCtx, promptCacheRoutingKey(opts))
 
 	body, endpoint, useRawHTTP, err := c.buildOutbound(messages, opts, true)
 	if err != nil {
@@ -364,15 +379,18 @@ func (c *RemoteAPIChat) chatStreamWithRawHTTP(ctx context.Context, endpoint stri
 	// 注入用户自定义 header（保留头会在工具内部自动跳过）
 	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
 
+	// 会话亲和 header：让同一会话的多轮请求落到同一缓存分片（FR-11 ③）。
+	AttachSessionAffinityHeaders(httpReq, sessionAffinityFromContext(ctx))
+
 	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		preview := secutils.ReadErrorPreview(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, preview)
 	}
 
 	streamChan := make(chan types.StreamResponse)

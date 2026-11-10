@@ -25,10 +25,12 @@ type stubMemoryService struct {
 	lastQuery   *types.MemoryFactQuery
 	updateErr   error
 	deleteErr   error
-	deleteAllN  int64
+	clearResult *types.MemoryClearResult
+	statusInfo  *types.MemoryStatusInfo
 	enabled     bool
 	updatedFact *types.MemoryFact
 	deletedID   string
+	deletedHard bool
 }
 
 func (s *stubMemoryService) ListFacts(ctx context.Context, q *types.MemoryFactQuery) ([]*types.MemoryFact, int64, error) {
@@ -41,13 +43,18 @@ func (s *stubMemoryService) UpdateFact(ctx context.Context, fact *types.MemoryFa
 	return s.updateErr
 }
 
-func (s *stubMemoryService) DeleteFact(ctx context.Context, id string) error {
+func (s *stubMemoryService) DeleteFact(ctx context.Context, id string, hard bool) error {
 	s.deletedID = id
+	s.deletedHard = hard
 	return s.deleteErr
 }
 
-func (s *stubMemoryService) DeleteAllForUser(ctx context.Context) (int64, error) {
-	return s.deleteAllN, nil
+func (s *stubMemoryService) DeleteAllForUser(ctx context.Context) (*types.MemoryClearResult, error) {
+	return s.clearResult, nil
+}
+
+func (s *stubMemoryService) GetStatusInfo(ctx context.Context) (*types.MemoryStatusInfo, error) {
+	return s.statusInfo, nil
 }
 
 func (s *stubMemoryService) IsEnabled(ctx context.Context, userID string) bool {
@@ -159,8 +166,28 @@ func TestDeleteMemoryFactMapsNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, w.Code)
 }
 
+// TestDeleteMemoryFactHardFlag 覆盖 PRD §3.2 的"用户删除 = 物理移除"开关。
+func TestDeleteMemoryFactHardFlag(t *testing.T) {
+	svc := &stubMemoryService{}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/memory/facts/f-1?hard=true", nil)
+	newMemoryTestRouter(svc).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Equal(t, "f-1", svc.deletedID)
+	require.True(t, svc.deletedHard, "hard=true 必须传到服务层做物理删除")
+
+	svc = &stubMemoryService{}
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodDelete, "/memory/facts/f-1", nil)
+	newMemoryTestRouter(svc).ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.False(t, svc.deletedHard, "默认仍是软删除，保持既有行为")
+}
+
 func TestDeleteAllMemoriesReturnsCount(t *testing.T) {
-	svc := &stubMemoryService{deleteAllN: 7}
+	svc := &stubMemoryService{clearResult: &types.MemoryClearResult{
+		DeletedFacts: 5, DeletedSummaries: 2, Generation: "gen-1", BlockedWrites: 1,
+	}}
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/memory", nil)
 	newMemoryTestRouter(svc).ServeHTTP(w, req)
@@ -168,11 +195,17 @@ func TestDeleteAllMemoriesReturnsCount(t *testing.T) {
 
 	var body map[string]interface{}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	require.EqualValues(t, 7, body["data"].(map[string]interface{})["deleted"])
+	data := body["data"].(map[string]interface{})
+	require.EqualValues(t, 7, data["deleted"])
+	clear := data["clear"].(map[string]interface{})
+	require.Equal(t, "gen-1", clear["generation"], "清空围栏世代随响应返回")
 }
 
 func TestGetMemoryStatus(t *testing.T) {
-	svc := &stubMemoryService{enabled: true, total: 3}
+	svc := &stubMemoryService{statusInfo: &types.MemoryStatusInfo{
+		Enabled: true, FactCount: 3, ActiveCount: 3, PendingCount: 2,
+		MaxActiveItems: 200, MaxPendingItems: 50, WriteMode: types.MemoryWriteAuto,
+	}}
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/memory/status", nil)
 	newMemoryTestRouter(svc).ServeHTTP(w, req)
@@ -183,4 +216,5 @@ func TestGetMemoryStatus(t *testing.T) {
 	data := body["data"].(map[string]interface{})
 	require.Equal(t, true, data["enabled"])
 	require.EqualValues(t, 3, data["fact_count"])
+	require.EqualValues(t, 2, data["pending_count"], "待确认角标计数")
 }

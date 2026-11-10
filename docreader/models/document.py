@@ -74,6 +74,12 @@ class Document(BaseModel):
         default_factory=dict,
         description="metadata fields",
     )
+    # 引用溯源定位（FR-05）：{"start","end","locator"} 列表，start/end 是 content
+    # 的码点偏移（end 开区间），locator 描述该区间在原文件中的位置。
+    source_blocks: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="source locator blocks mapping content ranges to the original file",
+    )
 
     def set_content(self, content: str) -> None:
         """Set document content."""

@@ -75,7 +75,14 @@ func (s *knowledgeBaseService) iterativeRetrieveWithDeduplication(ctx context.Co
 	matchCount int,
 	queryText string,
 ) ([]*types.IndexWithScore, error) {
-	maxIterations := 5
+	// FAQ 列表展开轮数来自工作区级检索配置（FR-19②）：未配置时回落到
+	// DefaultFAQExpandCount(5)，与既有硬编码行为一致；配置值由
+	// GetEffectiveFAQExpandCount 钳制到 [1, MaxFAQExpandCount]。
+	maxIterations := types.DefaultFAQExpandCount
+	if tenantInfo, ok := types.TenantInfoFromContext(ctx); ok && tenantInfo != nil {
+		maxIterations = tenantInfo.RetrievalConfig.GetEffectiveFAQExpandCount()
+	}
+	logger.Infof(ctx, "FAQ iterative retrieval: max expand rounds = %d", maxIterations)
 	// Start with a larger TopK since we're called when first retrieval wasn't enough
 	// The first retrieval already used matchCount*3, so start from there
 	currentTopK := matchCount * 3

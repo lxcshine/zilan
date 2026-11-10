@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/agent/compaction"
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/event"
@@ -367,6 +368,10 @@ func (e *AgentEngine) streamThinkingToEventBus(
 	}
 	if llmResult.Usage != nil {
 		resp.Usage = *llmResult.Usage
+		// 本轮用量累加（PRD FR-12）。放在这里而不是 runReActIteration：溢出恢复与
+		// 瞬时错误重试都会再走一遍本函数，只有这个咽喉点能保证每一次真实的模型往返
+		// 都恰好计入一次，被重试替换掉的那次尝试也不漏。
+		e.accumulateTurnUsage(llmResult.Usage)
 	}
 	return resp, nil
 }
@@ -375,11 +380,15 @@ func (e *AgentEngine) streamThinkingToEventBus(
 // and handles graceful degradation when prior tool results exist.
 // Returns nil response (with state.IsComplete=true) when graceful degradation succeeds.
 // Returns a non-nil error only when the call fails irrecoverably.
+//
+// messagesPtr 用指针传递，因为溢出恢复会就地压缩历史：调用方必须留下压缩后的列表，否则
+// 下一轮会把刚被拒绝的那个请求原样重建一遍（PRD FR-06 规则 1）。
 func (e *AgentEngine) callLLMWithRetry(
-	ctx context.Context, messages []chat.Message, tools []chat.Tool,
+	ctx context.Context, messagesPtr *[]chat.Message, tools []chat.Tool,
 	state *types.AgentState, query string, iteration int, sessionID string,
 ) (*types.ChatResponse, error) {
 	round := iteration + 1
+	messages := *messagesPtr
 
 	// Log message summary; only detail the tail messages to avoid repeating what prior rounds already logged
 	const maxDetailMsgs = 4
@@ -422,6 +431,28 @@ func (e *AgentEngine) callLLMWithRetry(
 	messages = agenttools.SanitizeMessages(messages)
 
 	response, err := e.streamThinkingToEventBus(ctx, messages, tools, iteration, sessionID)
+
+	// 因体积被拒的请求既不是瞬时错误也不是致命错误，而把它读成任一种都会以特定方式出错：
+	// 原样重试每次都同样失败，当作错误上报则会结束一个压缩本可以救回来的轮次。它有自己的
+	// 一次性恢复（PRD FR-06 规则 1、规则 4、规则 9）。
+	if err != nil && ctx.Err() == nil && !e.overflowRecovered && compaction.IsOverflowError(err) {
+		e.overflowRecovered = true
+		logger.Warnf(ctx, "[Agent][Round-%d] 供应商以请求过大为由拒绝；压缩后重试一次: %v", round, err)
+		common.PipelineWarn(ctx, "Agent", "context_overflow_rejected", map[string]interface{}{
+			"round":         round,
+			"iteration":     iteration,
+			"message_count": len(*messagesPtr),
+		})
+		// engine 侧保留未经 sanitize 的副本：sanitize 会合并连续同角色消息，而摘要是一条
+		// `user` 消息，可能与真实的 user 消息相邻——合并会把活的对话折进摘要信封里，
+		// 下一次压缩就再也读不回来了。供应商拿到 sanitize 后的视图，engine 留下结构化的那份。
+		compacted := e.forceCompaction(ctx, *messagesPtr, round)
+		*messagesPtr = compacted
+		messages = agenttools.SanitizeMessages(compacted)
+		e.lastSentMsgCount = len(compacted)
+		response, err = e.streamThinkingToEventBus(ctx, messages, tools, iteration, sessionID)
+	}
+
 	if err != nil && isTransientError(err) {
 		// Retry transient errors (timeout, rate limit, server errors) up to maxLLMRetries times
 		for retry := 1; retry <= maxLLMRetries; retry++ {

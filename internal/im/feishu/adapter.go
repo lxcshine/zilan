@@ -867,7 +867,7 @@ func (a *Adapter) cardkitCreate(ctx context.Context, accessToken, cardJSON strin
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := utils.ReadResponseCapped(resp.Body, utils.JSONResponseLimit())
 	if err != nil {
 		return "", fmt.Errorf("read response: %w", err)
 	}

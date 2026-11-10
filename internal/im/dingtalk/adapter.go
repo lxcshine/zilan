@@ -261,7 +261,7 @@ func (a *Adapter) DownloadFile(ctx context.Context, msg *im.IncomingMessage) (io
 		return nil, "", fmt.Errorf("download file: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 		resp.Body.Close()
 		return nil, "", fmt.Errorf("download file returned %d: %s", resp.StatusCode, string(body))
 	}
@@ -446,7 +446,7 @@ func (a *Adapter) replyViaSessionWebhook(ctx context.Context, webhookURL, conten
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 		return fmt.Errorf("dingtalk sessionWebhook returned %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -497,7 +497,7 @@ func (a *Adapter) replyViaOpenAPI(ctx context.Context, incoming *im.IncomingMess
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 		return fmt.Errorf("dingtalk OpenAPI returned %d: %s", resp.StatusCode, string(respBody))
 	}
 	return nil
@@ -541,7 +541,7 @@ func (a *Adapter) getAccessToken(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 		return "", fmt.Errorf("dingtalk accessToken returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -589,7 +589,7 @@ func (a *Adapter) dingtalkAPI(ctx context.Context, method, path string, body int
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("dingtalk API %s returned %d: %s", path, resp.StatusCode, string(respBody))
 	}

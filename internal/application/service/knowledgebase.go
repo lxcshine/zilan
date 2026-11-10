@@ -135,6 +135,10 @@ func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 		kb.CreatorID = uid
 	}
 	kb.EnsureDefaults()
+	// FR-13：OCR 流水线与前处理参数的取值校验（类型/范围/规则）。
+	if err := ValidateOCRPipelineConfig(ctx, &kb.ImageProcessingConfig); err != nil {
+		return nil, err
+	}
 	applyTenantDefaultStorageProvider(ctx, kb)
 	if err := s.applyAndValidateStorageBackend(ctx, kb); err != nil {
 		return nil, err
@@ -547,6 +551,11 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 	}
 	kb.UpdatedAt = time.Now()
 	kb.EnsureDefaults()
+	// FR-13：OCR 流水线与前处理参数的取值校验（类型/范围/规则）。
+	// 校验失败直接拒绝保存；保存成功也不会触发存量文档重解析（PRD §5.4）。
+	if err := ValidateOCRPipelineConfig(ctx, &kb.ImageProcessingConfig); err != nil {
+		return nil, err
+	}
 
 	logger.Info(ctx, "Saving knowledge base update")
 	if err := s.repo.UpdateKnowledgeBase(ctx, kb); err != nil {

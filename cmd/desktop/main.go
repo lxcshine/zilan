@@ -164,6 +164,11 @@ func main() {
 	_ = godotenv.Load()
 	configureDesktopStorage(execPath)
 	logger.ConfigureFromEnv()
+	// FR-08 条 4：日志格式模板缺少 %msg 时拒绝启动并给出明确错误。
+	if err := logger.LogFormatConfigError(); err != nil {
+		fmt.Fprintf(os.Stderr, "启动失败：%v\n", err)
+		os.Exit(1)
+	}
 
 	// Set Gin mode
 	if os.Getenv("GIN_MODE") == "release" {

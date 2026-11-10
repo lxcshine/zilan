@@ -2,6 +2,7 @@ package retriever
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -28,11 +29,18 @@ type CompositeRetrieveEngine struct {
 }
 
 // Retrieve performs retrieval operations by delegating to the appropriate engine
-// based on the retriever type specified in the parameters
+// based on the retriever type specified in the parameters.
+//
+// 错误契约（FR-19⑤）：某一条检索腿失败不会丢弃其他腿已经取回的结果。
+// 失败会与可用结果**一并**返回（全部腿都失败时结果为空），调用方因此可以
+// 降级处理，而不会把残缺答案当成完整答案。结果集自身通过
+// RetrieveResult.Error 上报的“部分失败”遵循同一契约：命中保留，失败上抛。
 func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 	retrieveParams []types.RetrieveParams,
 ) ([]*types.RetrieveResult, error) {
-	return concurrentRetrieve(ctx, retrieveParams,
+	var partialMu sync.Mutex
+	var partialErrs []error
+	results, err := concurrentRetrieve(ctx, retrieveParams,
 		func(ctx context.Context, param types.RetrieveParams, results *[]*types.RetrieveResult, mu *sync.Mutex) error {
 			found := false
 			for _, engineInfo := range c.engineInfos {
@@ -43,6 +51,18 @@ func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 					result, err := engineInfo.retrieveEngine.Retrieve(ctx, param)
 					if err != nil {
 						return err
+					}
+					// 底层引擎（如 sqlite / postgres 的多 collection 检索）会把
+					// 局部失败写在 RetrieveResult.Error 上并照常返回命中结果。
+					// 过去这里完全不读该字段，失败被静默丢弃；现在收集起来，
+					// 与结果一并交给调用方。
+					for _, one := range result {
+						if one == nil || one.Error == nil {
+							continue
+						}
+						partialMu.Lock()
+						partialErrs = append(partialErrs, one.Error)
+						partialMu.Unlock()
 					}
 					mu.Lock()
 					*results = append(*results, result...)
@@ -57,6 +77,14 @@ func (c *CompositeRetrieveEngine) Retrieve(ctx context.Context,
 			return nil
 		},
 	)
+	if err != nil {
+		// 保留成功腿的结果，与失败一并返回。
+		return results, err
+	}
+	if len(partialErrs) > 0 {
+		return results, fmt.Errorf("retrieve returned partial results: %w", errors.Join(partialErrs...))
+	}
+	return results, nil
 }
 
 // NewCompositeRetrieveEngine creates a new composite retrieve engine with the given parameters
@@ -127,7 +155,10 @@ func (c *CompositeRetrieveEngine) BatchUpdateChunkTagID(
 }
 
 // concurrentRetrieve is a helper function for concurrent processing of retrieval parameters
-// and collecting results
+// and collecting results.
+//
+// 一条腿失败时**不再**丢弃其他腿已经收集到的结果：结果与首个错误一并返回，
+// 由调用方决定降级还是失败（见 Retrieve 的错误契约）。
 func concurrentRetrieve(
 	ctx context.Context,
 	retrieveParams []types.RetrieveParams,
@@ -155,7 +186,7 @@ func concurrentRetrieve(
 	// Check for errors
 	for err := range errCh {
 		if err != nil {
-			return nil, err
+			return results, err
 		}
 	}
 

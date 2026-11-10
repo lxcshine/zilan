@@ -47,10 +47,10 @@ import (
 	tencentVectorDBRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/tencentvectordb"
 	weaviateRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/weaviate"
 	"github.com/Tencent/WeKnora/internal/application/service"
+	backupSvc "github.com/Tencent/WeKnora/internal/application/service/backup"
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/application/service/file"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
-	backupSvc "github.com/Tencent/WeKnora/internal/application/service/backup"
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/database"
@@ -178,6 +178,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(repository.NewTaskPendingOpsRepository))
 	must(container.Provide(repository.NewTaskDeadLetterRepository))
 	must(container.Provide(repository.NewBackupRepository))
+	// FR-12 每轮 Token 用量归因与分层看板：只读数据源（messages.usage /
+	// messages.context_stats），与仓储层的其它构造函数同形，因此直接 Provide。
+	must(container.Provide(repository.NewTokenUsageStatsRepository))
 
 	// MCP manager for managing MCP client connections
 	logger.Debugf(ctx, "[Container] Registering MCP manager...")
@@ -192,6 +195,8 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(service.NewTenantInvitationService))
 	must(container.Provide(service.NewAuditLogService))
 	must(container.Provide(service.NewAuditLogRetentionRunner))
+	// FR-12 工作区管理员的用量看板服务：身份校验 + 时间窗钳制 + 聚合计算。
+	must(container.Provide(service.NewTokenUsageService))
 	must(container.Provide(service.NewKnowledgeBaseService))
 	must(container.Provide(service.NewOrganizationService))
 	must(container.Provide(service.NewKBShareService)) // KBShareService must be registered before KnowledgeService and KnowledgeTagService
@@ -409,6 +414,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	must(container.Provide(handler.NewEmbedChannelHandler))
 	must(container.Provide(handler.NewWeKnoraCloudHandler))
 	must(container.Provide(handler.NewBackupHandler))
+	// FR-12 用量看板 handler：填进 router.RouterParams.UsageStatsHandler，
+	// 由 RegisterTokenUsageRoutes 挂到 GET /api/v1/token-usage/overview。
+	must(container.Provide(handler.NewUsageStatsHandler))
 	logger.Debugf(ctx, "[Container] HTTP handlers registered")
 
 	// Wire the chat package's local image resolver so multimodal chat can read
@@ -668,6 +676,10 @@ func initDatabase(cfg *config.Config) (*gorm.DB, error) {
 		NowFunc: func() time.Time {
 			return time.Now().UTC()
 		},
+		// 显式注入日志器：默认的 gormlogger.Default 会把慢查询的绑定参数
+		// 原值打进 stdout（含 chunk 正文、向量与 api_key/token 列）。
+		// newGormLogger 开启 ParameterizedQueries，只保留 SQL 与耗时。
+		Logger: newGormLogger(os.Stdout),
 	})
 	if err != nil {
 		return nil, err

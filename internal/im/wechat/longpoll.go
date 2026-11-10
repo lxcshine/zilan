@@ -15,13 +15,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/im"
 	"github.com/Tencent/WeKnora/internal/logger"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 const (
@@ -129,7 +129,7 @@ func (c *LongPollClient) poll(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}

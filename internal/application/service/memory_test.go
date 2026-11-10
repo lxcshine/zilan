@@ -163,7 +163,8 @@ func newMemoryServiceForTest(t *testing.T) (*memoryService, *gorm.DB, *memoryFak
 	if sqlDB, dbErr := db.DB(); dbErr == nil {
 		sqlDB.SetMaxOpenConns(1)
 	}
-	require.NoError(t, db.AutoMigrate(&types.MemoryFact{}, &types.MemorySessionSummary{}))
+	require.NoError(t, db.AutoMigrate(&types.MemoryFact{}, &types.MemorySessionSummary{},
+		&types.MemoryGovernance{}, &types.MemoryGovernanceEvent{}))
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_memory_facts_triple
 		ON memory_facts(tenant_id, user_id, triple_hash)
 		WHERE deleted_at IS NULL AND triple_hash <> ''`).Error)
@@ -230,15 +231,22 @@ func TestMemoryServiceProcessMemoryExtractEndToEnd(t *testing.T) {
 	require.Equal(t, 1, chatModel.calls)
 	require.Contains(t, chatModel.lastUser, "Prometheus", "extraction prompt must carry the conversation")
 
-	// L3 facts persisted with embeddings and parsed due dates.
-	facts, total, err := svc.memoryRepo.ListFacts(memoryTestCtx(), 1, "alice", &types.MemoryFactQuery{Page: 1, PageSize: 10})
+	// L3 facts persisted with embeddings and parsed due dates. 抽取产物属
+	// 系统推断，按 PRD §3.2 落在 pending（FR-02），因此默认（active）列表为空。
+	_, activeTotal, err := svc.memoryRepo.ListFacts(memoryTestCtx(), 1, "alice", &types.MemoryFactQuery{Page: 1, PageSize: 10})
+	require.NoError(t, err)
+	require.EqualValues(t, 0, activeTotal, "pending memories must not surface as active")
+
+	facts, total, err := svc.memoryRepo.ListFacts(memoryTestCtx(), 1, "alice",
+		&types.MemoryFactQuery{Status: types.MemoryStatusPending, Page: 1, PageSize: 10})
 	require.NoError(t, err)
 	require.EqualValues(t, 2, total)
 	require.Len(t, facts, 2)
 	var todo *types.MemoryFact
 	for _, f := range facts {
 		require.NotEmpty(t, f.Embedding, "fact must carry an embedding")
-		require.Equal(t, types.MemoryStatusActive, f.Status)
+		require.Equal(t, types.MemoryStatusPending, f.Status)
+		require.Equal(t, types.MemoryOriginExtracted, f.Origin)
 		if f.Category == types.MemoryCategoryTodo {
 			todo = f
 		}
@@ -269,7 +277,8 @@ func TestMemoryServiceProcessMemoryExtractDedupRefreshes(t *testing.T) {
 	require.NoError(t, svc.ProcessMemoryExtract(memoryTestCtx(), task))
 	require.NoError(t, svc.ProcessMemoryExtract(memoryTestCtx(), task))
 
-	_, total, err := svc.memoryRepo.ListFacts(memoryTestCtx(), 1, "alice", &types.MemoryFactQuery{Page: 1, PageSize: 10})
+	_, total, err := svc.memoryRepo.ListFacts(memoryTestCtx(), 1, "alice",
+		&types.MemoryFactQuery{Status: "all", Page: 1, PageSize: 10})
 	require.NoError(t, err)
 	require.EqualValues(t, 2, total, "re-extracting the same turn must upsert, not duplicate")
 }
@@ -602,9 +611,11 @@ func TestMemoryServiceDeleteAllForUser(t *testing.T) {
 		TenantID: 1, UserID: "alice", SessionID: "s-1", Summary: "sum",
 	}))
 
-	n, err := svc.DeleteAllForUser(ctx)
+	result, err := svc.DeleteAllForUser(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 2, n)
+	require.EqualValues(t, 2, result.Deleted())
+	require.NotEmpty(t, result.Generation, "清空必须生成围栏世代令牌")
+	require.False(t, result.CutoffAt.IsZero(), "清空必须生成截止点")
 
 	_, total, err := svc.memoryRepo.ListFacts(ctx, 1, "alice", &types.MemoryFactQuery{Status: "all"})
 	require.NoError(t, err)
@@ -895,11 +906,15 @@ func TestMemoryServiceSkillConfidenceGate(t *testing.T) {
 	payloadBytes, _ := json.Marshal(payload)
 	require.NoError(t, svc.ProcessMemoryExtract(memoryTestCtx(), asynq.NewTask(types.TypeMemoryExtract, payloadBytes)))
 
-	facts, _, err := svc.ListFacts(memoryTestCtx(), &types.MemoryFactQuery{Category: types.MemoryCategorySkill, Page: 1, PageSize: 10})
+	facts, _, err := svc.ListFacts(memoryTestCtx(), &types.MemoryFactQuery{
+		Category: types.MemoryCategorySkill, Status: types.MemoryStatusPending, Page: 1, PageSize: 10,
+	})
 	require.NoError(t, err)
 	require.Len(t, facts, 1, "low-confidence skills must be dropped; explicit ones kept")
 	require.Equal(t, "默认用中文回答", facts[0].Content)
 	require.Equal(t, "assistant", facts[0].Subject, "skills are normalized to assistant subject")
+	require.Equal(t, types.MemoryStatusPending, facts[0].Status,
+		"技巧类记忆属系统推断，同样走 pending 门控（FR-02）")
 }
 
 // seedModuleFact inserts one active fact for the ctx user.

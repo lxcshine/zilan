@@ -194,6 +194,8 @@ func buildStreamResponse(evt interfaces.StreamEvent, requestID string) *types.St
 		Content:      evt.Content,
 		Done:         evt.Done,
 		Data:         evt.Data,
+		// 本轮用量随 complete 事件推给前端（PRD FR-12）。只有那一个事件会带它。
+		Usage: evt.Usage,
 	}
 
 	// Extract session_id and assistant_message_id for agent_query events

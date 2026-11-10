@@ -57,6 +57,8 @@ type StoredImage struct {
 	OriginalRef string // reference in the original markdown
 	ServingURL  string // provider:// URL (e.g. local://images/xxx.png, minio://bucket/key)
 	MimeType    string
+	// SourceLocators 图片在原文中的位置（由页级定位块推导），best-effort，可为空
+	SourceLocators types.SourceLocators
 }
 
 // ImageResolver reads images from a DocReader ReadResult (inline bytes only)

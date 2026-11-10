@@ -262,6 +262,20 @@ func (s *messageService) UpdateMessageRenderedContent(ctx context.Context, sessi
 	return s.messageRepo.UpdateMessageRenderedContent(ctx, sessionID, messageID, renderedContent)
 }
 
+// GetLatestContextCheckpoint returns the session's newest context compaction
+// checkpoint (PRD FR-10), or nil when the session has none.
+func (s *messageService) GetLatestContextCheckpoint(ctx context.Context, sessionID string) (*types.Message, error) {
+	return s.messageRepo.GetLatestContextCheckpoint(ctx, sessionID)
+}
+
+// SaveContextCheckpoint persists a compaction checkpoint onto one assistant
+// message of the session (PRD FR-10).
+func (s *messageService) SaveContextCheckpoint(
+	ctx context.Context, sessionID, messageID string, checkpoint *types.ContextCheckpoint,
+) error {
+	return s.messageRepo.UpdateMessageContextCheckpoint(ctx, sessionID, messageID, checkpoint)
+}
+
 // DeleteMessage removes a message from a session, also cleaning up its Knowledge entry in the chat history KB.
 func (s *messageService) DeleteMessage(ctx context.Context, sessionID string, messageID string) error {
 	logger.Info(ctx, "Start deleting message")

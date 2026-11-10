@@ -75,6 +75,22 @@
         </div>
       </div>
 
+      <!-- FR-17 图文共空间检索：图片向量索引开关（opt-in，默认关闭） -->
+      <div class="setting-row">
+        <div class="setting-info">
+          <label>{{ $t('knowledgeEditor.advanced.imageVector.label') }}</label>
+          <p class="desc">{{ $t('knowledgeEditor.advanced.imageVector.description') }}</p>
+          <p class="hint">{{ $t('knowledgeEditor.advanced.imageVector.reparseHint') }}</p>
+        </div>
+        <div class="setting-control">
+          <t-switch
+            :model-value="imageVectorEnabled"
+            @change="(value: boolean) => emit('update:imageVectorEnabled', value)"
+            size="medium"
+          />
+        </div>
+      </div>
+
     </div>
   </div>
 </template>
@@ -94,15 +110,19 @@ interface Props {
   allModels?: any[]
   embedded?: boolean
   tableMetadataInstructions?: string
+  /** FR-17 图文共空间检索开关（知识库 image_processing_config.image_vector_enabled） */
+  imageVectorEnabled?: boolean
 }
 
 const props = withDefaults(defineProps<Props>(), {
   embedded: false,
+  imageVectorEnabled: false,
 })
 
 const emit = defineEmits<{
   'update:questionGeneration': [value: QuestionGenerationConfig]
   'update:tableMetadataInstructions': [value: string]
+  'update:imageVectorEnabled': [value: boolean]
 }>()
 
 const localQuestionGeneration = ref<QuestionGenerationConfig>(

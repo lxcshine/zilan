@@ -26,15 +26,67 @@ type AnthropicChat struct {
 }
 
 type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string           `json:"role"`
+	Content anthropicContent `json:"content"`
+}
+
+// anthropicTextBlock 是 Anthropic Messages 协议的文本内容块。CacheControl 非空时
+// 该块就是一个缓存断点（FR-11 ③）：断点及其之前的内容构成可复用的稳定前缀。
+type anthropicTextBlock struct {
+	Type         string              `json:"type"`
+	Text         string              `json:"text"`
+	CacheControl *CacheControlMarker `json:"cache_control,omitempty"`
+}
+
+// anthropicContent 兼容 Anthropic 的两种内容写法：纯字符串（不带缓存标记，序列化
+// 结果与改造前逐字节一致）与文本块数组（带 cache_control 断点）。
+type anthropicContent struct {
+	Text   string
+	Blocks []anthropicTextBlock
+}
+
+// newAnthropicText 构造纯字符串内容。
+func newAnthropicText(text string) anthropicContent { return anthropicContent{Text: text} }
+
+// newAnthropicCachedText 构造带缓存断点的文本内容；marker 为 nil 或文本为空时
+// 退化为纯字符串，不改变请求形态。
+func newAnthropicCachedText(text string, marker *CacheControlMarker) anthropicContent {
+	if marker == nil || text == "" {
+		return anthropicContent{Text: text}
+	}
+	return anthropicContent{Blocks: []anthropicTextBlock{{Type: "text", Text: text, CacheControl: marker}}}
+}
+
+// MarshalJSON 无缓存断点时输出字符串，有断点时输出内容块数组。
+func (c anthropicContent) MarshalJSON() ([]byte, error) {
+	if len(c.Blocks) == 0 {
+		return json.Marshal(c.Text)
+	}
+	return json.Marshal(c.Blocks)
+}
+
+// UnmarshalJSON 同时接受字符串与内容块数组两种写法（便于测试与网关回放）。
+func (c *anthropicContent) UnmarshalJSON(data []byte) error {
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		c.Text, c.Blocks = text, nil
+		return nil
+	}
+	var blocks []anthropicTextBlock
+	if err := json.Unmarshal(data, &blocks); err != nil {
+		return err
+	}
+	c.Text, c.Blocks = "", blocks
+	return nil
 }
 
 type anthropicRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	Stream      bool               `json:"stream,omitempty"`
-	System      string             `json:"system,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	Stream    bool   `json:"stream,omitempty"`
+	// System 用指针以便 omitempty 生效：没有系统消息时整个字段不下发，
+	// 与改造前的请求字节保持一致。
+	System      *anthropicContent  `json:"system,omitempty"`
 	Messages    []anthropicMessage `json:"messages"`
 	Temperature *float64           `json:"temperature,omitempty"`
 	TopP        *float64           `json:"top_p,omitempty"`
@@ -135,6 +187,8 @@ func (c *AnthropicChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	httpReq.Header.Set("x-api-key", c.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
+	// 会话亲和 header：让同一会话的多轮请求落到同一缓存分片（FR-11 ③）。
+	AttachSessionAffinityHeaders(httpReq, promptCacheRoutingKey(opts))
 
 	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
@@ -142,7 +196,8 @@ func (c *AnthropicChat) Chat(ctx context.Context, messages []Message, opts *Chat
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// 响应体受上界约束（FR-07）：超限直接报错，不把无界内容读进内存。
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -167,7 +222,7 @@ func (c *AnthropicChat) Chat(ctx context.Context, messages []Message, opts *Chat
 		if chatResp.Error != nil && chatResp.Error.Message != "" {
 			return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, chatResp.Error.Message)
 		}
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, secutils.ErrorPreviewString(body))
 	}
 
 	result := c.parseResponse(&chatResp)
@@ -197,15 +252,17 @@ func (c *AnthropicChat) ChatStream(ctx context.Context, messages []Message, opts
 	httpReq.Header.Set("x-api-key", c.apiKey)
 	httpReq.Header.Set("anthropic-version", anthropicVersion)
 	secutils.ApplyCustomHeaders(httpReq, c.customHeaders)
+	// 会话亲和 header：让同一会话的多轮请求落到同一缓存分片（FR-11 ③）。
+	AttachSessionAffinityHeaders(httpReq, promptCacheRoutingKey(opts))
 
 	resp, err := rawHTTPClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		body, _ := io.ReadAll(resp.Body)
+		preview := secutils.ReadErrorPreview(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, preview)
 	}
 
 	streamChan := make(chan types.StreamResponse)
@@ -285,14 +342,27 @@ func (c *AnthropicChat) buildRequest(messages []Message, opts *ChatOptions) anth
 		case "system":
 			systemParts = append(systemParts, content)
 		case "assistant":
-			req.Messages = append(req.Messages, anthropicMessage{Role: "assistant", Content: content})
+			req.Messages = append(req.Messages, anthropicMessage{Role: "assistant", Content: newAnthropicText(content)})
 		case "user":
-			req.Messages = append(req.Messages, anthropicMessage{Role: "user", Content: content})
+			req.Messages = append(req.Messages, anthropicMessage{Role: "user", Content: newAnthropicText(content)})
 		default:
-			req.Messages = append(req.Messages, anthropicMessage{Role: "user", Content: content})
+			req.Messages = append(req.Messages, anthropicMessage{Role: "user", Content: newAnthropicText(content)})
 		}
 	}
-	req.System = strings.Join(systemParts, "\n\n")
+
+	// 缓存断点（FR-11 ③）：Anthropic 的 prompt 缓存必须显式标记，不会自动生效。
+	// 断点打在稳定前缀的边界上——system（指令 + 记忆常驻块，跨轮不变）与最后一条
+	// 会话消息（让下一轮复用本轮之前的全部对话）。CacheRetentionNone 时 marker 为
+	// nil，请求形态与改造前完全一致。
+	marker := CacheControlFor(ResolveCacheRetention(opts), LongCacheTTL)
+	if system := strings.Join(systemParts, "\n\n"); system != "" {
+		cached := newAnthropicCachedText(system, marker)
+		req.System = &cached
+	}
+	if marker != nil && len(req.Messages) > 0 {
+		last := &req.Messages[len(req.Messages)-1]
+		last.Content = newAnthropicCachedText(last.Content.Text, marker)
+	}
 	return req
 }
 

@@ -92,6 +92,9 @@ type IndexWithScore struct {
 	TagID string
 	// Score
 	Score float64
+	// VectorScore 向量腿原始相似度（FR-17）：向量检索命中行的原始向量分。
+	// 图片命中行被文本重排器拒绝后凭该分保留（KeptByImageVector）。
+	VectorScore float64
 	// Match type
 	MatchType MatchType
 	// IsEnabled
@@ -108,5 +111,10 @@ type RetrieveResult struct {
 	Results             []*IndexWithScore   // Retrieval results
 	RetrieverEngineType RetrieverEngineType // Retrieval source type
 	RetrieverType       RetrieverType       // Retrieval type
-	Error               error               // Retrieval error
+	// Error 上报本结果集的“部分失败”：Results 是成功应答的部分，Error 说明
+	// 哪一部分没有应答。完整检索（包括真的零命中）时为 nil。整库级别的失败
+	// 仍然作为调用的 error 返回、且不带结果集。
+	// CompositeRetrieveEngine 会把非 nil 的 Error 连同结果一起向上抛，因此
+	// 读取结果的调用方不得忽略这个 error——至少要记录“本次答案不完整”。
+	Error error // Retrieval error
 }

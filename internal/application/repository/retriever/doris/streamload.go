@@ -68,29 +68,34 @@ func newDorisStreamLoadHTTPClient() *http.Client {
 	cfg.Timeout = 0
 
 	client := secutils.NewSSRFSafeHTTPClient(cfg)
-	ssrfCheckRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		// Keep the shared client's redirect limit, scheme/target validation and
-		// sensitive-header stripping as the authoritative SSRF behaviour.
-		if err := ssrfCheckRedirect(req, via); err != nil {
-			return err
+		if len(via) >= cfg.MaxRedirects {
+			return fmt.Errorf("stopped after %d redirects", cfg.MaxRedirects)
 		}
 		if len(via) == 0 {
 			return nil
 		}
 
-		sourceHost := via[len(via)-1].URL.Hostname()
-		targetHost := req.URL.Hostname()
-		if !strings.EqualFold(sourceHost, targetHost) && !secutils.IsSSRFWhitelisted(targetHost) {
-			return fmt.Errorf(
-				"stream load redirect blocked: target host %q is not trusted to receive credentials",
-				targetHost,
-			)
+		// Stream Load 必须把 PUT body 重放给 BE，这是 Doris 协议的要求。
+		// 这个例外只属于 Doris：通用客户端的共享策略会拒绝跨源重放
+		// （见 utils.newSSRFCheckRedirect），因此这里整体替换 CheckRedirect，
+		// 而不是在共享策略之上叠加。每个跨源目标都必须被显式信任。
+		source := via[0].URL
+		sameOrigin := strings.EqualFold(source.Scheme, req.URL.Scheme) &&
+			strings.EqualFold(source.Host, req.URL.Host)
+		if !sameOrigin && !secutils.IsSSRFWhitelisted(req.URL.Hostname()) {
+			return fmt.Errorf("%w: stream load target host %q is not trusted to receive credentials",
+				secutils.ErrSSRFRedirectBlocked, req.URL.Hostname())
+		}
+		if strings.EqualFold(source.Scheme, "https") && !strings.EqualFold(req.URL.Scheme, "https") {
+			return fmt.Errorf("%w: stream load HTTPS downgrade is forbidden", secutils.ErrSSRFRedirectBlocked)
+		}
+		if err := secutils.ValidateURLForSSRF(req.URL.String()); err != nil {
+			return fmt.Errorf("%w: %w", secutils.ErrSSRFRedirectBlocked, err)
 		}
 
-		// The shared client deliberately strips Authorization on cross-host
-		// redirects. Doris is the exceptional case where an explicitly trusted
-		// BE needs the same Basic credentials after the FE's 307 response.
+		// 共享 transport 仍会校验每个 URL 与连接。先校验目标，
+		// 再恢复 Basic auth 与负载选项。
 		req.Header.Set(headerAuthorization, via[0].Header.Get(headerAuthorization))
 		return nil
 	}
@@ -172,17 +177,18 @@ func (r *dorisRepository) streamLoadOnce(ctx context.Context,
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// 响应体受上界约束（FR-07）：Stream Load 返回的是小 JSON 状态报文。
+	respBody, err := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	if err != nil {
 		return fmt.Errorf("read stream load response: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("stream load HTTP %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("stream load HTTP %d: %s", resp.StatusCode, secutils.ErrorPreviewString(respBody))
 	}
 
 	var result streamLoadResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return fmt.Errorf("decode stream load response: %w (raw=%s)", err, string(respBody))
+		return fmt.Errorf("decode stream load response: %w (raw=%s)", err, secutils.ErrorPreviewString(respBody))
 	}
 
 	switch result.Status {

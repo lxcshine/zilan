@@ -7,6 +7,9 @@ const (
 	ChunkSourceType   SourceType = iota // Source is a text chunk
 	PassageSourceType                   // Source is a passage
 	SummarySourceType                   // Source is a summary
+	// ImageSourceType 图片向量来源（FR-17 图文共空间检索）：标记写入向量
+	// 索引的行由图片编码而来，与文本行共享同一向量空间。
+	ImageSourceType
 )
 
 // MatchType represents the type of matching algorithm

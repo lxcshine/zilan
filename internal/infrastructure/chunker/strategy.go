@@ -133,22 +133,45 @@ func SplitWithDiagnostics(text string, cfg SplitterConfig) ([]Chunk, *Diagnostic
 // is bounded by O(sum(parent_size)) ≈ O(N) total, which is the same
 // order as the original parent profiling pass.
 func SplitParentChild(text string, parentCfg, childCfg SplitterConfig) ParentChildResult {
-	if text == "" {
-		return ParentChildResult{}
-	}
+	result, _ := splitParentChild(text, parentCfg, childCfg, false)
+	return result
+}
+
+// SplitParentChildWithDiagnostics is the diagnostics-aware form of
+// SplitParentChild. The result is identical to SplitParentChild; diagnostics
+// describe the strategy selected for the parent split over the full document.
+// It is intended for debug surfaces rather than the ingestion hot path.
+func SplitParentChildWithDiagnostics(text string, parentCfg, childCfg SplitterConfig) (ParentChildResult, *Diagnostics) {
+	return splitParentChild(text, parentCfg, childCfg, true)
+}
+
+func splitParentChild(text string, parentCfg, childCfg SplitterConfig, withDiagnostics bool) (ParentChildResult, *Diagnostics) {
 	parentCfg = ensureDefaults(parentCfg)
 	childCfg = ensureDefaults(childCfg)
 
-	parents := Split(text, parentCfg)
+	var (
+		parents []Chunk
+		diag    *Diagnostics
+	)
+	if withDiagnostics {
+		parents, diag = SplitWithDiagnostics(text, parentCfg)
+	} else {
+		parents = Split(text, parentCfg)
+	}
 	if len(parents) == 0 {
-		return ParentChildResult{}
+		return ParentChildResult{}, diag
 	}
 
 	var newParents []Chunk
 	var children []ChildChunk
 	childSeq := 0
 	for _, parent := range parents {
-		subs := Split(parent.Content, childCfg)
+		// mapChildrenToSource rebases the child offsets onto the original
+		// document — a plain `sub.Start += parent.Start` shift is wrong whenever
+		// parent.Content carries a synthetic prefix (continued table header)
+		// that occupies no source positions. FR-05 feeds these offsets to
+		// sourceIndex.Locators, so they must point at the real text.
+		subs := mapChildrenToSource(parent, Split(parent.Content, childCfg))
 
 		parentIndex := -1
 		if len(subs) > 1 || (len(subs) == 1 && subs[0].Content != parent.Content) {
@@ -157,14 +180,12 @@ func SplitParentChild(text string, parentCfg, childCfg SplitterConfig) ParentChi
 		}
 		for _, sub := range subs {
 			sub.Seq = childSeq
-			sub.Start += parent.Start
-			sub.End += parent.Start
 			sub.ContextHeader = mergeBreadcrumbs(parent.ContextHeader, sub.ContextHeader)
 			children = append(children, ChildChunk{Chunk: sub, ParentIndex: parentIndex})
 			childSeq++
 		}
 	}
-	return ParentChildResult{Parents: newParents, Children: children}
+	return ParentChildResult{Parents: newParents, Children: children}, diag
 }
 
 // mergeBreadcrumbs combines the parent and child heading breadcrumbs into a

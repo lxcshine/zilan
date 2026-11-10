@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -132,7 +131,7 @@ func (r *AliyunReranker) Rerank(ctx context.Context, query string, documents []s
 	defer resp.Body.Close()
 
 	// Read the response
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.ModelResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}

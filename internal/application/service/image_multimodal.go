@@ -312,6 +312,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 			IsEnabled:       true,
 			Flags:           types.ChunkFlagRecommended,
 			ImageInfo:       string(imageInfoJSON),
+			SourceLocators:  payload.SourceLocators, // FR-05 引用溯源：图片在原文中的位置
 			CreatedAt:       time.Now(),
 			UpdatedAt:       time.Now(),
 		})
@@ -329,6 +330,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 			IsEnabled:       true,
 			Flags:           types.ChunkFlagRecommended,
 			ImageInfo:       string(imageInfoJSON),
+			SourceLocators:  payload.SourceLocators, // FR-05 引用溯源：图片在原文中的位置
 			CreatedAt:       time.Now(),
 			UpdatedAt:       time.Now(),
 		})
@@ -352,7 +354,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	}
 
 	// Index chunks so they can be retrieved
-	s.indexChunks(ctx, payload, newChunks)
+	s.indexChunks(ctx, payload, newChunks, imgBytes, imageInfo.OCRText, imageInfo.Caption)
 	imgOut["indexed"] = true
 
 	// Enqueue question generation for the caption/OCR content if KB has it enabled.
@@ -424,7 +426,9 @@ func isFinalAsynqAttempt(ctx context.Context) bool {
 
 // indexChunks indexes the newly created multimodal chunks into the retrieval engine
 // so they can participate in semantic search.
-func (s *ImageMultimodalService) indexChunks(ctx context.Context, payload types.ImageMultimodalPayload, chunks []*types.Chunk) {
+// imgBytes/ocrText/captionText 供 FR-17 图片向量索引（indexImageVector）使用：
+// 图片向量与文本 chunk 共享同一向量索引，这里在文本索引完成后顺挂图片腿。
+func (s *ImageMultimodalService) indexChunks(ctx context.Context, payload types.ImageMultimodalPayload, chunks []*types.Chunk, imgBytes []byte, ocrText string, captionText string) {
 	kb, err := s.kbService.GetKnowledgeBaseByIDOnly(ctx, payload.KnowledgeBaseID)
 	if err != nil || kb == nil {
 		logger.Warnf(ctx, "[ImageMultimodal] Failed to get KB for indexing: %v", err)
@@ -492,6 +496,11 @@ func (s *ImageMultimodalService) indexChunks(ctx context.Context, payload types.
 		logger.Errorf(ctx, "[ImageMultimodal] Failed to index multimodal chunks: %v", err)
 		return
 	}
+
+	// FR-17 图文共空间检索：图片向量行（image_vector chunk）与文本行
+	// 写入同一向量索引。内部自带开关与降级（关闭/扫描页/模型不支持
+	// 图片/嵌入失败均只记日志跳过），不影响上面的文本索引结果。
+	s.indexImageVector(ctx, payload, kb, engine, embeddingModel, imgBytes, ocrText, captionText)
 
 	// Mark chunks as indexed.
 	// Must re-fetch from DB because the in-memory objects lack auto-generated fields

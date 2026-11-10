@@ -3,6 +3,7 @@ package types
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 )
 
 // PromptCacheStatus distinguishes a real cache miss from providers that do not
@@ -30,6 +31,69 @@ type TokenUsage struct {
 	CacheMissTokens  int               `json:"cache_miss_tokens,omitempty"`
 	CacheReported    bool              `json:"cache_reported"`
 	CacheStatus      PromptCacheStatus `json:"cache_status,omitempty"`
+}
+
+// Accumulate 把另一次模型调用的用量累加进来。
+//
+// 一轮对话可能包含多次模型往返（Agent 的每个 ReAct 轮次、压缩摘要调用、最终答案
+// 合成），持久化到 messages.usage 上的是本轮的总量，因此需要逐次累加。缓存计数
+// 同样累加（本轮一共从供应商前缀缓存里读到多少 token）；CacheReported 取或，
+// CacheStatus 保留最后一次非空值——它描述的是本轮结束时的缓存状态。
+func (u *TokenUsage) Accumulate(other TokenUsage) {
+	if u == nil {
+		return
+	}
+	u.PromptTokens += other.PromptTokens
+	u.CompletionTokens += other.CompletionTokens
+	u.TotalTokens += other.TotalTokens
+	u.CachedTokens += other.CachedTokens
+	u.CacheReadTokens += other.CacheReadTokens
+	u.CacheWriteTokens += other.CacheWriteTokens
+	u.CacheMissTokens += other.CacheMissTokens
+	if other.CacheReported {
+		u.CacheReported = true
+	}
+	if other.CacheStatus != "" {
+		u.CacheStatus = other.CacheStatus
+	}
+}
+
+// IsZero 报告这份用量是否没有任何计量（供应商未回报 usage）。
+func (u *TokenUsage) IsZero() bool {
+	return u == nil || (u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0 &&
+		u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 && u.CacheMissTokens == 0)
+}
+
+// Value 实现 driver.Valuer：用量随 assistant 消息持久化到 messages.usage
+// （PRD FR-12）。零值与 nil 都存 NULL——用户消息不消耗模型用量，供应商未回报
+// usage 的轮次也不该在库里留下一份全零的假计量。
+func (u *TokenUsage) Value() (driver.Value, error) {
+	if u.IsZero() {
+		return nil, nil
+	}
+	return json.Marshal(u)
+}
+
+// Scan 实现 sql.Scanner。
+func (u *TokenUsage) Scan(value interface{}) error {
+	if value == nil {
+		*u = TokenUsage{}
+		return nil
+	}
+	var b []byte
+	switch v := value.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		return errors.New("types: cannot scan token usage from unsupported type")
+	}
+	if len(b) == 0 {
+		*u = TokenUsage{}
+		return nil
+	}
+	return json.Unmarshal(b, u)
 }
 
 // SetPromptCacheUsage normalizes provider-specific cache counters into the

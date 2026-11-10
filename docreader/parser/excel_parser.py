@@ -67,15 +67,17 @@ class ExcelParser(BaseParser):
     
     def parse_into_text(self, content: bytes) -> Document:
         """Parse Excel file bytes into a Document object.
-        
+
         Args:
             content: Raw bytes of the Excel file
-            
+
         Returns:
             Document: Parsed document containing:
                 - content: Full text with all rows from all sheets
                 - chunks: List of Chunk objects, one per row
-                
+                - source_blocks: 每行的 {"start","end","locator"} 定位块，指向
+                  所在 sheet 与 1-based 物理行号（FR-05 引用溯源）
+
         Note:
             - Empty rows (all NaN values) are automatically skipped
             - Each row is formatted as: "col1: val1,col2: val2,..."
@@ -83,61 +85,98 @@ class ExcelParser(BaseParser):
         """
         chunks: List[Chunk] = []
         text: List[str] = []
+        source_blocks: List[dict] = []
         start, end = 0, 0
 
         excel_file = _open_excel_file(content, file_type=self.file_type)
-        
+
         # Process each sheet in the Excel file
         for excel_sheet_name in excel_file.sheet_names:
-            df = _read_sheet_dataframe(excel_file, excel_sheet_name)
-            # Remove rows where all values are NaN (completely empty rows)
+            df, header_rows = _read_sheet_dataframe(excel_file, excel_sheet_name)
+            # Remove rows where all values are NaN (completely empty rows).
+            # dropna keeps the original index labels, so row_index below stays
+            # the 0-based sheet row even across skipped rows.
             df.dropna(how="all", inplace=True)
 
-            # Process each row in the DataFrame
-            for _, row in df.iterrows():
+            # Process each row in the DataFrame. The index is the 0-based
+            # sheet row (rows are read from row 1 and skipped rows keep
+            # their labels), so index + 1 + header_rows is the row number
+            # users see in spreadsheet applications.
+            for row_index, row in df.iterrows():
                 page_content = []
                 # Build key-value pairs for non-null values
                 for k, v in row.items():
                     if pd.notna(v) and not _is_image_function(v):
                         page_content.append(f"{k}: {v}")
-                
+
                 # Skip rows with no valid content
                 if not page_content:
                     continue
-                
+
                 # Format row as comma-separated key-value pairs
                 content_row = ",".join(page_content) + "\n"
                 end += len(content_row)
                 text.append(content_row)
-                
+
                 # Create a chunk for this row with position tracking
                 chunks.append(
                     Chunk(content=content_row, seq=len(chunks), start=start, end=end)
                 )
+                # FR-05 引用溯源：为该行生成 sheet 定位块（行号 1-based，
+                # start/end 与 chunk 相同，精确对应 content 拼接偏移）。
+                try:
+                    row_number = int(row_index) + 1 + header_rows
+                except (TypeError, ValueError):
+                    row_number = 0
+                if row_number > 0:
+                    source_blocks.append(
+                        {
+                            "start": start,
+                            "end": end,
+                            "locator": {
+                                "type": "sheet",
+                                "sheet": str(excel_sheet_name),
+                                "row_start": row_number,
+                                "row_end": row_number,
+                            },
+                        }
+                    )
                 start = end
 
         # Combine all text and return as Document
-        return Document(content="".join(text), chunks=chunks)
+        return Document(
+            content="".join(text), chunks=chunks, source_blocks=source_blocks
+        )
 
 
-def _read_sheet_dataframe(excel_file: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
-    """Read a worksheet into a DataFrame with stable column labels."""
+def _read_sheet_dataframe(
+    excel_file: pd.ExcelFile, sheet_name: str
+) -> tuple[pd.DataFrame, int]:
+    """Read a worksheet into a DataFrame with stable column labels.
+
+    Returns (DataFrame, header_rows)：header_rows 是被当作表头消费掉的物理行数
+    （0 或 1），调用方据此把 DataFrame 行标签换算回 sheet 的 1-based 物理行号，
+    供引用溯源定位使用。
+    """
     from openpyxl.utils import get_column_letter
+
+    def _with_letter_columns(df: pd.DataFrame) -> pd.DataFrame:
+        df.columns = [get_column_letter(idx + 1) for idx in range(len(df.columns))]
+        return df
 
     # XLSX is preprocessed (merge fill); use A/B/C column letters and keep row 1 as data.
     if excel_file.engine == "openpyxl":
         df = excel_file.parse(sheet_name=sheet_name, header=None)
-        df.columns = [get_column_letter(idx + 1) for idx in range(len(df.columns))]
-        return df
+        return _with_letter_columns(df), 0
 
     df = excel_file.parse(sheet_name=sheet_name, header=0)
     if df.empty:
         df = excel_file.parse(sheet_name=sheet_name, header=None)
-        df.columns = [get_column_letter(idx + 1) for idx in range(len(df.columns))]
-    elif any(str(col).startswith("Unnamed:") for col in df.columns):
+        return _with_letter_columns(df), 0
+    if any(str(col).startswith("Unnamed:") for col in df.columns):
         df = excel_file.parse(sheet_name=sheet_name, header=None)
-        df.columns = [get_column_letter(idx + 1) for idx in range(len(df.columns))]
-    return df
+        return _with_letter_columns(df), 0
+    return df, 1
 
 
 def _prepare_xlsx_bytes(data: bytes) -> bytes:

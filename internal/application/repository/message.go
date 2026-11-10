@@ -115,10 +115,9 @@ func (r *messageRepository) UpdateMessage(ctx context.Context, message *types.Me
 }
 
 // DeleteMessage deletes a message
+// 删除会改写已压缩区间，因此在同一事务里失效依赖它的上下文压缩检查点（PRD FR-10）。
 func (r *messageRepository) DeleteMessage(ctx context.Context, sessionID string, messageID string) error {
-	return r.db.WithContext(ctx).Where(
-		"id = ? AND session_id = ?", messageID, sessionID,
-	).Delete(&types.Message{}).Error
+	return deleteMessageInvalidatingCheckpoints(ctx, r.db, sessionID, messageID)
 }
 
 // GetFirstMessageOfUser retrieves the first message from a user in a session

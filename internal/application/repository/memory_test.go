@@ -17,7 +17,8 @@ func newMemoryRepositoryForTest(t *testing.T) (interfaces.MemoryRepository, *gor
 
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&types.MemoryFact{}, &types.MemorySessionSummary{}))
+	require.NoError(t, db.AutoMigrate(&types.MemoryFact{}, &types.MemorySessionSummary{},
+		&types.MemoryGovernance{}, &types.MemoryGovernanceEvent{}))
 	// The dedup/partial unique indexes live in the migration SQL, not in GORM
 	// tags, so replicate them here to exercise the real schema semantics.
 	require.NoError(t, db.Exec(`CREATE UNIQUE INDEX uq_memory_facts_triple

@@ -335,6 +335,13 @@ func (h *TenantHandler) CreateTenant(c *gin.Context) {
 
 	logger.Infof(ctx, "Creating tenant, name: %s", secutils.SanitizeForLog(tenantData.Name))
 
+	// 创建路径同样要校验解析引擎的出站 URL：此前只有 KV PUT 更新路径调用，
+	// 而超级用户的整包创建请求可以把未经校验的地址直接写入库（FR-07）。
+	if err := validateParserEngineOutboundURLs(tenantData.ParserEngineConfig); err != nil {
+		c.Error(errors.NewValidationError(err.Error()))
+		return
+	}
+
 	createdTenant, err := h.service.CreateTenant(ctx, &tenantData)
 	if err != nil {
 		// Check if this is an application-specific error
@@ -1256,6 +1263,9 @@ func (h *TenantHandler) GetTenantKV(c *gin.Context) {
 	case "retrieval-config":
 		h.GetTenantRetrievalConfig(c)
 		return
+	case "memory-config":
+		h.GetTenantMemoryConfig(c)
+		return
 	default:
 		logger.Info(ctx, "KV key not supported", "key", key)
 		c.Error(errors.NewBadRequestError("unsupported key"))
@@ -1303,6 +1313,9 @@ func (h *TenantHandler) UpdateTenantKV(c *gin.Context) {
 		return
 	case "retrieval-config":
 		h.updateTenantRetrievalConfigInternal(c)
+		return
+	case "memory-config":
+		h.updateTenantMemoryConfigInternal(c)
 		return
 	default:
 		logger.Info(ctx, "KV key not supported", "key", key)
@@ -1723,18 +1736,108 @@ func (h *TenantHandler) updateTenantRetrievalConfigInternal(c *gin.Context) {
 	})
 }
 
+// GetTenantMemoryConfig returns the tenant's memory governance configuration
+// (写入模式与容量上限，FR-02 规则 7 / FR-04 规则 1)。
+func (h *TenantHandler) GetTenantMemoryConfig(c *gin.Context) {
+	ctx := c.Request.Context()
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Workspace is empty")
+		c.Error(errors.NewBadRequestError("Workspace is empty"))
+		return
+	}
+	data := tenant.MemoryConfig
+	if data == nil {
+		data = &types.TenantMemoryConfig{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		// 回显生效值，前端不需要自己复刻默认值与硬顶逻辑。
+		"data": gin.H{
+			"write_mode":        data.EffectiveWriteMode(),
+			"max_active_items":  data.EffectiveMaxActiveItems(),
+			"max_pending_items": data.EffectiveMaxPendingItems(),
+		},
+	})
+}
+
+// updateTenantMemoryConfigInternal updates the tenant's memory governance
+// configuration. 上限夹在 [1, MemoryMaxItemsHardCap]，写入模式只接受两档。
+func (h *TenantHandler) updateTenantMemoryConfigInternal(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var req types.TenantMemoryConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logger.Error(ctx, "Failed to parse request parameters", err)
+		c.Error(errors.NewValidationError("Invalid request data").WithDetails(err.Error()))
+		return
+	}
+	switch req.WriteMode {
+	case "", types.MemoryWriteAuto:
+		req.WriteMode = types.MemoryWriteAuto
+	case types.MemoryWriteExplicitOnly:
+	default:
+		c.Error(errors.NewBadRequestError("write_mode must be one of auto|explicit_only"))
+		return
+	}
+	if req.MaxActiveItems < 0 || req.MaxActiveItems > types.MemoryMaxItemsHardCap {
+		c.Error(errors.NewBadRequestError("max_active_items must be between 0 and 2000"))
+		return
+	}
+	if req.MaxPendingItems < 0 || req.MaxPendingItems > types.MemoryMaxItemsHardCap {
+		c.Error(errors.NewBadRequestError("max_pending_items must be between 0 and 2000"))
+		return
+	}
+
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		logger.Error(ctx, "Workspace is empty")
+		c.Error(errors.NewBadRequestError("Workspace is empty"))
+		return
+	}
+
+	cfg := req
+	tenant.MemoryConfig = &cfg
+	updatedTenant, err := h.service.UpdateTenant(ctx, tenant)
+	if err != nil {
+		if appErr, ok := errors.IsAppError(err); ok {
+			c.Error(appErr)
+		} else {
+			logger.ErrorWithFields(ctx, err, nil)
+			c.Error(errors.NewInternalServerError("Failed to update memory config").WithDetails(err.Error()))
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    updatedTenant.MemoryConfig,
+		"message": "Memory configuration updated successfully",
+	})
+}
+
 func validateParserEngineOutboundURLs(cfg *types.ParserEngineConfig) error {
 	if cfg == nil {
 		return nil
 	}
-	if endpoint := strings.TrimSpace(cfg.MinerUEndpoint); endpoint != "" {
-		if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
-			return fmt.Errorf("mineru_endpoint failed SSRF validation: %v", err)
-		}
+	// 解析引擎的全部出站地址都要过 SSRF 校验（FR-07）：这些值最终会被
+	// 解析器当作 HTTP 端点直接请求，漏掉任何一个就等于留了一条通往内网的
+	// 通道。键名与 ParserEngineConfig.ToOverridesMap 的输出一一对应。
+	outboundURLs := []struct {
+		key   string
+		value string
+	}{
+		{"mineru_endpoint", cfg.MinerUEndpoint},
+		{"mineru_vlm_server_url", cfg.MinerUVLMServerURL},
+		{"odl_hybrid_url", cfg.ODLHybridURL},
+		{"paddleocr_vl_endpoint", cfg.PaddleOCRVLEndpoint},
 	}
-	if vlmURL := strings.TrimSpace(cfg.MinerUVLMServerURL); vlmURL != "" {
-		if err := secutils.ValidateURLForSSRF(vlmURL); err != nil {
-			return fmt.Errorf("mineru_vlm_server_url failed SSRF validation: %v", err)
+	for _, item := range outboundURLs {
+		endpoint := strings.TrimSpace(item.value)
+		if endpoint == "" {
+			continue
+		}
+		if err := secutils.ValidateURLForSSRF(endpoint); err != nil {
+			return fmt.Errorf("%s failed SSRF validation: %v", item.key, err)
 		}
 	}
 	return nil

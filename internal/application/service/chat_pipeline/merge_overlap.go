@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/Tencent/WeKnora/internal/searchutil"
+	"github.com/Tencent/WeKnora/internal/sourceloc"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -43,6 +44,8 @@ func (p *PluginMerge) mergeOverlappingChunks(
 			)
 			lastChunk.EndAt = chunks[i].EndAt
 			lastChunk.SubChunkID = append(lastChunk.SubChunkID, chunks[i].ID)
+			// FR-05 引用溯源：合并相邻块时合并定位信息（去重）
+			lastChunk.SourceLocators = sourceloc.MergeLocators(lastChunk.SourceLocators, chunks[i].SourceLocators)
 
 			if err := mergeImageInfo(ctx, lastChunk, chunks[i]); err != nil {
 				pipelineWarn(ctx, "Merge", "image_merge", map[string]interface{}{
@@ -55,6 +58,8 @@ func (p *PluginMerge) mergeOverlappingChunks(
 			if !containsID(lastChunk.SubChunkID, chunks[i].ID) {
 				lastChunk.SubChunkID = append(lastChunk.SubChunkID, chunks[i].ID)
 			}
+			// FR-05 引用溯源：被包含块的定位信息同样并入（去重）
+			lastChunk.SourceLocators = sourceloc.MergeLocators(lastChunk.SourceLocators, chunks[i].SourceLocators)
 			if err := mergeImageInfo(ctx, lastChunk, chunks[i]); err != nil {
 				pipelineWarn(ctx, "Merge", "image_merge_contained", map[string]interface{}{
 					"knowledge_id": knowledgeID,

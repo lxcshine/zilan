@@ -477,6 +477,10 @@ type ImageMultimodalPayload struct {
 	EnableCaption   bool   `json:"enable_caption"`
 	Language        string `json:"language,omitempty"`          // Request locale for {{language}} in prompt templates
 	ImageSourceType string `json:"image_source_type,omitempty"` // Source type of the image (e.g., "scanned_pdf")
+	// PageClass 图片所在页的分类（FR-17⑤ 扫描页排除）：docreader（FR-13）
+	// 产出的 page_classes 中该图所在页的 class（text/scanned/image/mixed）。
+	// 页码取自 SourceLocators 的首个 PDF 定位器；非 PDF 或无定位器时为空。
+	PageClass string `json:"page_class,omitempty"`
 	// Attempt links this image task back to the parent ProcessDocument
 	// attempt so the worker can record its image[i] subspan under the
 	// same attempt's multimodal stage span.
@@ -485,6 +489,8 @@ type ImageMultimodalPayload struct {
 	// parent's image set. Used as the subspan name suffix
 	// ("multimodal.image[3]") so the timeline preserves order.
 	ImageIndex int `json:"image_index,omitempty"`
+	// SourceLocators 图片在原文中的位置，随图片 OCR/描述 chunk 落库（FR-05 引用溯源）
+	SourceLocators SourceLocators `json:"source_locators,omitempty"`
 }
 
 // KnowledgePostProcessPayload represents the knowledge post process task payload.

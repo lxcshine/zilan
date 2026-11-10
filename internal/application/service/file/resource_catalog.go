@@ -106,6 +106,15 @@ func (s *resourceCatalogFileService) SaveFile(
 	return ref, nil
 }
 
+// isImagePayload reports whether the bytes would register as an image. Only
+// images deduplicate（FR-18 规则 5）：extractors re-save the same image bytes
+// under several per-chunk paths, while other kinds of exports (PDF renditions,
+// share images, avatars, graphs...) keep their one-object-one-location layout.
+func isImagePayload(name string, data []byte) bool {
+	kind, _ := resourceKind(name)
+	return kind == "image"
+}
+
 func (s *resourceCatalogFileService) SaveBytes(
 	ctx context.Context,
 	data []byte,
@@ -113,12 +122,23 @@ func (s *resourceCatalogFileService) SaveBytes(
 	fileName string,
 	temp bool,
 ) (string, error) {
+	sum := sha256.Sum256(data)
+	contentHash := hex.EncodeToString(sum[:])
+	// A persistent image whose bytes are already stored is referenced, not
+	// written again: the extractor saves each extracted image once (it does
+	// not know the catalog), and the same image pulled from two pages, or
+	// extracted again on a re-parse, must not double the storage. The lookup
+	// is best-effort — on error the bytes are written as before.
+	if !temp && isImagePayload(fileName, data) {
+		if reused, ok, err := s.catalog.ReuseByContentHash(ctx, tenantID, contentHash); err == nil && ok {
+			return reused, nil
+		}
+	}
 	physical, err := s.inner.SaveBytes(ctx, data, tenantID, fileName, temp)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(data)
-	return s.register(ctx, physical, tenantID, fileName, int64(len(data)), temp, hex.EncodeToString(sum[:]))
+	return s.register(ctx, physical, tenantID, fileName, int64(len(data)), temp, contentHash)
 }
 
 func (s *resourceCatalogFileService) resolve(ctx context.Context, value string) (string, bool, error) {

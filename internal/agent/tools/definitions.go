@@ -18,6 +18,10 @@ const (
 	ToolDataSchema          = "data_schema"
 	ToolWebSearch           = "web_search"
 	ToolWebFetch            = "web_fetch"
+	// ToolReadFile 按需读取本会话附件（attachment://）。它不在
+	// AvailableToolDefinitions / DefaultAllowedTools 里：注册与否跟随会话内容，
+	// 用户发过的文件必须始终可读（PRD FR-22 ③）。
+	ToolReadFile = "read_file"
 	// Skills-related tools (only available when skills are enabled)
 	ToolExecuteSkillScript = "execute_skill_script"
 	ToolReadSkill          = "read_skill"

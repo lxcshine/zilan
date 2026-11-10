@@ -79,7 +79,7 @@ func splitByHeuristicsImpl(text string, cfg SplitterConfig, _ *DocProfile) []Chu
 			// large to fit in any chunk. Flush current accumulation, then
 			// recursively chunk the oversize block via the legacy splitter.
 			if curEnd-chunkStart > 0 {
-				out = appendChunk(out, runes, chunkStart, curEnd, &seq)
+				out = appendChunk(out, runes, chunkStart, curEnd, &seq, cfg.ChunkSize)
 				chunkStart = curEnd
 			}
 			out = appendOversizeBlock(out, runes, curEnd, nextEnd, cfg, &seq)
@@ -92,7 +92,7 @@ func splitByHeuristicsImpl(text string, cfg SplitterConfig, _ *DocProfile) []Chu
 		accumulated := nextEnd - chunkStart
 		if accumulated > cfg.ChunkSize && curEnd-chunkStart >= minChunkSize {
 			// Flush accumulated content as a chunk, restart at curEnd.
-			out = appendChunk(out, runes, chunkStart, curEnd, &seq)
+			out = appendChunk(out, runes, chunkStart, curEnd, &seq, cfg.ChunkSize)
 			// Snap overlap start to the nearest semantic boundary or line
 			// break instead of slicing mid-line / mid-word.
 			chunkStart = applyOverlapAligned(runes, curEnd, cfg.ChunkOverlap, bounds)
@@ -102,7 +102,7 @@ func splitByHeuristicsImpl(text string, cfg SplitterConfig, _ *DocProfile) []Chu
 
 	// Flush remaining content.
 	if curEnd > chunkStart {
-		out = appendChunk(out, runes, chunkStart, curEnd, &seq)
+		out = appendChunk(out, runes, chunkStart, curEnd, &seq, cfg.ChunkSize)
 	}
 	return out
 }
@@ -230,17 +230,24 @@ func allRuneIndices(text, needle string) []int {
 
 // appendChunk slices runes[start:end] into a Chunk and appends it to out.
 // Pure-whitespace slices are skipped (boundary clustering can occasionally
-// produce them). The Content stored is the raw slice — Start/End rune
-// offsets must match utf8.RuneCountInString(Content) for downstream
-// reconstruction code; whitespace stripping for embedding happens in
-// Chunk.EmbeddingContent.
-func appendChunk(out []Chunk, runes []rune, start, end int, seq *int) []Chunk {
+// produce them). Start/End always describe the source slice; whitespace
+// stripping for embedding happens in Chunk.EmbeddingContent.
+//
+// headerBudget is cfg.ChunkSize: when the chunk starts on a table data row, the
+// table's header is prepended as a synthetic prefix (FR-15 规则③ keeps 表头续接
+// effective in the heuristic tier too) unless the header alone would exceed the
+// budget. The prefix occupies no source positions, so Start/End stay accurate
+// while Content grows — the same contract mergeUnits uses.
+func appendChunk(out []Chunk, runes []rune, start, end int, seq *int, headerBudget int) []Chunk {
 	if end <= start {
 		return out
 	}
 	raw := string(runes[start:end])
 	if strings.TrimSpace(raw) == "" {
 		return out
+	}
+	if header := continuedTableHeader(runes, start, headerBudget); header != "" {
+		raw = header + raw
 	}
 	c := Chunk{Content: raw, Seq: *seq, Start: start, End: end}
 	*seq++

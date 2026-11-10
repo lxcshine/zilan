@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
 	apperrors "github.com/Tencent/WeKnora/internal/errors"
@@ -35,12 +36,49 @@ func (s *knowledgeBaseService) GetQueryEmbedding(ctx context.Context, kbID strin
 		return nil, err
 	}
 
-	return embeddingModel.Embed(ctx, queryText)
+	vector, err := embeddingModel.Embed(ctx, queryText)
+	if err != nil {
+		return nil, err
+	}
+	// 维度校验（FR-19⑤）：不同向量宽度的索引必须隔离。放行的两种情况是
+	// 模型未声明维度（dimensions == 0，老配置常见）与空向量（actual == 0，
+	// 例如禁用了向量召回），否则历史配置会全部报错。
+	if err := validateQueryEmbeddingDimension(embeddingModel, len(vector)); err != nil {
+		logger.Errorf(ctx, "GetQueryEmbedding: %v", err)
+		return nil, err
+	}
+	return vector, nil
+}
+
+// validateQueryEmbeddingDimension 在畸形查询打到向量库之前拦住“模型配置漂移”。
+// 没有这层校验时，厂商返回了不同长度的向量只会被上层报成语义误导的
+// 2201「绑定存储不可用」；而对按维度分表的存储（collection 名含维度）来说，
+// 更糟的是它会静默地查不到任何东西。
+func validateQueryEmbeddingDimension(model embedding.Embedder, actual int) error {
+	if model == nil || actual == 0 {
+		return nil
+	}
+	expected := model.GetDimensions()
+	if expected <= 0 || expected == actual {
+		return nil
+	}
+	return apperrors.NewVectorStoreUnavailableError(
+		"embedding vector dimension does not match the configured model",
+	).WithDetails(map[string]any{
+		"model":              model.GetModelName(),
+		"expected_dimension": expected,
+		"actual_dimension":   actual,
+		"hint": fmt.Sprintf(
+			"check the embedding model configuration and rebuild the affected index (%d dimensions)",
+			expected),
+	})
 }
 
 // ResolveEmbeddingModelKeys resolves embedding model IDs to their actual model
-// identity key (name + endpoint). KBs using the same underlying model across
-// different tenants will share the same key, enabling optimal grouping.
+// identity key (name + endpoint + 配置的向量维度). KBs using the same
+// underlying model AND the same vector space across different tenants will
+// share the same key, enabling optimal grouping without reusing one query
+// embedding across incompatible index dimensions.
 func (s *knowledgeBaseService) ResolveEmbeddingModelKeys(ctx context.Context, kbs []*types.KnowledgeBase) map[string]string {
 	type modelRef struct {
 		ModelID  string
@@ -56,7 +94,11 @@ func (s *knowledgeBaseService) ResolveEmbeddingModelKeys(ctx context.Context, kb
 		kbRefs[kb.ID] = ref
 	}
 
-	// Resolve each unique (modelID, tenantID) to a model identity key
+	// Resolve each unique (modelID, tenantID) to a model identity key。
+	// 维度必须进 key：OpenAI 等厂商支持同一模型名 + 同一 endpoint 输出多种
+	// 向量宽度，只用 name|baseURL 会让 1536 维与 512 维的两个模型拿到同一个
+	// key，上层据此复用同一份预计算 query embedding 去查不同维度的
+	// collection —— 结果要么报错要么静默零命中（FR-19⑤）。
 	resolvedKeys := make(map[modelRef]string, len(uniqueRefs))
 	for ref := range uniqueRefs {
 		tenantCtx := context.WithValue(ctx, types.TenantIDContextKey, ref.TenantID)
@@ -66,7 +108,8 @@ func (s *knowledgeBaseService) ResolveEmbeddingModelKeys(ctx context.Context, kb
 			resolvedKeys[ref] = ref.ModelID
 			continue
 		}
-		resolvedKeys[ref] = model.Name + "|" + model.Parameters.BaseURL
+		resolvedKeys[ref] = fmt.Sprintf("%s|%s|%d", model.Name, model.Parameters.BaseURL,
+			model.Parameters.EmbeddingParameters.Dimension)
 	}
 
 	result := make(map[string]string, len(kbs))
@@ -333,12 +376,19 @@ func (s *knowledgeBaseService) buildRetrievalParams(
 	// scope happens to include them (e.g. KBSelectionMode=all picking up a
 	// wiki-only KB).
 	var faqVectorKBIDs, docVectorKBIDs, docKeywordKBIDs []string
+	// FR-17 图文共空间检索：组内任一 KB 开启图片向量索引时，文档向量腿
+	// 需要扩池并提高阈值（图片行 caption 的文本信号弱，不扩池进不了
+	// 过采样候选；阈值提到图片腿下限防止弱相关图片行混入）。
+	hasImageVectorKB := false
 	for _, kb := range groupKBs {
 		if kb.IsVectorEnabled() && kb.EmbeddingModelID != "" {
 			if kb.Type == types.KnowledgeBaseTypeFAQ {
 				faqVectorKBIDs = append(faqVectorKBIDs, kb.ID)
 			} else {
 				docVectorKBIDs = append(docVectorKBIDs, kb.ID)
+				if kb.IsImageVectorEnabled() {
+					hasImageVectorKB = true
+				}
 			}
 		}
 		// FAQ KBs are retrieved exclusively via the FAQ vector index and
@@ -359,13 +409,13 @@ func (s *knowledgeBaseService) buildRetrievalParams(
 			return nil, err
 		}
 
-		appendVectorParams := func(kbIDs []string, knowledgeType string) {
+		appendVectorParams := func(kbIDs []string, knowledgeType string, topK int, threshold float64) {
 			retrieveParams = append(retrieveParams, types.RetrieveParams{
 				Query:            params.QueryText,
 				Embedding:        queryEmbedding,
 				KnowledgeBaseIDs: kbIDs,
-				TopK:             matchCount,
-				Threshold:        params.VectorThreshold,
+				TopK:             topK,
+				Threshold:        threshold,
 				RetrieverType:    types.VectorRetrieverType,
 				KnowledgeIDs:     params.KnowledgeIDs,
 				TagIDs:           params.TagIDs,
@@ -377,10 +427,11 @@ func (s *knowledgeBaseService) buildRetrievalParams(
 		// index. A group containing both types yields one retrieval param
 		// per index so each KB is queried against the index it was written to.
 		if len(docVectorKBIDs) > 0 {
-			appendVectorParams(docVectorKBIDs, "")
+			docTopK, docThreshold := withImageVectorRecall(matchCount, params.VectorThreshold, hasImageVectorKB)
+			appendVectorParams(docVectorKBIDs, "", docTopK, docThreshold)
 		}
 		if len(faqVectorKBIDs) > 0 {
-			appendVectorParams(faqVectorKBIDs, types.KnowledgeTypeFAQ)
+			appendVectorParams(faqVectorKBIDs, types.KnowledgeTypeFAQ, matchCount, params.VectorThreshold)
 		}
 		logger.Info(ctx, "Vector retrieval parameters setup completed")
 	}
@@ -442,6 +493,12 @@ func (s *knowledgeBaseService) resolveQueryEmbedding(
 	queryEmbedding, err := embeddingModel.Embed(ctx, params.QueryText)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to embed query text, query text: %s, error: %v", params.QueryText, err)
+		return nil, err
+	}
+	// 与 GetQueryEmbedding 同样的维度校验：这一路是“分组内自己算 embedding”，
+	// 不能因为走了不同入口就跳过隔离检查。
+	if err := validateQueryEmbeddingDimension(embeddingModel, len(queryEmbedding)); err != nil {
+		logger.Errorf(ctx, "resolveQueryEmbedding: %v", err)
 		return nil, err
 	}
 	logger.Infof(ctx, "Query embedding generated successfully, embedding vector length: %d", len(queryEmbedding))

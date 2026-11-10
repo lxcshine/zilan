@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/url"
 	"regexp"
@@ -18,7 +19,16 @@ import (
 
 const (
 	maxBodySize = 1024 * 10 // 最大记录10KB的body内容
+	// bodyTruncatedMarker 是日志里跟在被截断的 body 后面的标记。
+	bodyTruncatedMarker = "... [内容过长，已截断]"
 )
+
+// replayedBody 把日志窥探消费掉的字节还给 handler，让它读到的 body 与没有这层
+// 中间件时完全一致；Close 仍然关闭原始 body，连接得以释放。
+type replayedBody struct {
+	io.Reader
+	io.Closer
+}
 
 // loggerResponseBodyWriter 自定义ResponseWriter用于捕获响应内容（用于logger中间件）
 type loggerResponseBodyWriter struct {
@@ -43,15 +53,33 @@ func (r loggerResponseBodyWriter) Write(b []byte) (int, error) {
 // sensitiveFieldRegex 匹配 JSON 中的敏感字段（不区分大小写，兼容 snake_case / camelCase / PascalCase）。
 // $1 捕获原始字段名（包括两侧引号），保持日志中的字段名不变，仅将值替换为 "***"。
 var sensitiveFieldRegex = regexp.MustCompile(
-	`(?i)("(?:new[_-]?password|old[_-]?password|password|passwd|token|access[_-]?token|` +
-		`refresh[_-]?token|id[_-]?token|authorization|auth[_-]?token|api[_-]?key|` +
+	`(?i)("(?:new[_-]?password|old[_-]?password|password|passwd|ticket|token|access[_-]?token|` +
+		`refresh[_-]?token|next[_-]?token|device[_-]?token|pending[_-]?token|pairing[_-]?link|` +
+		`id[_-]?token|authorization|auth[_-]?token|api[_-]?key|` +
 		`api[_-]?secret|secret[_-]?key|client[_-]?secret|private[_-]?key|secret|` +
-		`authorization[_-]?url|authorization[_-]?attempt)")\s*:\s*"[^"]*"`,
+		`authorization[_-]?url|authorization[_-]?attempt|assertion)")\s*:\s*"[^"]*"`,
 )
 
-// sanitizeBody 清理敏感信息
+// dataURIRegex 匹配 base64 载荷的内联 data URI。请求日志上限只有 10KB，
+// 一次图片上传就能把整个上限填满文件字节（FR-08：日志不该承载内容载荷）。
+var dataURIRegex = regexp.MustCompile(`(?i)\bdata:[^\s"'<>]{0,128};base64,[A-Za-z0-9+/=\r\n]*`)
+
+// sanitizeBody 清理敏感字段，并把 data URI 的 base64 载荷换成长度标记。
 func sanitizeBody(body string) string {
-	return sensitiveFieldRegex.ReplaceAllString(body, `$1:"***"`)
+	redacted := dataURIRegex.ReplaceAllStringFunc(body, redactDataURI)
+	return sensitiveFieldRegex.ReplaceAllString(redacted, `$1:"***"`)
+}
+
+// redactDataURI 保留 data URI 的媒体类型（诊断需要），只把 base64 载荷
+// 换成字符数标记。
+func redactDataURI(match string) string {
+	marker := ";base64,"
+	idx := strings.Index(strings.ToLower(match), marker)
+	if idx < 0 {
+		return "data:[redacted]"
+	}
+	payloadLen := len(match) - idx - len(marker)
+	return fmt.Sprintf("%s;base64,[redacted %d chars]", match[:idx], payloadLen)
 }
 
 var sensitiveQueryFields = map[string]struct{}{
@@ -61,7 +89,11 @@ var sensitiveQueryFields = map[string]struct{}{
 	"id_token":              {},
 	"refresh_token":         {},
 	"state":                 {},
-	"token":                 {},
+	// ticket 是一次性握手凭据：浏览器无法在 upgrade 请求上设置
+	// Authorization 头，因此它只能走 query string；持有者在有效期内
+	// 就能建立会话，绝不能进访问日志。
+	"ticket": {},
+	"token":  {},
 }
 
 // sanitizeQuery prevents OAuth authorization codes and CSRF/attempt state from
@@ -94,26 +126,32 @@ func readRequestBody(c *gin.Context) string {
 		return "[非文本类型，已跳过]"
 	}
 
-	// 完整读取body内容（不限制大小），因为需要完整重置给后续handler使用
-	bodyBytes, err := io.ReadAll(c.Request.Body)
+	// 只窥探日志需要的那点字节，剩余部分原样交还后续 handler（FR-07）。
+	//
+	// 这里原本是无上限的 io.ReadAll(c.Request.Body)：Logger 注册在 Auth 之前，
+	// 对所有请求生效，而 handler 里的 http.MaxBytesReader 要等到中间件放行后
+	// 才装上——body 早已被整体读进内存，那些上限只剩报错的意义，没有真正
+	// 限住内存；没有装上限的路由（对话、检索、IM webhook）则连报错都没有。
+	// 多读 1 字节用于判断是否发生了截断。
+	bodyBytes, err := io.ReadAll(io.LimitReader(c.Request.Body, maxBodySize+1))
+	originalBody := c.Request.Body
+	c.Request.Body = &replayedBody{
+		Reader: io.MultiReader(bytes.NewReader(bodyBytes), originalBody),
+		Closer: originalBody,
+	}
 	if err != nil {
 		return "[读取请求体失败]"
 	}
 
-	// 重置request body，使用完整内容，确保后续handler能读取到完整数据
-	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
 	// 用于日志的body（限制大小）
-	var logBodyBytes []byte
-	if len(bodyBytes) > maxBodySize {
-		logBodyBytes = bodyBytes[:maxBodySize]
-	} else {
-		logBodyBytes = bodyBytes
+	truncated := len(bodyBytes) > maxBodySize
+	if truncated {
+		bodyBytes = bodyBytes[:maxBodySize]
 	}
 
-	bodyStr := string(logBodyBytes)
-	if len(bodyBytes) > maxBodySize {
-		bodyStr += "... [内容过长，已截断]"
+	bodyStr := string(bodyBytes)
+	if truncated {
+		bodyStr += bodyTruncatedMarker
 	}
 
 	return sanitizeBody(bodyStr)
@@ -213,7 +251,7 @@ func Logger() gin.HandlerFunc {
 				strings.Contains(contentType, "text/") {
 				bodyBytes := responseBody.Bytes()
 				if len(bodyBytes) >= maxBodySize {
-					responseBodyStr = string(bodyBytes[:maxBodySize]) + "... [内容过长，已截断]"
+					responseBodyStr = string(bodyBytes[:maxBodySize]) + bodyTruncatedMarker
 				} else {
 					responseBodyStr = string(bodyBytes)
 				}

@@ -36,6 +36,11 @@ func (s *stubResourceCatalog) Register(
 	panic("unexpected Register")
 }
 
+// FR-18 规则 5 新增的接口方法：文件代理路由测试不会走到按内容哈希复用。
+func (s *stubResourceCatalog) ReuseByContentHash(context.Context, uint64, string) (string, bool, error) {
+	return "", false, nil
+}
+
 func (s *stubResourceCatalog) Resolve(context.Context, string) (*types.StoredResource, error) {
 	return s.resource, nil
 }

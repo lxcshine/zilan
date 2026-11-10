@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
 	"github.com/Tencent/WeKnora/internal/config"
+	"github.com/Tencent/WeKnora/internal/contextx"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/embedding"
@@ -50,9 +52,11 @@ type memoryService struct {
 	memoryRepo    interfaces.MemoryRepository
 	messageRepo   interfaces.MessageRepository
 	userRepo      interfaces.UserRepository
+	tenantRepo    interfaces.TenantRepository
 	modelService  interfaces.ModelService
 	taskEnqueuer  interfaces.TaskEnqueuer
 	precipitation interfaces.SessionPrecipitationService
+	audit         interfaces.AuditLogService
 }
 
 // NewMemoryService creates the three-layer memory service.
@@ -61,18 +65,22 @@ func NewMemoryService(
 	memoryRepo interfaces.MemoryRepository,
 	messageRepo interfaces.MessageRepository,
 	userRepo interfaces.UserRepository,
+	tenantRepo interfaces.TenantRepository,
 	modelService interfaces.ModelService,
 	taskEnqueuer interfaces.TaskEnqueuer,
 	precipitation interfaces.SessionPrecipitationService,
+	audit interfaces.AuditLogService,
 ) interfaces.MemoryService {
 	return &memoryService{
 		cfg:           cfg,
 		memoryRepo:    memoryRepo,
 		messageRepo:   messageRepo,
 		userRepo:      userRepo,
+		tenantRepo:    tenantRepo,
 		modelService:  modelService,
 		taskEnqueuer:  taskEnqueuer,
 		precipitation: precipitation,
+		audit:         audit,
 	}
 }
 
@@ -89,6 +97,17 @@ func (s *memoryService) EnqueueMemoryExtract(ctx context.Context, payload *types
 	if !s.IsEnabled(ctx, payload.UserID) {
 		return
 	}
+	// 写入模式为「仅显式」或自动抽取已被容量治理暂停时，不发起后台抽取，
+	// 因此也不会产生 pending 项（FR-02 规则 7 / FR-04 异常）。
+	if !s.autoExtractAllowed(ctx, payload.TenantID, payload.UserID) {
+		logger.Debugf(ctx, "[Memory] auto extraction not allowed for user %q, skipping enqueue", payload.UserID)
+		return
+	}
+	// 入队时捕获围栏世代与对话时间：任务可能在清空前入队、在清空后完成，
+	// 落库前据此拦截（FR-01 规则 4）。
+	fence := s.captureFence(ctx, payload.TenantID, payload.UserID, payload.ConversationAt)
+	payload.ConversationAt = fence.ConversationAt
+	payload.FenceGeneration = fence.Generation
 	langfuse.InjectTracing(ctx, payload)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -140,6 +159,30 @@ func (s *memoryService) ProcessMemoryExtract(ctx context.Context, task *asynq.Ta
 		return nil
 	}
 
+	// 写入模式与暂停状态在执行时再校验一次：入队后工作区配置可能已变更。
+	if !s.autoExtractAllowed(ctx, payload.TenantID, payload.UserID) {
+		logger.Debugf(ctx, "[Memory] auto extraction not allowed for user %q, skipping task", payload.UserID)
+		return nil
+	}
+
+	// 清空时序围栏预检查（FR-01 规则 4）：任务可能在清空前入队、清空后执行，
+	// 其携带的对话时间早于截止点或世代已轮换，此时既不值得调用模型，也绝不能
+	// 把记忆写回去。被拦截只计数、不报错（FR-01 规则 5），返回 nil 直接 ack。
+	fence := types.MemoryWriteFence{
+		ConversationAt: payload.ConversationAt,
+		Generation:     payload.FenceGeneration,
+	}
+	if fence.ConversationAt.IsZero() {
+		fence.ConversationAt = time.Now()
+	}
+	if s.fenceBlocks(ctx, payload.TenantID, payload.UserID, fence) {
+		logger.Infof(ctx, "[Memory] extract task fenced by memory clear, dropped (session %s user %s)",
+			payload.SessionID, payload.UserID)
+		return nil
+	}
+	// 本次任务的所有写入共用这道围栏：仓储层在每个写路径统一校验。
+	ctx = types.WithMemoryWriteFence(ctx, fence)
+
 	// 1. Load the recent conversation excerpt.
 	messages, err := s.messageRepo.GetRecentMessagesBySession(ctx, payload.SessionID, memoryExtractionTurns)
 	if err != nil {
@@ -180,8 +223,8 @@ func (s *memoryService) ProcessMemoryExtract(ctx context.Context, task *asynq.Ta
 		s.refreshSessionSummary(ctx, &payload, messages, result, summaryEmbedding)
 	}
 
-	// 7. Enforce the per-user cap so recall stays a cheap in-Go rescore.
-	s.enforceFactCap(ctx, payload.TenantID, payload.UserID)
+	// 7. 容量治理（FR-04）：active 与 pending 两类上限分别复核，超限按排名归档。
+	s.enforceMemoryCapacity(ctx, payload.TenantID, payload.UserID)
 
 	// 8. 知识沉淀 (4.4): high-value sessions (favorited or sustained
 	//    follow-ups) get distilled into the tenant's precipitation KB.
@@ -425,13 +468,18 @@ func (s *memoryService) upsertExtractedFacts(
 			Content:    content,
 			Confidence: clamp01(item.Confidence, 0.7),
 			Importance: clamp01(item.Importance, 0.5),
-			Status:     types.MemoryStatusActive,
-			DueAt:      parseMemoryDueAt(item.DueAt),
+			// 后台抽取属系统推断：来源 extracted，按 PRD §3.2 进入 pending，
+			// 用户确认后才生效，且永不注入 prompt（FR-02 规则 2/4）。
+			// 「反馈→技巧」闭环产出的技巧类记忆同样走这道门控。
+			Origin: types.MemoryOriginExtracted,
+			Status: types.MemoryStatusForOrigin(types.MemoryOriginExtracted),
+			DueAt:  parseMemoryDueAt(item.DueAt),
 		}
 		if i < len(factEmbeddings) && factEmbeddings[i] != nil {
 			fact.Embedding = factEmbeddings[i]
 		}
 		fact.TripleHash = types.ComputeTripleHash(fact.Category, fact.Subject, fact.Predicate, fact.Object)
+		fact.NormalizedKey = types.ComputeNormalizedKey(fact.Category, fact.Subject, fact.Predicate)
 
 		existing, err := s.memoryRepo.GetFactByTripleHash(ctx, fact.TenantID, fact.UserID, fact.TripleHash)
 		if err != nil {
@@ -442,6 +490,13 @@ func (s *memoryService) upsertExtractedFacts(
 			// Refresh instead of duplicating: keep the stronger confidence /
 			// importance signals and bump access so the fact stays hot.
 			fact.ID = existing.ID
+			// 状态与来源保持既有值：已确认的记忆不会因为又被推断一次而退回
+			// 待确认，用户已拒绝（archived）或已被取代（superseded）的裁决
+			// 同样不被后台任务推翻。
+			fact.Status = existing.Status
+			if existing.Origin != "" {
+				fact.Origin = existing.Origin
+			}
 			if fact.Confidence < existing.Confidence {
 				fact.Confidence = existing.Confidence
 			}
@@ -455,6 +510,9 @@ func (s *memoryService) upsertExtractedFacts(
 				fact.Embedding = existing.Embedding
 			}
 			if _, err := s.memoryRepo.UpdateFact(ctx, fact); err != nil {
+				if errors.Is(err, types.ErrMemoryWriteFenced) {
+					continue
+				}
 				logger.Warnf(ctx, "[Memory] refresh fact %s failed: %v", existing.ID, err)
 				continue
 			}
@@ -462,7 +520,16 @@ func (s *memoryService) upsertExtractedFacts(
 			upserted++
 			continue
 		}
+		// 矛盾判定（FR-03）：pending 不立即取代 active，只记下拟取代目标，
+		// 用户确认时才落地取代；阈值边界的疑似矛盾同样交用户裁决。
+		if conflict := s.detectConflicts(ctx, fact); conflict.first() != "" {
+			fact.ReplacesID = conflict.first()
+		}
 		if err := s.memoryRepo.CreateFact(ctx, fact); err != nil {
+			if errors.Is(err, types.ErrMemoryWriteFenced) {
+				// 用户已清空记忆：静默丢弃（FR-01 规则 5）。
+				continue
+			}
 			logger.Warnf(ctx, "[Memory] create fact failed: %v", err)
 			continue
 		}
@@ -491,28 +558,12 @@ func (s *memoryService) refreshSessionSummary(
 		Embedding:     summaryEmbedding,
 	}
 	if err := s.memoryRepo.UpsertSessionSummary(ctx, summary); err != nil {
+		if errors.Is(err, types.ErrMemoryWriteFenced) {
+			// 用户已清空记忆：静默丢弃（FR-01 规则 5）。
+			return
+		}
 		logger.Warnf(ctx, "[Memory] upsert session summary failed (session %s): %v", payload.SessionID, err)
 	}
-}
-
-// enforceFactCap evicts the lowest-importance facts beyond MaxFactsPerUser.
-func (s *memoryService) enforceFactCap(ctx context.Context, tenantID uint64, userID string) {
-	count, err := s.memoryRepo.CountActiveFacts(ctx, tenantID, userID)
-	if err != nil || count <= types.MaxFactsPerUser {
-		return
-	}
-	excess := int(count - types.MaxFactsPerUser)
-	candidates, err := s.memoryRepo.ListLowestImportanceFacts(ctx, tenantID, userID, excess)
-	if err != nil {
-		return
-	}
-	for _, fact := range candidates {
-		if _, err := s.memoryRepo.DeleteFact(ctx, tenantID, userID, fact.ID); err != nil {
-			logger.Warnf(ctx, "[Memory] evict fact %s failed: %v", fact.ID, err)
-		}
-	}
-	logger.Infof(ctx, "[Memory] evicted %d low-importance facts for user %s (cap %d)",
-		len(candidates), userID, types.MaxFactsPerUser)
 }
 
 // ---------------------------------------------------------------------------
@@ -534,8 +585,15 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 		params = &types.MemoryRecallParams{}
 	}
 	now := params.Now
+	accessedAt := now
 	if now.IsZero() {
-		now = time.Now()
+		realNow := time.Now()
+		accessedAt = realNow
+		// FR-11（Prompt 缓存前缀稳定化）：打分时刻对齐到当天零点。若每轮都用
+		// time.Now()，时间衰减因子会让评分逐轮漂移，评分相同的条目排序随之抖动，
+		// L1 记忆常驻块的渲染字节就不再稳定，供应商侧的前缀缓存永远命中不了。
+		// 半衰期是 7~30 天，日粒度对齐带来的评分误差可以忽略。
+		now = time.Date(realNow.Year(), realNow.Month(), realNow.Day(), 0, 0, 0, 0, realNow.Location())
 	}
 	limit := params.Limit
 	if limit <= 0 {
@@ -623,7 +681,14 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 		semantic = append(semantic, &types.RecalledMemory{Kind: "session_summary", Summary: sum, Score: score})
 	}
 
-	sort.Slice(semantic, func(i, j int) bool { return semantic[i].Score > semantic[j].Score })
+	// 稳定排序 + ID 二级键：评分相同的条目必须有确定次序，否则 L1 记忆块的渲染
+	// 字节会逐轮抖动，稳定前缀随之失效（FR-11 ④）。
+	sort.SliceStable(semantic, func(i, j int) bool {
+		if semantic[i].Score != semantic[j].Score {
+			return semantic[i].Score > semantic[j].Score
+		}
+		return recalledID(semantic[i]) < recalledID(semantic[j])
+	})
 	if len(semantic) > limit {
 		semantic = semantic[:limit]
 	}
@@ -638,7 +703,7 @@ func (s *memoryService) Recall(ctx context.Context, params *types.MemoryRecallPa
 	if ids := recalledFactIDs(scored); len(ids) > 0 {
 		bgCtx := context.WithoutCancel(ctx)
 		go func() {
-			if err := s.memoryRepo.TouchFacts(bgCtx, tenantID, userID, ids, now); err != nil {
+			if err := s.memoryRepo.TouchFacts(bgCtx, tenantID, userID, ids, accessedAt); err != nil {
 				logger.Warnf(bgCtx, "[Memory] touch facts failed: %v", err)
 			}
 		}()
@@ -742,114 +807,244 @@ func factLine(fact *types.MemoryFact) string {
 	return line
 }
 
-// FormatRecalledForPrompt renders recalled memories as a system-prompt block,
-// grouped into the four memory modules with fixed section order and
-// per-module budgets (soul directives → user profile → memory stream →
-// assistant skills). Raw feedback is archived for audit but never injected —
-// only its distilled skill is.
-func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory) string {
+// 记忆块的固定文案与分节顺序（FR-11 ④：记忆常驻块的渲染顺序必须确定，
+// 分节按固定顺序、节内按稳定键排序，渲染结果才是记忆集合的纯函数）。
+const (
+	memoryPromptHeader     = "## 关于用户的长期记忆\n以下来自历史对话的记忆可能与本问题相关，请在回答时自然地利用，不要逐字复述：\n"
+	memorySectionSoul      = "### 助手风格指令（用户设定）"
+	memorySectionProfile   = "### 用户档案"
+	memorySectionFacts     = "### 相关长期记忆"
+	memorySectionSummaries = "相关历史对话摘要："
+	memorySectionSkills    = "### 助手经验"
+)
+
+// memorySummaryMaxRunes 限定常驻条目"摘要降级形式"的长度（FR-20 ③）。
+const memorySummaryMaxRunes = 40
+
+// residentSummaryLine 生成常驻条目的摘要降级形式：优先使用主谓宾三元组这一最紧凑
+// 的等价表述，缺失时退化为按长度确定性截断的内容。纯函数——同一条记忆每轮得到
+// 完全相同的摘要，常驻块因此只在"整块原文 / 整块摘要"两态之间切换。
+func residentSummaryLine(fact *types.MemoryFact) string {
+	summary := ""
+	parts := make([]string, 0, 3)
+	for _, p := range []string{fact.Subject, fact.Predicate, fact.Object} {
+		if p = strings.TrimSpace(p); p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) >= 2 {
+		summary = strings.Join(parts, " ")
+	}
+	if summary == "" {
+		summary = strings.TrimSpace(fact.Content)
+	}
+	if runes := []rune(summary); len(runes) > memorySummaryMaxRunes {
+		summary = string(runes[:memorySummaryMaxRunes]) + "…"
+	}
+	return "- " + summary
+}
+
+// isResidentRecall 报告一条召回记忆是否属于常驻块（soul / profile / preference /
+// skill）。常驻块不参与逐条裁剪，只走整块保留或整块降级（FR-20 ③）。
+func isResidentRecall(m *types.RecalledMemory) bool {
+	if m == nil || m.Fact == nil {
+		return false
+	}
+	return m.Resident || types.IsResidentMemoryCategory(m.Fact.Category)
+}
+
+// recalledID 返回排序用的稳定二级键：主排序值相同的条目必须有一个不随轮变化的
+// 次序，否则记忆块的渲染字节会抖动，稳定前缀随之失效（FR-11 ④）。
+func recalledID(m *types.RecalledMemory) string {
+	switch m.Kind {
+	case "fact":
+		if m.Fact != nil {
+			return m.Fact.ID
+		}
+	case "session_summary":
+		if m.Summary != nil {
+			return m.Summary.ID
+		}
+	}
+	return ""
+}
+
+// sortRecalled 按 (rank 降序, ID 升序) 稳定排序。
+func sortRecalled(rows []*types.RecalledMemory, rank func(*types.RecalledMemory) float64) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		ri, rj := rank(rows[i]), rank(rows[j])
+		if ri != rj {
+			return ri > rj
+		}
+		return recalledID(rows[i]) < recalledID(rows[j])
+	})
+}
+
+func importanceRank(m *types.RecalledMemory) float64 {
+	if m.Fact == nil {
+		return 0
+	}
+	return m.Fact.Importance
+}
+
+func skillRank(m *types.RecalledMemory) float64 {
+	if m.Fact == nil {
+		return 0
+	}
+	return m.Fact.Importance * m.Fact.Confidence
+}
+
+func scoreRank(m *types.RecalledMemory) float64 { return m.Score }
+
+// factBlocks 把召回条目渲染成 L1 记忆块单元；常驻条目额外携带摘要降级形式。
+func factBlocks(rows []*types.RecalledMemory) []contextx.MemoryBlock {
+	blocks := make([]contextx.MemoryBlock, 0, len(rows))
+	for _, m := range rows {
+		if m == nil || m.Fact == nil {
+			continue
+		}
+		blk := contextx.MemoryBlock{
+			Text:     factLine(m.Fact),
+			Score:    m.Score,
+			Resident: isResidentRecall(m),
+		}
+		if blk.Resident {
+			blk.Summary = residentSummaryLine(m.Fact)
+		}
+		blocks = append(blocks, blk)
+	}
+	return blocks
+}
+
+// summaryBlocks 渲染 L2 会话摘要条目（非常驻：预算不足时按评分整条移除）。
+func summaryBlocks(rows []*types.RecalledMemory) []contextx.MemoryBlock {
+	blocks := make([]contextx.MemoryBlock, 0, len(rows))
+	for _, m := range rows {
+		if m == nil || m.Summary == nil {
+			continue
+		}
+		blocks = append(blocks, contextx.MemoryBlock{
+			Text:  "- " + m.Summary.Summary,
+			Score: m.Score,
+		})
+	}
+	return blocks
+}
+
+// BuildMemoryPrompt 把召回结果整理成结构化的 L1 记忆块：分节顺序固定、节内按
+// (排序值, ID) 稳定排序、条数上限在此生效（FR-20 ④ 的"条数上限"一侧），
+// 并给出常驻条目的摘要降级形式。渲染与预算裁剪都由 contextx 负责，
+// 保证同一份记忆集合每轮得到完全相同的字节（FR-11 ①④）。
+//
+// Raw feedback is archived for audit but never injected — only its distilled
+// skill is；pending / superseded / archived 一律不进入 prompt（PRD §3.2）。
+func (s *memoryService) BuildMemoryPrompt(memories []*types.RecalledMemory) contextx.MemoryPrompt {
+	prompt := contextx.MemoryPrompt{Header: memoryPromptHeader}
 	if len(memories) == 0 {
-		return ""
+		return prompt
 	}
 
-	var soul, profile, memoryFacts, skills, summaries []string
-	var profileRows, factRows, skillFacts []*types.MemoryFact
+	var soulRows, profileRows, factRows, otherRows, skillRows, summaryRows []*types.RecalledMemory
 	for _, m := range memories {
+		if m == nil {
+			continue
+		}
 		switch m.Kind {
 		case "fact":
 			if m.Fact == nil {
 				continue
 			}
+			// 防御性兜底：召回侧只取 active，这里再挡一次 pending /
+			// superseded / archived，确保它们永不进入 prompt（FR-20 ②）。
+			if types.MemoryStatusHiddenFromPrompt(m.Fact.Status) {
+				continue
+			}
 			switch m.Fact.Category {
 			case types.MemoryCategorySoul:
-				soul = append(soul, factLine(m.Fact))
+				soulRows = append(soulRows, m)
 			case types.MemoryCategoryProfile:
-				profileRows = append(profileRows, m.Fact)
+				profileRows = append(profileRows, m)
 			case types.MemoryCategoryFact:
-				factRows = append(factRows, m.Fact)
+				factRows = append(factRows, m)
 			case types.MemoryCategorySkill:
-				skillFacts = append(skillFacts, m.Fact)
+				skillRows = append(skillRows, m)
 			case types.MemoryCategoryFeedback:
 				// Never injected: the distilled skill carries the lesson.
 			default:
-				memoryFacts = append(memoryFacts, factLine(m.Fact))
+				otherRows = append(otherRows, m)
 			}
 		case "session_summary":
 			if m.Summary == nil {
 				continue
 			}
-			summaries = append(summaries, "- "+m.Summary.Summary)
+			summaryRows = append(summaryRows, m)
 		}
 	}
 
 	// 用户档案 (PRD P0-3 FR2): resident profile rows are guaranteed — they
 	// render first within the block budget; semantic fact rows fill the
 	// remaining slots, both importance-ordered.
-	sort.SliceStable(profileRows, func(i, j int) bool {
-		return profileRows[i].Importance > profileRows[j].Importance
-	})
+	sortRecalled(profileRows, importanceRank)
 	if len(profileRows) > memoryInjectProfileMax {
 		profileRows = profileRows[:memoryInjectProfileMax]
 	}
-	sort.SliceStable(factRows, func(i, j int) bool {
-		return factRows[i].Importance > factRows[j].Importance
-	})
+	sortRecalled(factRows, importanceRank)
 	if remaining := memoryInjectProfileMax - len(profileRows); len(factRows) > remaining {
 		if remaining < 0 {
 			remaining = 0
 		}
 		factRows = factRows[:remaining]
 	}
-	for _, f := range profileRows {
-		profile = append(profile, factLine(f))
-	}
-	for _, f := range factRows {
-		profile = append(profile, factLine(f))
-	}
 
 	// 助手经验: importance × confidence, bounded (PRD FR2, M=3).
-	sort.SliceStable(skillFacts, func(i, j int) bool {
-		return skillFacts[i].Importance*skillFacts[i].Confidence > skillFacts[j].Importance*skillFacts[j].Confidence
-	})
-	if len(skillFacts) > memoryInjectSkillMax {
-		skillFacts = skillFacts[:memoryInjectSkillMax]
-	}
-	for _, f := range skillFacts {
-		skills = append(skills, factLine(f))
+	sortRecalled(skillRows, skillRank)
+	if len(skillRows) > memoryInjectSkillMax {
+		skillRows = skillRows[:memoryInjectSkillMax]
 	}
 
-	if len(soul)+len(profile)+len(memoryFacts)+len(skills)+len(summaries) == 0 {
-		return ""
-	}
+	// 风格指令 / 相关长期记忆 / 会话摘要：同样按稳定键排序（原先 default 分支
+	// 完全依赖召回返回顺序，评分相同的条目会随轮抖动）。
+	sortRecalled(soulRows, importanceRank)
+	sortRecalled(otherRows, scoreRank)
+	sortRecalled(summaryRows, scoreRank)
 
-	writeSection := func(b *strings.Builder, title string, lines []string) {
-		if len(lines) == 0 {
-			return
-		}
-		b.WriteString("\n")
-		b.WriteString(title)
-		b.WriteString("\n")
-		for _, l := range lines {
-			b.WriteString(l)
-			b.WriteString("\n")
-		}
+	prompt.Sections = []contextx.MemorySection{
+		{Title: memorySectionSoul, Blocks: factBlocks(soulRows)},
+		{Title: memorySectionProfile, Blocks: append(factBlocks(profileRows), factBlocks(factRows)...)},
+		{Title: memorySectionFacts, Blocks: factBlocks(otherRows)},
+		{Title: memorySectionSummaries, Blocks: summaryBlocks(summaryRows)},
+		{Title: memorySectionSkills, Blocks: factBlocks(skillRows)},
 	}
+	return prompt
+}
 
-	var b strings.Builder
-	b.WriteString("## 关于用户的长期记忆\n")
-	b.WriteString("以下来自历史对话的记忆可能与本问题相关，请在回答时自然地利用，不要逐字复述：\n")
-	writeSection(&b, "### 助手风格指令（用户设定）", soul)
-	writeSection(&b, "### 用户档案", profile)
-	writeSection(&b, "### 相关长期记忆", memoryFacts)
-	if len(summaries) > 0 {
-		b.WriteString("\n相关历史对话摘要：\n")
-		for _, l := range summaries {
-			b.WriteString(l)
-			b.WriteString("\n")
-		}
+// FormatRecalledForPrompt renders recalled memories as a system-prompt block,
+// grouped into the four memory modules with fixed section order and
+// per-module budgets (soul directives → user profile → memory stream →
+// assistant skills).
+func (s *memoryService) FormatRecalledForPrompt(memories []*types.RecalledMemory) string {
+	return contextx.RenderMemoryPrompt(s.BuildMemoryPrompt(memories))
+}
+
+// FormatRecalledForPromptWithin 在精确 token 预算内渲染召回记忆（FR-20）：
+//   - 计量口径是精确 tokenizer（counter），不再使用字符近似（FR-20 ①）；
+//   - 条数上限（BuildMemoryPrompt）与 token 预算双重生效，取更严者（FR-20 ④）；
+//   - 超预算时按召回评分从低到高整条移除，常驻块整块保留或整块降级为摘要
+//     （FR-20 ②③），绝不逐字裁剪。
+//
+// 返回结构化记忆块与裁剪结果：调用方把 prompt 交给五层装配器复核（smart 模式下
+// 装配器会用厂商 tokenizer 再算一次 L1），把 fit.Text 作为注入文本。
+// counter 为 nil 时退回通用 tokenizer；budgetTokens <= 0 表示不注入记忆。
+func (s *memoryService) FormatRecalledForPromptWithin(
+	memories []*types.RecalledMemory,
+	counter *contextx.Counter,
+	budgetTokens int,
+) (contextx.MemoryPrompt, contextx.MemoryFitResult) {
+	prompt := s.BuildMemoryPrompt(memories)
+	if counter == nil {
+		counter = contextx.NewCounter(contextx.VendorGeneric)
 	}
-	writeSection(&b, "### 助手经验", skills)
-	return b.String()
+	return prompt, contextx.NewAssembler(counter).FitMemory(prompt, budgetTokens)
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,6 +1317,12 @@ func (s *memoryService) UpdateFact(ctx context.Context, fact *types.MemoryFact) 
 		fact.Importance = existing.Importance
 	}
 	fact.TripleHash = types.ComputeTripleHash(fact.Category, fact.Subject, fact.Predicate, fact.Object)
+	// 管理页编辑属来源 manual（PRD §3.2）：manual 直接 active，因此编辑一条
+	// 待确认记忆等同于用户确认它。
+	fact.Origin = types.MemoryOriginManual
+	if fact.Status == types.MemoryStatusPending {
+		fact.Status = types.MemoryStatusActive
+	}
 
 	// Re-embed when the human-readable content changed so recall semantics
 	// track the edit. Embedder resolution failure never blocks the edit.
@@ -1140,16 +1341,27 @@ func (s *memoryService) UpdateFact(ctx context.Context, fact *types.MemoryFact) 
 	if rows == 0 {
 		return fmt.Errorf("memory fact not found")
 	}
+	// 编辑可能改变重要度/状态，顺带复核容量（FR-04）。
+	s.enforceMemoryCapacity(ctx, tenantID, userID)
 	return nil
 }
 
-// DeleteFact removes one fact owned by the ctx user.
-func (s *memoryService) DeleteFact(ctx context.Context, id string) error {
+// DeleteFact removes one fact owned by the ctx user. hard=true 时物理移除
+// （PRD §3.2：用户删除 = 物理移除，不可逆），否则沿用既有软删除。
+func (s *memoryService) DeleteFact(ctx context.Context, id string, hard bool) error {
 	tenantID, userID, ok := memoryScopeFromContext(ctx)
 	if !ok {
 		return fmt.Errorf("memory scope unavailable")
 	}
-	rows, err := s.memoryRepo.DeleteFact(ctx, tenantID, userID, id)
+	var (
+		rows int64
+		err  error
+	)
+	if hard {
+		rows, err = s.memoryRepo.HardDeleteFacts(ctx, tenantID, userID, []string{id})
+	} else {
+		rows, err = s.memoryRepo.DeleteFact(ctx, tenantID, userID, id)
+	}
 	if err != nil {
 		return err
 	}
@@ -1157,23 +1369,6 @@ func (s *memoryService) DeleteFact(ctx context.Context, id string) error {
 		return fmt.Errorf("memory fact not found")
 	}
 	return nil
-}
-
-// DeleteAllForUser erases every memory row of the ctx user (GDPR erase).
-func (s *memoryService) DeleteAllForUser(ctx context.Context) (int64, error) {
-	tenantID, userID, ok := memoryScopeFromContext(ctx)
-	if !ok {
-		return 0, fmt.Errorf("memory scope unavailable")
-	}
-	facts, err := s.memoryRepo.DeleteAllFacts(ctx, tenantID, userID)
-	if err != nil {
-		return 0, err
-	}
-	summaries, err := s.memoryRepo.DeleteAllSessionSummaries(ctx, tenantID, userID)
-	if err != nil {
-		return facts, err
-	}
-	return facts + summaries, nil
 }
 
 // DeleteSessionMemory drops the L2 summary bound to a session (session delete

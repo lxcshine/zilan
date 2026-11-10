@@ -776,7 +776,11 @@ function initFromKbInfo(kb: any) {
       enableParentChild: kb.chunking_config?.enable_parent_child ?? false,
       parentChunkSize: kb.chunking_config?.parent_chunk_size || 4096,
       childChunkSize: kb.chunking_config?.child_chunk_size || 384,
-      strategy: kb.chunking_config?.strategy || 'auto',
+      // 空字符串 = legacy（按长度递归切分）。存量知识库未显式选择过策略时
+      // 必须保持空值，绝不能兜底成 'auto'，否则一次上传就会把存量库的切分
+      // 行为静默升级为自适应三档，导致检索质量突变（PRD FR-15 规则②/§5.4）。
+      // 用户需切换时在知识库设置页显式选择。
+      strategy: kb.chunking_config?.strategy || '',
       tokenLimit: kb.chunking_config?.token_limit || 0,
       languages: kb.chunking_config?.languages || [],
       tableMetadataInstructions: kb.chunking_config?.table_metadata_instructions || '',

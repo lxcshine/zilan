@@ -204,7 +204,52 @@ type SearchResult struct {
 
 	// KnowledgeBaseID is the ID of the knowledge base this result belongs to
 	KnowledgeBaseID string `json:"knowledge_base_id,omitempty"`
+
+	// SourceLocators 引用溯源定位：命中内容在原始文件中的位置，
+	// 随引用接口响应返回（FR-05），合并相邻块时由调用方合并
+	SourceLocators SourceLocators `json:"source_locators,omitempty"`
+
+	// RerankPassage 保存“重排阶段实际看到的原文片段”（FR-19③）。
+	// Content 会在下游被逐层改写（FAQ 答案回填、相邻块合并、按 token
+	// 预算裁剪、图片裁剪等），一旦覆盖就无法再还原重排打分依据；
+	// 该字段由 reranking 包在构造副本时写入，仅用于溯源与调试，
+	// 不参与 JSON 序列化，也不参与任何打分。
+	RerankPassage string `gorm:"-" json:"-"`
+
+	// VectorScore 向量检索原始分（FR-17）：检索阶段记录该行命中向量索引
+	// 时的原始向量相似度。重排阶段图片命中行可能被文本重排器拒绝而仅凭
+	// 向量分保留（KeptByImageVector），保留判断依据该字段而非被改写过的
+	// Score。
+	VectorScore float64 `gorm:"-" json:"-"`
+
+	// MatchedImages 该行命中的图片证据（FR-17）：image_vector 行自身或经
+	// 去重合并继承而来的图片引用，供图片重排与视觉模型上下文注入使用。
+	MatchedImages []MatchedImage `gorm:"-" json:"matched_images,omitempty"`
 }
+
+// MatchedImage 描述一条随检索结果携带的图片证据（FR-17）。
+// ChunkID / KnowledgeBaseID 指向 image_vector chunk 本身，URL 为图片
+// 存储/资源地址——注入视觉模型前仍需按 VisionImageLimits 预处理。
+type MatchedImage struct {
+	// ChunkID 图片向量 chunk 的 ID
+	ChunkID string `json:"chunk_id"`
+	// KnowledgeBaseID 图片所属知识库 ID
+	KnowledgeBaseID string `json:"knowledge_base_id"`
+	// URL 图片地址（存储相对路径或资源 URL）
+	URL string `json:"url"`
+}
+
+const (
+	// MetadataKeptBy 标记某行因分数以外的原因被保留（见 KeptByImageVector），
+	// TopK 裁剪（如 TopKKeepingKept）不得丢弃带此标记的行。
+	MetadataKeptBy = "kept_by"
+	// KeptByImageVector 表示该图片命中行被文本重排器拒绝后，因向量分
+	// 达到 ImageKeepScore 而被保留（FR-17③）。
+	KeptByImageVector = "image_vector"
+	// MetadataImageVectorMatch 标记该行携带图片向量命中的证据（自身为
+	// image_vector 行或经 InheritImageEvidence 继承）。
+	MetadataImageVectorMatch = "image_vector_match"
+)
 
 // SearchParams represents the search parameters
 type SearchParams struct {

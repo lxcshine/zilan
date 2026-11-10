@@ -256,10 +256,12 @@ func sanitizeFileName(name string) string {
 	return result
 }
 
-// redactToken returns a masked form of the token for logging (never log the full token).
+// redactToken 返回可用于日志的脱敏形式。凭据的任何片段都不得入日志
+// （FR-08 条 1），首尾截断形式同样算片段，因此这里只保留"是否已配置"
+// 与长度这两个非敏感信息。
 func redactToken(t string) string {
-	if len(t) < 12 {
-		return "***"
+	if t == "" {
+		return "[unset]"
 	}
-	return t[:6] + "..." + t[len(t)-4:]
+	return fmt.Sprintf("[redacted len=%d]", len(t))
 }

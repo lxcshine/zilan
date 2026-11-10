@@ -29,11 +29,11 @@ const (
 // collected results span >1 engine type, the normalizer rescales vector
 // scores into [0, 1] before fusion.
 //
-// Failure policy: all-or-nothing. The first group error fails the whole
-// search and cancels siblings via errgroup, matching the existing single-
-// store behavior — chat/agent callers already treat "search failed" as
-// abort. A future PR can extract a MergePolicy interface (open/closed)
-// to add partial-result support without changing this function's callers.
+// Failure policy: 一个“完全没有结果”的 store group 失败会让整轮检索失败，
+// 并通过 errgroup 取消兄弟分组。但一次 Retrieve 调用可能在返回错误的同时也
+// 带回结果——某条检索腿或某个 collection 挂了、另一些成功了。这类结果会被
+// retainPartialResults 保留并在 WARN 级别记录：整轮失败会把已经成功取回的
+// 证据一起扔掉，而毫无痕迹地返回又会让调用方把残缺答案当成完整答案。
 //
 // Fast path: len(groups) == 1 → returns the single engine's Retrieve
 // directly with zero fan-out overhead. This is the dominant case today
@@ -54,7 +54,7 @@ func (s *knowledgeBaseService) retrieveFromStores(
 		return nil, nil
 	}
 	if len(groups) == 1 {
-		return groups[0].Engine.Retrieve(ctx, paramsWithTopK(groups[0]))
+		return retrieveGroup(ctx, groups[0])
 	}
 
 	timeout := multiStoreRetrieveTimeout()
@@ -71,7 +71,7 @@ func (s *knowledgeBaseService) retrieveFromStores(
 		g.Go(func() error {
 			gcCtx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
-			res, err := grp.Engine.Retrieve(gcCtx, paramsWithTopK(grp))
+			res, err := retrieveGroup(gcCtx, grp)
 			if err != nil {
 				logger.WarnWithFields(gctx, logger.Fields{
 					"tenant_id":  grp.OwnerTenantID,
@@ -128,6 +128,35 @@ func (s *knowledgeBaseService) retrieveFromStores(
 		}
 	}
 	return all, nil
+}
+
+// retrieveGroup 执行单个 store group 的检索，并把“结果 + 错误”并存的部分失败
+// 归一化为“要么有结果、要么有错误”，让单组与多组扇出走完全相同的策略。
+func retrieveGroup(ctx context.Context, g *storeGroup) ([]*types.RetrieveResult, error) {
+	res, err := g.Engine.Retrieve(ctx, paramsWithTopK(g))
+	return retainPartialResults(ctx, g, res, err)
+}
+
+// retainPartialResults 保留与错误一并返回的结果。
+//
+// CompositeRetrieveEngine 在某条检索腿/某个 collection 失败而其他检索成功时，
+// 会带着非 nil error 返回结果。丢掉这些结果会让一个降级的存储变成整轮检索
+// 失败、并损失已经取回的证据；毫无痕迹地返回又会让调用方把不完整的答案当成
+// 完整答案。因此这里在 WARN 级别记录失败（本函数是仍然知道 store group 上下文
+// 的最近消费者），并以 nil error 返回结果。没有任何结果的失败仍然是致命的。
+func retainPartialResults(
+	ctx context.Context, g *storeGroup, res []*types.RetrieveResult, err error,
+) ([]*types.RetrieveResult, error) {
+	if err == nil || len(res) == 0 {
+		return res, err
+	}
+	logger.WarnWithFields(ctx, logger.Fields{
+		"tenant_id":   g.OwnerTenantID,
+		"kb_count":    len(g.KBIDs),
+		"store_kind":  storeKindLabel(g.StoreID),
+		"result_sets": len(res),
+	}, fmt.Sprintf("retrieve returned partial results: %v", err))
+	return res, nil
 }
 
 // paramsWithTopK builds a fresh []RetrieveParams for a group. BaseParams

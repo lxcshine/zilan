@@ -254,6 +254,27 @@ var restrictedIPv4Ranges = []*net.IPNet{
 	mustParseCIDR("172.20.0.0/16"),
 }
 
+// restrictedPorts 是用户可控 URL 不得触达的非 HTTP 服务端口。
+// URL 校验（isSSRFSafeURL）与拨号（SSRFSafeDialContext）各查一次：
+// 只在入参处查一次时，运行时发现的 URL（重定向、SDK 自取的元数据地址）
+// 就能绕过输入边界。
+var restrictedPorts = map[string]bool{
+	"22":    true, // SSH
+	"23":    true, // Telnet
+	"25":    true, // SMTP
+	"445":   true, // SMB
+	"3389":  true, // RDP
+	"5432":  true, // PostgreSQL
+	"3306":  true, // MySQL
+	"6379":  true, // Redis
+	"27017": true, // MongoDB
+	"9200":  true, // Elasticsearch
+	"2379":  true, // etcd
+	"2380":  true, // etcd
+	"8500":  true, // Consul
+	"4001":  true, // etcd (old)
+}
+
 // mustParseCIDR parses a CIDR string and panics on error
 func mustParseCIDR(s string) *net.IPNet {
 	_, ipNet, err := net.ParseCIDR(s)
@@ -459,27 +480,8 @@ func isSSRFSafeURL(rawURL string) (bool, string) {
 
 	// Check for suspicious port numbers
 	port := parsed.Port()
-	if port != "" {
-		// Block common internal service ports
-		blockedPorts := map[string]bool{
-			"22":    true, // SSH
-			"23":    true, // Telnet
-			"25":    true, // SMTP
-			"445":   true, // SMB
-			"3389":  true, // RDP
-			"5432":  true, // PostgreSQL
-			"3306":  true, // MySQL
-			"6379":  true, // Redis
-			"27017": true, // MongoDB
-			"9200":  true, // Elasticsearch
-			"2379":  true, // etcd
-			"2380":  true, // etcd
-			"8500":  true, // Consul
-			"4001":  true, // etcd (old)
-		}
-		if blockedPorts[port] {
-			return false, fmt.Sprintf("port %s is blocked for security reasons", port)
-		}
+	if port != "" && restrictedPorts[port] {
+		return false, fmt.Sprintf("port %s is blocked for security reasons", port)
 	}
 
 	return true, ""
@@ -742,10 +744,13 @@ func ValidateStdioConfig(command string, args []string, envVars map[string]strin
 
 // SSRFSafeHTTPClientConfig contains configuration for the SSRF-safe HTTP client
 type SSRFSafeHTTPClientConfig struct {
-	Timeout            time.Duration
-	MaxRedirects       int
-	DisableKeepAlives  bool
-	DisableCompression bool
+	// SameOriginRedirectsOnly 为真时，任何跨源重定向一律拒绝，
+	// 供只与单一固定上游通信的客户端（如 IM webhook 回调）使用。
+	SameOriginRedirectsOnly bool
+	Timeout                 time.Duration
+	MaxRedirects            int
+	DisableKeepAlives       bool
+	DisableCompression      bool
 }
 
 // DefaultSSRFSafeHTTPClientConfig returns the default configuration
@@ -771,12 +776,17 @@ func sameHTTPOrigin(a, b *url.URL) bool {
 
 // stripRedirectSensitiveHeaders removes credentials that must not follow a
 // cross-host redirect (Go only strips Authorization/Cookie by default).
+// 采用白名单而非黑名单：连接器会带各种自定义凭据头（X-Auth-Token、
+// X-Api-Key、Api-Key、租户签名……），逐个列举必然漏项。
 func stripRedirectSensitiveHeaders(req *http.Request) {
-	req.Header.Del("Authorization")
-	req.Header.Del("Cookie")
-	req.Header.Del("X-Auth-Token")
-	req.Header.Del("X-Api-Key")
-	req.Header.Del("Api-Key")
+	for name := range req.Header {
+		switch http.CanonicalHeaderKey(name) {
+		case "Accept", "Accept-Language", "User-Agent":
+		default:
+			req.Header.Del(name)
+		}
+	}
+	req.Host = ""
 }
 
 // NewSSRFSafeTransport builds an *http.Transport whose connections are guarded
@@ -805,6 +815,13 @@ func newSSRFCheckRedirect(maxRedirects int) func(*http.Request, []*http.Request)
 		// Strip credentials when the redirect crosses hosts so connector
 		// tokens (e.g. Yuque X-Auth-Token) cannot leak to a third party.
 		if len(via) > 0 && !sameHTTPOrigin(via[0].URL, req.URL) {
+			// 跨源重放非 GET/HEAD 或带 body 的请求一律拒绝：Go 会把原始
+			// body 重新发往新主机，等于把用户提交的数据（可能含凭据）
+			// 交给一个未经用户指定的第三方。
+			if via[0].Method != http.MethodGet && via[0].Method != http.MethodHead || via[0].Body != nil {
+				return fmt.Errorf("%w: cross-origin request replay is forbidden (method %s)",
+					ErrSSRFRedirectBlocked, via[0].Method)
+			}
 			stripRedirectSensitiveHeaders(req)
 		}
 
@@ -818,13 +835,33 @@ func newSSRFCheckRedirect(maxRedirects int) func(*http.Request, []*http.Request)
 		if redirectHost != "" && IsSSRFWhitelisted(redirectHost) {
 			return nil
 		}
-		redirectURL := req.URL.String()
-		if safe, reason := isSSRFSafeURL(redirectURL); !safe {
-			return fmt.Errorf("%w: %s", ErrSSRFRedirectBlocked, reason)
+		if err := validateURLForSSRFForOutbound(req.URL.String()); err != nil {
+			return fmt.Errorf("%w: %w", ErrSSRFRedirectBlocked, err)
 		}
 
 		return nil
 	}
+}
+
+// SSRFValidatingRoundTripper 对每一个出站请求强制 URL 策略，包括 SDK 在
+// 运行时自行发现的 URL（例如 OAuth 元数据地址）——它们从未经过应用层的
+// handler 校验。拨号侧的检查仍然必要：它负责 pin 住 DNS 应答，也覆盖那些
+// 无法直接套上这层包装的 transport。
+type SSRFValidatingRoundTripper struct {
+	Base http.RoundTripper
+}
+
+func (t *SSRFValidatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil || req.URL == nil {
+		return nil, fmt.Errorf("outbound request blocked: request URL is required")
+	}
+	if t.Base == nil {
+		return nil, fmt.Errorf("outbound request blocked: base transport is required")
+	}
+	if err := validateURLForSSRFForOutbound(req.URL.String()); err != nil {
+		return nil, fmt.Errorf("outbound request blocked by SSRF policy: %w", err)
+	}
+	return t.Base.RoundTrip(req)
 }
 
 // NewSSRFSafeHTTPClientWithTransport wraps a caller-supplied transport in an
@@ -834,10 +871,20 @@ func newSSRFCheckRedirect(maxRedirects int) func(*http.Request, []*http.Request)
 func NewSSRFSafeHTTPClientWithTransport(
 	config SSRFSafeHTTPClientConfig, transport http.RoundTripper,
 ) *http.Client {
+	if transport == nil {
+		transport = NewSSRFSafeTransport(config)
+	}
 	return &http.Client{
-		Timeout:       config.Timeout,
-		Transport:     transport,
-		CheckRedirect: newSSRFCheckRedirect(config.MaxRedirects),
+		Timeout: config.Timeout,
+		// 兜底包装：即使调用方传入了自己的 transport（例如 SDK 要求的
+		// 自定义 transport），URL 策略也依然生效。
+		Transport: &SSRFValidatingRoundTripper{Base: transport},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if config.SameOriginRedirectsOnly && len(via) > 0 && !sameHTTPOrigin(via[0].URL, req.URL) {
+				return fmt.Errorf("%w: cross-origin redirect is forbidden", ErrSSRFRedirectBlocked)
+			}
+			return newSSRFCheckRedirect(config.MaxRedirects)(req, via)
+		},
 	}
 }
 
@@ -849,12 +896,47 @@ func NewSSRFSafeHTTPClient(config SSRFSafeHTTPClientConfig) *http.Client {
 	return NewSSRFSafeHTTPClientWithTransport(config, NewSSRFSafeTransport(config))
 }
 
+// outboundDialTimeoutNanos 限制 SSRFSafeDialContext 建立单条 TCP 连接的耗时
+// 上界（FR-07：外部 HTTP 抓取的读取超时上界）。被黑洞吞掉或不可达的端点
+// 必须快速失败，而不是把 30s 的默认超时耗光、让上层（VLM/LLM 客户端、
+// 解析任务）显示误导性的"处理中"。默认 5s，可用
+// WEKNORA_OUTBOUND_DIAL_TIMEOUT（Go duration 字符串，如 "3s"）覆盖。
+// 以纳秒存储，便于原子替换。
+var outboundDialTimeoutNanos atomic.Int64
+
+const defaultOutboundDialTimeout = 5 * time.Second
+
+func init() {
+	outboundDialTimeoutNanos.Store(int64(defaultOutboundDialTimeout))
+	if raw := strings.TrimSpace(os.Getenv("WEKNORA_OUTBOUND_DIAL_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			outboundDialTimeoutNanos.Store(int64(d))
+		} else {
+			log.Printf("[ssrf] invalid WEKNORA_OUTBOUND_DIAL_TIMEOUT %q; using %s", raw, defaultOutboundDialTimeout)
+		}
+	}
+}
+
+// SetOutboundDialTimeout 覆盖 SSRFSafeDialContext 使用的单连接拨号超时。
+// 可在启动时由配置层调用，并发安全；非正值被忽略（保持已有配置）。
+func SetOutboundDialTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	outboundDialTimeoutNanos.Store(int64(d))
+}
+
+// OutboundDialTimeout 返回当前的单连接拨号超时上界。
+func OutboundDialTimeout() time.Duration {
+	return time.Duration(outboundDialTimeoutNanos.Load())
+}
+
 // SSRFSafeDialContext is a custom dial function that validates the resolved IP addresses
 // before establishing a connection. This provides an additional layer of SSRF protection
 // against DNS rebinding attacks during the connection phase.
 func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	// Parse host and port
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid address %s: %w", addr, err)
 	}
@@ -865,10 +947,16 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 	// hosts. Admins must ensure whitelisted domains are under their control.
 	if IsSystemProxy(addr) || IsSSRFWhitelisted(host) {
 		dialer := &net.Dialer{
-			Timeout:   30 * time.Second,
+			Timeout:   OutboundDialTimeout(),
 			KeepAlive: 30 * time.Second,
 		}
 		return dialer.DialContext(ctx, network, addr)
+	}
+
+	// 端口在拨号侧复检：URL 校验只对经过 handler 的入参生效，
+	// 重定向或 SDK 运行时发现的地址可以直接走到这里。
+	if restrictedPorts[port] {
+		return nil, fmt.Errorf("connection blocked: port %s is restricted", port)
 	}
 
 	// Check if the host is a restricted hostname
@@ -884,10 +972,15 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// Resolve the hostname to IP addresses
+	// 只解析一次，校验全部应答，然后直接拨其中某个已校验的 IP。
+	// 若这里仍然拨原主机名，标准 dialer 会再解析一次，
+	// 在校验与建连之间留下 DNS rebinding 窗口。
 	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("DNS resolution failed for %s: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("DNS resolution returned no addresses for %s", host)
 	}
 
 	// Validate all resolved IPs
@@ -897,13 +990,22 @@ func SSRFSafeDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		}
 	}
 
-	// If we get here, all IPs are safe. Connect using the standard dialer.
-	// We dial the original address so that proper connection routing happens.
+	// Pin 到已校验的 DNS 应答；TLS 仍用请求里的主机名做 SNI 与证书校验
+	// （SNI 由 http.Transport 依据 URL 主机名设置，与这里的拨号地址无关）。
 	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
+		Timeout:   OutboundDialTimeout(),
 		KeepAlive: 30 * time.Second,
 	}
-	return dialer.DialContext(ctx, network, addr)
+	var lastErr error
+	for _, ipAddr := range ips {
+		pinnedAddr := net.JoinHostPort(ipAddr.IP.String(), port)
+		conn, dialErr := dialer.DialContext(ctx, network, pinnedAddr)
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, fmt.Errorf("failed to connect to validated addresses for %s: %w", host, lastErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1089,8 @@ func loadSSRFWhitelist() *ssrfWhitelistConfig {
 // applySSRFWhitelist for the canonical merge logic.
 func SetSSRFWhitelistFromRaw(raw string) {
 	ssrfWhitelistAtomic.Store(parseSSRFWhitelistRaw(raw))
+	// 白名单变了，之前缓存的出站校验结论一律作废。
+	invalidateSSRFOutboundValidationCache()
 }
 
 // parseSSRFWhitelistRaw parses a comma-separated whitelist string into
@@ -1165,6 +1269,7 @@ func ResetSSRFWhitelistForTest() {
 	ssrfWhitelistOnce = sync.Once{}
 	ssrfWhitelist = nil
 	ssrfWhitelistAtomic.Store(nil)
+	invalidateSSRFOutboundValidationCache()
 }
 
 // FormatSSRFError takes the error returned by ValidateURLForSSRF and wraps

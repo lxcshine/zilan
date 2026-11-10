@@ -15,10 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"time"
+
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 )
 
 // QRCodeResult holds the result of requesting a login QR code.
@@ -66,7 +67,7 @@ func (s *QRCodeService) GetLoginQRCode(ctx context.Context) (*QRCodeResult, erro
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}
@@ -129,7 +130,7 @@ func (s *QRCodeService) PollQRCodeStatus(ctx context.Context, qrcode string) (*L
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := secutils.ReadResponseCapped(resp.Body, secutils.JSONResponseLimit())
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
 	}

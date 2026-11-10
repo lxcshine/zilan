@@ -92,6 +92,10 @@ def extract_formulas_from_page(
             "b64": str,            # base64 JPEG
             "page": int,
             "is_display": bool,    # display (block) vs inline
+            # --- FR-21：公式图像裁剪区域的位置，供单元格级溯源使用 ---
+            "line_index": int,     # 该公式在页面文本层中的行号（0 基）
+            "bbox": tuple,         # 裁剪区域，PDF 点、左下原点
+            "bbox_norm": list|None, # 同一区域的 0-1 归一化 bbox（左上原点）
         }
     """
     results = []
@@ -113,6 +117,8 @@ def extract_formulas_from_page(
     formula_lines = detect_formula_lines(plain)
     if not formula_lines:
         return results
+
+    geometry = _page_geometry(page)
 
     # Step 2: For each formula line, get its bounding box and render as image
     for line_idx, line_text in formula_lines:
@@ -137,9 +143,34 @@ def extract_formulas_from_page(
             "b64": b64,
             "page": page_index,
             "is_display": len(line_text) > 50,  # heuristic
+            "line_index": line_idx,
+            "bbox": tuple(bbox),
+            "bbox_norm": _normalize_bbox(geometry, bbox),
         })
 
     return results
+
+
+def _page_geometry(page):
+    """页面几何（CropBox + /Rotate）；拿不到就返回 None，定位降级为页级。"""
+    try:
+        from docreader.parser.source_locator import PageGeometry
+
+        return PageGeometry(page.get_cropbox(), page.get_rotation())
+    except Exception:
+        logger.debug("formula page geometry unavailable", exc_info=True)
+        return None
+
+
+def _normalize_bbox(geometry, bbox) -> Optional[List[float]]:
+    """把 PDF 点 bbox 归一化成 0-1（左上原点），失败时返回 None。"""
+    if geometry is None or not bbox:
+        return None
+    try:
+        return geometry.bbox(bbox)
+    except Exception:
+        logger.debug("formula bbox normalization failed", exc_info=True)
+        return None
 
 
 def _line_bbox(page, raw, line_index: int):
@@ -278,22 +309,30 @@ def _validate_latex(latex: str) -> bool:
     return True
 
 
+def formula_markdown(formula: dict) -> str:
+    """一个公式区域对应的 Markdown 片段；无 LaTeX 也无图时返回空串。"""
+    latex = formula.get("latex")
+    if latex:
+        return f"$$ {latex} $$" if formula.get("is_display") else f"${latex}$"
+    ref = formula.get("ref_path", "")
+    return f"![formula]({ref})" if ref else ""
+
+
 def inject_formula_markdown(text: str, formulas: List[dict]) -> str:
-    """Inject LaTeX formulas into the page text as $$...$$ blocks."""
+    """Inject LaTeX formulas into the page text as $$...$$ blocks.
+
+    注意：把公式追加进页文本会让 ``source_locator.locate_lines`` 的「命中数 ==
+    出现数」判定失败（同一行公式在页内出现两次），进而把整页拖回页级定位。
+    PDF 流水线因此改为在页文本块之后把公式作为独立块追加（见 pdf_parser）。
+    """
     if not formulas:
         return text
 
     lines = text.splitlines()
     for f in formulas:
-        latex = f.get("latex")
-        ref = f.get("ref_path", "")
-        if latex:
-            if f.get("is_display"):
-                lines.append(f"$$ {latex} $$")
-            else:
-                lines.append(f"${latex}$")
-        elif ref:
-            lines.append(f"![formula]({ref})")
+        part = formula_markdown(f)
+        if part:
+            lines.append(part)
     return "\n".join(lines)
 
 

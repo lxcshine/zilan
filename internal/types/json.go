@@ -65,6 +65,19 @@ func (j *JSON) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// NewJSON 把任意值序列化为 JSON 载荷（审计日志 Details 等场景）；
+// 序列化失败返回 nil，调用方按"无明细"处理。
+func NewJSON(v any) JSON {
+	if v == nil {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return JSON(b)
+}
+
 // ToString converts JSON to a string.
 func (j JSON) ToString() string {
 	if len(j) == 0 {

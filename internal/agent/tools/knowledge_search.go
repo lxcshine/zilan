@@ -13,7 +13,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/models/imageprep"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
+	"github.com/Tencent/WeKnora/internal/reranking"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -282,9 +284,14 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 		topK, vectorThreshold, keywordThreshold, kbTypeMap)
 	logger.Infof(ctx, "[Tool][KnowledgeSearch] Concurrent search completed: %d raw results", len(allResults))
 
-	// Note: HybridSearch now uses RRF (Reciprocal Rank Fusion) which produces normalized scores
-	// RRF scores are in range [0, ~0.033] (max when rank=1 on both sides: 2/(60+1))
-	// Threshold filtering is already done inside HybridSearch before RRF, so we skip it here
+	// Note: HybridSearch now uses RRF (Reciprocal Rank Fusion) which produces
+	// *unnormalized* rank-based scores: RRF 分数落在 [0, ~0.033]（两侧都排第 1
+	// 时取到最大值 (vectorWeight+keywordWeight)/(k+1)）。阈值过滤已经在
+	// HybridSearch 内部、RRF 之前完成，因此这里不再按 minScore 过滤。
+	//
+	// ⚠️ 若将来给 fuseWithRRF 加上 /maxRRF 归一化（把分数拉到 [0,1]），本处与
+	// 文件后面的第二处说明必须同步改：归一化后 minScore 会变得“看起来可用”，
+	// 但它是排名派生分而非校准相关度，重新开启会造成对同一批结果的二次过滤。
 
 	// Deduplicate before reranking to reduce processing overhead
 	deduplicatedBeforeRerank := t.deduplicateResults(allResults)
@@ -348,9 +355,11 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 		}
 	}
 
-	// Note: minScore filter is skipped because HybridSearch now uses RRF scores
-	// RRF scores are in range [0, ~0.033], not [0, 1], so old thresholds don't apply
-	// Threshold filtering is already done inside HybridSearch before RRF fusion
+	// Note: minScore filter is skipped because HybridSearch returns RRF scores,
+	// which live in [0, ~0.033] rather than [0, 1], so the old threshold scale
+	// does not apply. 阈值过滤已经在 HybridSearch 内部、RRF 融合之前完成，
+	// 这里再过滤一次就是对同一批结果的双重过滤。参见前面 concurrentSearch
+	// 之后的同一条说明。
 
 	// Final deduplication after rerank (in case rerank changed scores/order but duplicates remain)
 	logger.Debugf(ctx, "[Tool][KnowledgeSearch] Final deduplication after rerank...")
@@ -548,8 +557,11 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 						}
 						kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, fullKBIDs[0], searchParams)
 						if err != nil {
-							logger.Warnf(ctx, "[Tool][KnowledgeSearch] Combined search failed for KBs %v: %v", fullKBIDs, err)
-							return
+							// 单个知识库组失败按“降级”处理：不整轮失败，其他
+							// 分组/目标的结果照常汇总。HybridSearch 允许
+							// “结果 + 错误”并存（部分失败），因此这里不 return，
+							// 已经取回的部分继续参与后续重排。
+							logger.Warnf(ctx, "[Tool][KnowledgeSearch] Combined search degraded for KBs %v: %v", fullKBIDs, err)
 						}
 						mu.Lock()
 						for _, r := range kbResults {
@@ -566,6 +578,14 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 				}
 
 				// Individual retrieval for specific-knowledge targets
+				//
+				// 检索范围限定到指定文档（FR-19④）：SearchTarget.KnowledgeIDs
+				// 在这里透传成 SearchParams.KnowledgeIDs，HybridSearch 再把它
+				// 写进每一条 RetrieveParams（向量腿与关键词腿都带），最终由各
+				// 检索引擎在存储层下推成 knowledge_id IN (...) 过滤（postgres /
+				// milvus / qdrant / weaviate / sqlite / opensearch / tencentvectordb
+				// 均已实现）。因此 Agent 与外部调用方可以按文档粒度收敛检索范围，
+				// 不需要在上层做结果过滤。
 				for _, target := range knowledgeTargets {
 					st := target
 					innerWg.Add(1)
@@ -587,8 +607,9 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 						}
 						kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, st.KnowledgeBaseID, searchParams)
 						if err != nil {
-							logger.Warnf(ctx, "[Tool][KnowledgeSearch] Failed to search KB %s: %v", st.KnowledgeBaseID, err)
-							return
+							// 同上：目标级失败降级，不丢弃其他目标的结果，
+							// 也保留本次调用可能已取回的部分结果。
+							logger.Warnf(ctx, "[Tool][KnowledgeSearch] Search degraded for KB %s: %v", st.KnowledgeBaseID, err)
 						}
 						mu.Lock()
 						for _, r := range kbResults {
@@ -958,6 +979,10 @@ func (t *KnowledgeSearchTool) rerankWithModel(
 		t.rerankThreshold(),
 		t.searchTargets.HasRecallThresholdOverride(),
 	)
+	// FR-17③ 图片兜底保留：文本重排器只看 caption，被其拒绝的图片腿命中行
+	// 只要向量分达标就以副本保留（带 KeptByImageVector 标记，供归因与
+	// top-k 保护），至多 reranking.MaxKeptImages 条。
+	ranked = t.keepImageVectorHits(ctx, results, ranked)
 	logger.Infof(
 		ctx,
 		"[Tool][KnowledgeSearch] Reranked %d/%d results above threshold %.2f",
@@ -966,6 +991,48 @@ func (t *KnowledgeSearchTool) rerankWithModel(
 		t.rerankThreshold(),
 	)
 	return ranked, nil
+}
+
+// keepImageVectorHits 是 reranking.KeepImages 在 agent 工具结果结构上的
+// 适配：把“被重排阈值拒绝、但向量分达到图片腿阈值+0.05”的 image_vector
+// 命中行以副本追加回结果。入参行保持只读（FR-19③）。
+func (t *KnowledgeSearchTool) keepImageVectorHits(
+	ctx context.Context,
+	originals, ranked []*searchResultWithMeta,
+) []*searchResultWithMeta {
+	keepScore := reranking.ImageKeepScoreFor(0.4) // 与 service.ImageVectorThreshold 对齐
+	survived := make(map[string]struct{}, len(ranked))
+	for _, r := range ranked {
+		survived[r.ID] = struct{}{}
+	}
+	kept := 0
+	for _, original := range originals {
+		if kept >= reranking.MaxKeptImages {
+			break
+		}
+		if _, ok := survived[original.ID]; ok {
+			continue
+		}
+		if !reranking.IsPictorialImageHit(original.SearchResult) ||
+			original.SearchResult.VectorScore < keepScore {
+			continue
+		}
+		keptResult := *original
+		if src := original.SearchResult; src != nil {
+			rowCopy := *src
+			rowCopy.Metadata = make(map[string]string, len(src.Metadata)+1)
+			for k, v := range src.Metadata {
+				rowCopy.Metadata[k] = v
+			}
+			rowCopy.Metadata[types.MetadataKeptBy] = types.KeptByImageVector
+			keptResult.SearchResult = &rowCopy
+		}
+		ranked = append(ranked, &keptResult)
+		kept++
+		logger.Infof(ctx, "[Tool][KnowledgeSearch] kept image hit %s by vector score %.4f",
+			original.ID, original.SearchResult.VectorScore)
+	}
+	return ranked
 }
 
 func (t *KnowledgeSearchTool) rerankThreshold() float64 {
@@ -1018,6 +1085,18 @@ func (t *KnowledgeSearchTool) applyModelRerankScores(
 			continue
 		}
 		newResult := *originals[rr.Index]
+		// searchResultWithMeta 内嵌的是 *types.SearchResult 指针，直接给
+		// newResult.Score 赋值会穿透指针改写到共享的原始行：原始检索分与
+		// 原始 metadata 会永久丢失（FR-19③）。这里换成对**副本**打分，
+		// 入参行保持只读。
+		if original := newResult.SearchResult; original != nil {
+			rowCopy := *original
+			rowCopy.Metadata = make(map[string]string, len(original.Metadata)+3)
+			for k, v := range original.Metadata {
+				rowCopy.Metadata[k] = v
+			}
+			newResult.SearchResult = &rowCopy
+		}
 		baseScore := newResult.Score
 		modelScore := rr.RelevanceScore
 		newResult.Score = t.compositeScore(&newResult, modelScore, baseScore)
@@ -1385,7 +1464,64 @@ func (t *KnowledgeSearchTool) formatOutput(
 		Success: true,
 		Output:  output,
 		Data:    data,
+		// FR-17④ 视觉模型上下文注入：把检索到的图片（图片腿命中行/
+		// 文本行携带的图片证据）按 MaxContextImages 上限转成 data URI 附上，
+		// 引擎经 ToolResult.Images → msg.Images 管道送入视觉模型对话；
+		// 读图/预处理失败的图片跳过，不影响文本结果（§5.3）。
+		Images: t.collectContextImages(ctx, results),
 	}, nil
+}
+
+// collectContextImages 收集检索结果中的图片证据并转为模型可用的
+// data URI（FR-17④）：优先图片腿命中行（image_vector），其次文本行携带
+// 的 MatchedImages；总数不超过 searchutil.MaxContextImages，单图遵守
+// VisionImageLimits。任何单图失败都只跳过该图。
+func (t *KnowledgeSearchTool) collectContextImages(ctx context.Context, results []*searchResultWithMeta) []string {
+	limits := searchutil.VisionImageLimits{}.WithDefaults()
+	dataURIs := make([]string, 0, searchutil.MaxContextImages)
+	seen := make(map[string]bool)
+	// 读图能力经鸭子类型断言获得（knowledgeBaseService 具体实现持有
+	// ReadChunkImage；不把它塞进大接口以免传染 repository 实现）。
+	reader, _ := t.knowledgeBaseService.(interface {
+		ReadChunkImage(ctx context.Context, r *types.SearchResult) ([]byte, error)
+	})
+	if reader == nil {
+		return nil
+	}
+	for _, result := range results {
+		if len(dataURIs) >= searchutil.MaxContextImages {
+			break
+		}
+		if result == nil || result.SearchResult == nil || !searchutil.IsImageEvidence(result.SearchResult) {
+			continue
+		}
+		for _, img := range result.SearchResult.MatchedImages {
+			if len(dataURIs) >= searchutil.MaxContextImages {
+				break
+			}
+			if img.URL == "" || seen[img.URL] {
+				continue
+			}
+			seen[img.URL] = true
+			rowCopy := *result.SearchResult
+			rowCopy.ImageInfo = fmt.Sprintf(`[{"url":%q}]`, img.URL)
+			data, err := reader.ReadChunkImage(ctx, &rowCopy)
+			if err != nil {
+				logger.Warnf(ctx, "[Tool][KnowledgeSearch] Failed to read image %s for context injection: %v", img.URL, err)
+				continue
+			}
+			prepared, err := imageprep.Prepare(data, imageprep.Limits{
+				MaxBytes:     limits.MaxBytes,
+				MaxDimension: limits.MaxDimension,
+			})
+			if err != nil {
+				logger.Warnf(ctx, "[Tool][KnowledgeSearch] Image %s does not fit vision limits, skipping: %v", img.URL, err)
+				continue
+			}
+			dataURIs = append(dataURIs, prepared.DataURI())
+		}
+	}
+	return dataURIs
 }
 
 // chunkRange represents a continuous range of chunk indices

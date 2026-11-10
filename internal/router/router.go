@@ -12,6 +12,7 @@ import (
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 	"go.uber.org/dig"
+	"gorm.io/gorm"
 
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/handler"
@@ -87,6 +88,13 @@ type RouterParams struct {
 	MemoryHandler                *handler.MemoryHandler
 	ParseReviewHandler           *handler.ParseReviewHandler
 	BackupHandler                *handler.BackupHandler
+	UsageStatsHandler            *handler.UsageStatsHandler
+
+	// FR-19③ 知识图谱 JSON 检索入口的装配依赖。二者容器里都已注册
+	// （initDatabase / neo4jRepo.NewNeo4jRepository），路由层用它们就地
+	// 组装 GraphSearchHandler，避免为一条只读路由额外改动容器注册表。
+	DB        *gorm.DB
+	GraphRepo interfaces.RetrieveGraphRepository
 }
 
 // NewRouter 创建新的路由
@@ -248,7 +256,9 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterFAQRoutes(v1, params.FAQHandler, rbacGuards)
 		RegisterChunkRoutes(v1, params.ChunkHandler, rbacGuards)
 		RegisterSessionRoutes(v1, params.SessionHandler, params.MessageSuggestionHandler, rbacGuards)
-		RegisterMemoryRoutes(v1, params.MemoryHandler)
+		RegisterMemoryRoutes(v1, params.MemoryHandler, rbacGuards)
+		// FR-12 每轮 Token 用量归因与分层看板（工作区管理员聚合视图）。
+		RegisterTokenUsageRoutes(v1, params.UsageStatsHandler, rbacGuards)
 		RegisterParseReviewRoutes(v1, params.ParseReviewHandler)
 		RegisterChatRoutes(v1, params.SessionHandler, rbacGuards)
 		RegisterMessageRoutes(v1, params.MessageHandler, rbacGuards)
@@ -272,6 +282,17 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterDataSourceRoutes(v1, params.DataSourceHandler, params.DataSourceCredentialsHandler, rbacGuards)
 		RegisterWeKnoraCloudRoutes(v1, params.WeKnoraCloudHandler, rbacGuards)
 		RegisterWikiPageRoutes(v1, params.WikiPageHandler, rbacGuards)
+		// FR-19③ 知识图谱 JSON 检索入口（POST /knowledge-bases/:id/graph-search）。
+		RegisterGraphSearchRoutes(v1, nil, params.KBHandler, params.DB, params.GraphRepo, rbacGuards)
+		// FR-18 文档图片画廊（GET/POST /knowledge-bases/:id/images）。依赖的
+		// KnowledgeHandler / KnowledgeService / ChunkService 容器里都已注册，
+		// 路由层就地组装 ImageGalleryHandler，避免为只读路由改动容器注册表
+		// （与上面 GraphSearchHandler 的先例一致）。
+		RegisterImageGalleryRoutes(
+			v1,
+			handler.NewImageGalleryHandler(params.KnowledgeHandler, params.ChunkService, params.KnowledgeService),
+			rbacGuards,
+		)
 		RegisterChunkerDebugRoutes(v1, rbacGuards)
 
 		// Fail fast if any declared API-key policy points at a route

@@ -26,6 +26,7 @@ func TestEveryBuiltInToolDeclaresAModelHandlePolicy(t *testing.T) {
 		ToolDataSchema,
 		ToolWebSearch,
 		ToolWebFetch,
+		ToolReadFile,
 		ToolExecuteSkillScript,
 		ToolReadSkill,
 		ToolWikiReadPage,

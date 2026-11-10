@@ -10,12 +10,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
+	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -189,68 +189,30 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		// - Normal pure-chat mode: runs in the async goroutine with progress events
 	}
 
-	// Process file attachments: decode and save to storage, extract content
-	var processedAttachments types.MessageAttachments
+	// 附件（PRD FR-22 ①）：上传只做"持久化源文件 + 建 TemporaryDocument + 入 asynq 队列"，
+	// 解析交给后台 worker，不阻塞对话开始。
+	//
+	// 失败语义因此发生变化：以前任一附件解析失败会让整轮返回 400；现在解析发生在
+	// 请求返回之后，失败只落到该附件自己的 Status=Failed，由流式事件告知用户，
+	// 后续 resolveTemporaryAttachments / describeTemporaryAttachmentsForAgent 会跳过它。
+	// 仍然返回 400 的只有确定性的请求级错误：体积超限、base64 解码失败、
+	// 以及连源文件都没能存下来（文件名非法 / 类型不支持 / 存储不可用）。
+	var attachmentIDs []string
+	var attachmentMetas types.MessageAttachments
 	if len(request.AttachmentUploads) > 0 {
-		logger.Infof(ctx, "[%s] processing %d attachment(s)", logPrefix, len(request.AttachmentUploads))
-
-		// MAX_FILE_SIZE_MB env (50MB default). See utils/filesize.go for
-		// why this is deploy-time-only rather than a runtime setting.
-		maxSizeMB := secutils.GetMaxFileSizeMB()
-		maxSize := maxSizeMB * 1024 * 1024
-		for i, upload := range request.AttachmentUploads {
-			if upload.FileSize > maxSize {
-				return nil, nil, errors.NewBadRequestError(
-					fmt.Sprintf("attachment %d exceeds size limit of %dMB", i+1, maxSizeMB))
-			}
+		logger.Infof(ctx, "[%s] persisting %d attachment(s) for background parsing",
+			logPrefix, len(request.AttachmentUploads))
+		// 与会话同租户：后面的 hasPendingAttachments / ResolveForPrompt 都按
+		// session.TenantID 查文档，创建时就必须落在同一个租户下。
+		var persistErr error
+		attachmentIDs, attachmentMetas, persistErr = h.persistAttachmentUploads(
+			ctx, session.TenantID, sessionID, request.AttachmentUploads, customAgent,
+		)
+		if persistErr != nil {
+			logger.Errorf(ctx, "[%s] attachment upload failed: %v", logPrefix, persistErr)
+			return nil, nil, errors.NewBadRequestError(persistErr.Error())
 		}
-
-		tenantID := c.GetUint64(types.TenantIDContextKey.String())
-
-		// Use ASR only when the agent has audio upload enabled.
-		asrModelID := ""
-		if customAgent != nil && customAgent.Config.AudioUploadEnabled && customAgent.Config.ASRModelID != "" {
-			asrModelID = customAgent.Config.ASRModelID
-		}
-
-		// Process all attachments concurrently.
-		processedAttachments = make(types.MessageAttachments, len(request.AttachmentUploads))
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(request.AttachmentUploads))
-
-		for i, upload := range request.AttachmentUploads {
-			wg.Add(1)
-			go func(idx int, att AttachmentUpload) {
-				defer wg.Done()
-
-				data, err := DecodeBase64Attachment(att.Data)
-				if err != nil {
-					errChan <- fmt.Errorf("attachment %d decode failed: %w", idx+1, err)
-					return
-				}
-
-				processed, err := h.attachmentProcessor.ProcessAttachment(
-					ctx, data, att.FileName, att.FileSize, tenantID, asrModelID,
-				)
-				if err != nil {
-					errChan <- fmt.Errorf("attachment %d processing failed: %w", idx+1, err)
-					return
-				}
-
-				processedAttachments[idx] = *processed
-			}(i, upload)
-		}
-
-		wg.Wait()
-		close(errChan)
-
-		if len(errChan) > 0 {
-			err := <-errChan
-			logger.Errorf(ctx, "[%s] attachment processing failed: %v", logPrefix, err)
-			return nil, nil, errors.NewBadRequestError(fmt.Sprintf("attachment processing failed: %v", err))
-		}
-
-		logger.Infof(ctx, "[%s] all attachments processed", logPrefix)
+		logger.Infof(ctx, "[%s] %d attachment(s) queued for background parsing", logPrefix, len(attachmentIDs))
 	}
 
 	// Pre-uploaded documents may still be parsing. Only fetch their metadata
@@ -258,15 +220,12 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 	// limits and to record the attachments on the persisted user message. The
 	// heavy content selection happens after the SSE stream is up, so the send
 	// is not blocked while parsing finishes (see resolveTemporaryAttachments).
-	var attachmentIDs []string
-	var attachmentMetas types.MessageAttachments
 	if len(request.AttachmentIDs) > 0 {
 		normalizedIDs, normErr := normalizeTemporaryAttachmentIDs(request.AttachmentIDs)
 		if normErr != nil {
 			return nil, nil, errors.NewBadRequestError(normErr.Error())
 		}
 		tenantID := session.TenantID
-		attachmentMetas = make(types.MessageAttachments, 0, len(normalizedIDs))
 		for _, id := range normalizedIDs {
 			doc, getErr := h.temporaryDocuments.Get(ctx, tenantID, sessionID, id)
 			if getErr != nil || doc == nil {
@@ -280,12 +239,37 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 						fmt.Sprintf("file type %s is not supported by this agent", ext))
 				}
 			}
+			attachmentIDs = append(attachmentIDs, doc.ID)
 			attachmentMetas = append(attachmentMetas, types.MessageAttachment{
 				ID: doc.ID, URL: doc.ResourceRef, FileName: doc.FileName,
 				FileType: doc.FileType, FileSize: doc.FileSize,
 			})
 		}
-		attachmentIDs = normalizedIDs
+	}
+
+	// 两条上传路径合并后统一去重并限量，避免绕过 MaxTemporaryAttachmentsPerMessage。
+	if len(attachmentIDs) > 0 {
+		mergedIDs, mergeErr := normalizeTemporaryAttachmentIDs(attachmentIDs)
+		if mergeErr != nil {
+			return nil, nil, errors.NewBadRequestError(mergeErr.Error())
+		}
+		keep := make(map[string]struct{}, len(mergedIDs))
+		for _, id := range mergedIDs {
+			keep[id] = struct{}{}
+		}
+		mergedMetas := make(types.MessageAttachments, 0, len(mergedIDs))
+		seen := make(map[string]struct{}, len(mergedIDs))
+		for _, meta := range attachmentMetas {
+			if _, ok := keep[meta.ID]; !ok {
+				continue
+			}
+			if _, dup := seen[meta.ID]; dup {
+				continue
+			}
+			seen[meta.ID] = struct{}{}
+			mergedMetas = append(mergedMetas, meta)
+		}
+		attachmentIDs, attachmentMetas = mergedIDs, mergedMetas
 	}
 
 	mentionScopes := tagScopesFromMentionedItems(request.MentionedItems)
@@ -344,7 +328,6 @@ func (h *Handler) parseQARequest(c *gin.Context, logPrefix string) (*qaRequestCo
 		effectiveTenantID:     effectiveTenantID,
 		images:                request.Images,
 		channel:               request.Channel,
-		attachments:           processedAttachments,
 		attachmentIDs:         attachmentIDs,
 		attachmentMetas:       attachmentMetas,
 		suggestionAttribution: request.SuggestionAttribution,
@@ -844,6 +827,34 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 	if mode == qaModeNormal {
 		var completionHandled bool
 
+		// 本轮的 token 用量与上下文归因（PRD FR-12）。chat pipeline 通过
+		// chat.complete 事件送来（该事件没有其它订阅者，不会污染 SSE 流），这里先写到
+		// assistant 消息的内存态上——采集侧保证它早于 answer(Done) 发出，因此赶得上
+		// completeAssistantMessage 的那次落库——再转挂到 agent.complete 的 Extra 上，
+		// 于是流式 complete 事件也能把 usage 推给前端。
+		var turnUsage *types.TokenUsage
+		var turnStats *types.ContextTurnStats
+
+		streamCtx.eventBus.On(event.EventChatComplete, func(ctx context.Context, evt event.Event) error {
+			data, ok := evt.Data.(types.TurnUsageData)
+			if !ok {
+				return nil
+			}
+			// 消息 ID 不匹配说明这份用量属于另一条 assistant 行；宁可丢掉这一轮的归因，
+			// 也不能把数字写到错误的行上。空 ID 表示采集侧没拿到消息 ID，按本行处理。
+			if data.MessageID != "" && data.MessageID != streamCtx.assistantMessage.ID {
+				return nil
+			}
+			turnUsage, turnStats = data.Usage, data.ContextStats
+			applyTurnUsage(streamCtx.assistantMessage, data.Usage, data.ContextStats)
+			// 正常时序走不到这里：用量事件早于 answer(Done)，消息还没落库。用户中途停止
+			// 等异常时序会让消息先完成，此时补一次定向更新，别让这一轮的归因整个丢掉。
+			if streamCtx.assistantMessage.IsCompleted {
+				h.persistTurnUsage(streamCtx.asyncCtx, streamCtx.assistantMessage)
+			}
+			return nil
+		})
+
 		// Persist reasoning_content into agent_steps so historical reload can
 		// reconstruct the thinking card (same shape as Agent-mode steps).
 		// Accumulate on assistantMessage directly so user-initiated stop also
@@ -890,7 +901,15 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 				streamCtx.eventBus.Emit(streamCtx.asyncCtx, event.Event{
 					Type:      event.EventAgentComplete,
 					SessionID: sessionID,
-					Data:      event.AgentCompleteData{FinalAnswer: streamCtx.assistantMessage.Content},
+					Data: event.AgentCompleteData{
+						FinalAnswer: streamCtx.assistantMessage.Content,
+						// 把本轮用量转挂上去，流式 complete 事件才会带 usage（PRD FR-12）。
+						// 刻意不带 MessageID：带上会让 AgentStreamHandler.handleComplete
+						// 把 FinalAnswer 再追加一次到 Content 上（普通模式的答案已经由
+						// 上面的 EventAgentFinalAnswer 累积过了），落库则已由
+						// completeAssistantMessage 完成。
+						Extra: types.NewTurnUsageExtra(turnUsage, turnStats),
+					},
 				})
 			}
 			return nil
@@ -930,7 +949,12 @@ func (h *Handler) executeQA(reqCtx *qaRequestContext, mode qaMode, generateTitle
 
 		// Resolve pre-uploaded attachments (may still be parsing): waits with a
 		// timeline step so the send is not blocked, then injects content/images.
-		h.resolveTemporaryAttachments(streamCtx, reqCtx)
+		// Agent 模式改为交付清单引用，由 Agent 自己按需读取（PRD FR-22 ②③）。
+		if mode == qaModeAgent {
+			h.describeTemporaryAttachmentsForAgent(streamCtx, reqCtx)
+		} else {
+			h.resolveTemporaryAttachments(streamCtx, reqCtx)
+		}
 
 		// Run VLM image analysis if applicable
 		h.runVLMAnalysisIfNeeded(streamCtx, reqCtx, mode)
@@ -1063,6 +1087,16 @@ func attachmentParseWaitTimeout() time.Duration {
 	return defaultAttachmentParseWaitTimeout
 }
 
+// attachmentWaitTimeout 返回本轮等待附件解析完成的预算：Agent 级覆盖优先，
+// 其次环境变量，最后默认值（PRD FR-22 ②）。
+func (h *Handler) attachmentWaitTimeout(reqCtx *qaRequestContext) time.Duration {
+	if reqCtx != nil && reqCtx.customAgent != nil &&
+		reqCtx.customAgent.Config.AttachmentParseWaitTimeoutSec > 0 {
+		return time.Duration(reqCtx.customAgent.Config.AttachmentParseWaitTimeoutSec) * time.Second
+	}
+	return attachmentParseWaitTimeout()
+}
+
 // resolveTemporaryAttachments selects prompt content for pre-uploaded documents
 // after the SSE stream is live. When any attachment is still parsing it emits a
 // "attachment_parsing" timeline step and waits (bounded); unfinished attachments
@@ -1090,11 +1124,7 @@ func (h *Handler) resolveTemporaryAttachments(streamCtx *sseStreamContext, reqCt
 				Iteration:  0,
 			},
 		})
-		waitTimeout := attachmentParseWaitTimeout()
-		if reqCtx.customAgent != nil && reqCtx.customAgent.Config.AttachmentParseWaitTimeoutSec > 0 {
-			waitTimeout = time.Duration(reqCtx.customAgent.Config.AttachmentParseWaitTimeoutSec) * time.Second
-		}
-		h.waitForAttachments(ctx, tenantID, sessionID, reqCtx.attachmentIDs, waitTimeout)
+		h.waitForAttachments(ctx, tenantID, sessionID, reqCtx.attachmentIDs, h.attachmentWaitTimeout(reqCtx))
 	}
 
 	readyIDs, skipped := h.partitionReadyAttachments(ctx, tenantID, sessionID, reqCtx.attachmentIDs)
@@ -1139,6 +1169,85 @@ func (h *Handler) resolveTemporaryAttachments(streamCtx *sseStreamContext, reqCt
 		return
 	}
 
+	h.applyTemporaryAttachments(ctx, reqCtx, temporaryResult)
+}
+
+// describeTemporaryAttachmentsForAgent 把预上传文档的清单交给 Agent 轮次，
+// 既不等待解析完成，也不按问题挑选内容（PRD FR-22 ③）。Agent 通过 read_file 的
+// attachment:// 地址自己按需读取；只有真正需要某份还在解析的文档时才会短暂等待。
+func (h *Handler) describeTemporaryAttachmentsForAgent(streamCtx *sseStreamContext, reqCtx *qaRequestContext) {
+	if len(reqCtx.attachmentIDs) == 0 {
+		return
+	}
+	ctx := streamCtx.asyncCtx
+	// 独立上传的图片仍然要等：它们直接进视觉上下文，不走 read_file。
+	h.awaitImageAttachmentsForAgent(streamCtx, reqCtx)
+	result, err := h.temporaryDocuments.DescribeForAgent(
+		ctx, reqCtx.session.TenantID, reqCtx.sessionID, reqCtx.attachmentIDs,
+	)
+	if err != nil || result == nil {
+		if err != nil {
+			logger.Warnf(ctx, "temporary attachment manifest failed for session %s: %v", reqCtx.sessionID, err)
+		}
+		return
+	}
+	h.applyTemporaryAttachments(ctx, reqCtx, result)
+}
+
+// awaitImageAttachmentsForAgent 只对"独立图片上传"等待解析完成；
+// 文档内嵌的图片由 Agent 通过 read_file 按需读取，不在这里阻塞。
+func (h *Handler) awaitImageAttachmentsForAgent(streamCtx *sseStreamContext, reqCtx *qaRequestContext) {
+	if reqCtx.customAgent == nil || !reqCtx.customAgent.Config.ImageUploadEnabled {
+		return
+	}
+	var imageIDs []string
+	for _, meta := range reqCtx.attachmentMetas {
+		if meta.ID != "" && docparser.IsImageFormat(meta.FileType) {
+			imageIDs = append(imageIDs, meta.ID)
+		}
+	}
+	ctx := streamCtx.asyncCtx
+	tenantID := reqCtx.session.TenantID
+	if len(imageIDs) == 0 || !h.hasPendingAttachments(ctx, tenantID, reqCtx.sessionID, imageIDs) {
+		return
+	}
+	start := time.Now()
+	toolCallID := uuid.New().String()
+	streamCtx.eventBus.Emit(ctx, event.Event{
+		Type:      event.EventAgentToolCall,
+		SessionID: reqCtx.sessionID,
+		Data:      event.AgentToolCallData{ToolCallID: toolCallID, ToolName: "attachment_parsing"},
+	})
+	waitTimeout := h.attachmentWaitTimeout(reqCtx)
+	h.waitForAttachments(ctx, tenantID, reqCtx.sessionID, imageIDs, waitTimeout)
+	ready, skipped := h.partitionReadyAttachments(ctx, tenantID, reqCtx.sessionID, imageIDs)
+	output := fmt.Sprintf("已解析 %d 个附件", len(ready))
+	if skipped > 0 {
+		output += fmt.Sprintf("，%d 个未完成已跳过", skipped)
+	}
+	streamCtx.eventBus.Emit(ctx, event.Event{
+		Type:      event.EventAgentToolResult,
+		SessionID: reqCtx.sessionID,
+		Data: event.AgentToolResultData{
+			ToolCallID: toolCallID,
+			ToolName:   "attachment_parsing",
+			Output:     output,
+			Success:    true,
+			Duration:   time.Since(start).Milliseconds(),
+			Data: map[string]interface{}{
+				"display_type":  "attachment_parsing",
+				"parsed_count":  len(ready),
+				"skipped_count": skipped,
+			},
+		},
+	})
+}
+
+// applyTemporaryAttachments 按 Agent 支持的文件类型过滤解析结果，把它们（及其图片）
+// 加进本轮，并把选中的内容写回用户消息以便后续历史回放。
+func (h *Handler) applyTemporaryAttachments(
+	ctx context.Context, reqCtx *qaRequestContext, temporaryResult *types.TemporaryDocumentPromptResult,
+) {
 	attachments := temporaryResult.Attachments
 	if reqCtx.customAgent != nil && len(reqCtx.customAgent.Config.SupportedFileTypes) > 0 {
 		filtered := attachments[:0]
@@ -1331,6 +1440,25 @@ func appendQuickAnswerReasoning(msg *types.Message, content string) {
 		}}
 	}
 	msg.AgentSteps[0].ReasoningContent += content
+}
+
+// persistTurnUsage 在 assistant 消息已经落库之后补写一次本轮的用量与上下文归因
+// （PRD FR-12）。
+//
+// 正常时序走不到这里：采集侧保证用量事件早于 answer(Done)，而 completeAssistantMessage
+// 是在收到 Done 之后才跑的。只有异常时序（用户中途停止、通道提前关闭）会让消息先完成，
+// 此时补一次定向更新，别让这一轮的归因整个丢掉。尽力而为：失败只记日志，绝不影响答案。
+func (h *Handler) persistTurnUsage(ctx context.Context, assistantMessage *types.Message) {
+	if assistantMessage == nil {
+		return
+	}
+	// 与 completeAssistantMessage 一样脱离请求生命周期：用户停止会取消 asyncCtx，
+	// 而这次补写恰恰最常发生在那条路径上。
+	updateCtx := context.WithoutCancel(ctx)
+	if err := h.messageService.UpdateMessage(updateCtx, assistantMessage); err != nil {
+		logger.Warnf(updateCtx, "persist turn usage failed for message %s: %v",
+			assistantMessage.ID, err)
+	}
 }
 
 // completeAssistantMessage marks an assistant message as complete, updates it,

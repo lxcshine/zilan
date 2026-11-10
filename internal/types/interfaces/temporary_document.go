@@ -28,6 +28,9 @@ type TemporaryDocumentService interface {
 	List(ctx context.Context, tenantID uint64, sessionID string) ([]*types.TemporaryDocument, error)
 	Delete(ctx context.Context, tenantID uint64, sessionID, documentID string) error
 	ResolveForPrompt(ctx context.Context, tenantID uint64, sessionID string, documentIDs []string, query string) (*types.TemporaryDocumentPromptResult, error)
+	// DescribeForAgent 返回附件的清单视图（不等待解析、不按问题挑内容），
+	// 供 Agent 通过 read_file 的 attachment:// 地址按需读取（PRD FR-22 ③④）。
+	DescribeForAgent(ctx context.Context, tenantID uint64, sessionID string, documentIDs []string) (*types.TemporaryDocumentPromptResult, error)
 	Process(ctx context.Context, task *asynq.Task) error
 	CleanupExpired(ctx context.Context) error
 }
