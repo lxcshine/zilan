@@ -339,6 +339,9 @@ func BuildContainer(container *dig.Container) *dig.Container {
 	// same wiring — StartScheduler short-circuits when the section is
 	// off, and the HTTP surface answers 503.
 	must(container.Provide(backupSvc.NewBackupService))
+	// handler 依赖的是接口类型，dig 不会自动把具体类型当作接口解析，
+	// 因此这里显式把 *backup.Service 绑定到 interfaces.BackupService。
+	must(container.Provide(func(svc *backupSvc.Service) interfaces.BackupService { return svc }))
 	must(container.Invoke(startBackupScheduler))
 	logger.Debugf(ctx, "[Container] Backup service registered")
 	must(container.Provide(service.NewHousekeepingService))

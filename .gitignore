@@ -35,6 +35,8 @@ WeKnora-main/
 WeKnora-main.zip
 # 内部规划文档（与 docs/ 同策略，不对外发布）
 Zilan_*.md
+# 扫描件评测语料（第三方标准 PDF，体积大且不宜随仓库分发）
+test_data/
 cmd/desktop/build/bin/
 /models/
 test/data/mswag.txt
