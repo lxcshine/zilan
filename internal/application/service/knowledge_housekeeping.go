@@ -135,13 +135,26 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 	// without decrementing the counter) leave the row hanging just as
 	// visibly. Housekeeping promotes both states to 'failed' once the
 	// span heartbeat is older than the threshold.
+	// 时区安全的粗筛：SQLite 把时间戳存成带偏移量的字符串（同一条数据里
+	// created_at 可能是 +08:00、updated_at 可能是 +00:00），而 cutoff 由本地
+	// time.Now() 生成。两者一旦偏移不同，`updated_at < cutoff` 就是按字符串
+	// 逐位比较——"05:35+00:00" 会小于 "13:57+08:00"，刚写入的行被误判成早已
+	// 过期，正在解析的任务被强制置为失败。因此 SQLite 只按状态取候选，精确的
+	// 时间判定放到 Go 侧按绝对时刻做；PostgreSQL 的 timestamptz 语义本身正确，
+	// 仍下推到 SQL 以便走索引。
+	sqlTimeFilter := h.supportsSQLTimeComparison()
+	candidatesQuery := h.db.WithContext(ctx).Where("parse_status IN ?",
+		[]string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing})
+	if sqlTimeFilter {
+		candidatesQuery = candidatesQuery.Where("updated_at < ?", cutoff)
+	}
 	var candidates []types.Knowledge
-	if err := h.db.WithContext(ctx).
-		Where("parse_status IN ? AND updated_at < ?",
-			[]string{types.ParseStatusPending, types.ParseStatusProcessing, types.ParseStatusFinalizing}, cutoff).
-		Find(&candidates).Error; err != nil {
+	if err := candidatesQuery.Find(&candidates).Error; err != nil {
 		logger.Warnf(ctx, "[Housekeeping] knowledge candidate query failed: %v", err)
 		return
+	}
+	if !sqlTimeFilter {
+		candidates = filterByUpdatedAt(candidates, cutoff)
 	}
 
 	stuck := h.filterByLastSpanActivity(ctx, candidates, cutoff)
@@ -200,15 +213,62 @@ func (h *HousekeepingService) runSweep(ctx context.Context) {
 	// is shorter because summary tasks are bounded by a single LLM call.
 	// No span heartbeat exists for the summary stage (it lives in a
 	// downstream asynq task), so we accept the original simple check.
+	// 与 Sweep A 相同的时区约束：SQLite 不下推时间比较，改在 Go 侧判定。
 	summaryCutoff := time.Now().Add(-1 * time.Hour)
-	resSummary := h.db.WithContext(ctx).Model(&types.Knowledge{}).
-		Where("summary_status = ? AND updated_at < ?", types.SummaryStatusProcessing, summaryCutoff).
-		Update("summary_status", types.SummaryStatusFailed)
-	if resSummary.Error != nil {
-		logger.Warnf(ctx, "[Housekeeping] summary sweep failed: %v", resSummary.Error)
-	} else if resSummary.RowsAffected > 0 {
-		logger.Infof(ctx, "[Housekeeping] recovered %d stuck summary rows", resSummary.RowsAffected)
+	summaryQuery := h.db.WithContext(ctx).
+		Where("summary_status = ?", types.SummaryStatusProcessing)
+	if sqlTimeFilter {
+		summaryQuery = summaryQuery.Where("updated_at < ?", summaryCutoff)
 	}
+	var summaryCandidates []types.Knowledge
+	if err := summaryQuery.Find(&summaryCandidates).Error; err != nil {
+		logger.Warnf(ctx, "[Housekeeping] summary candidate query failed: %v", err)
+		return
+	}
+	if !sqlTimeFilter {
+		summaryCandidates = filterByUpdatedAt(summaryCandidates, summaryCutoff)
+	}
+	if len(summaryCandidates) > 0 {
+		ids := make([]string, 0, len(summaryCandidates))
+		for _, k := range summaryCandidates {
+			ids = append(ids, k.ID)
+		}
+		resSummary := h.db.WithContext(ctx).Model(&types.Knowledge{}).
+			Where("id IN ? AND summary_status = ?", ids, types.SummaryStatusProcessing).
+			Update("summary_status", types.SummaryStatusFailed)
+		if resSummary.Error != nil {
+			logger.Warnf(ctx, "[Housekeeping] summary sweep failed: %v", resSummary.Error)
+		} else if resSummary.RowsAffected > 0 {
+			logger.Infof(ctx, "[Housekeeping] recovered %d stuck summary rows", resSummary.RowsAffected)
+		}
+	}
+}
+
+// supportsSQLTimeComparison reports whether the timestamp column can be
+// compared against a bound time.Time in SQL and still mean "absolute instant".
+//
+// PostgreSQL (timestamptz) and MySQL (DATETIME with driver-side layout) both
+// do. SQLite stores timestamps as TEXT and compares them lexicographically, so
+// a row written as "…05:35:00+00:00" sorts before "…13:57:00+08:00" even
+// though it is later in absolute time — the comparison must happen in Go.
+func (h *HousekeepingService) supportsSQLTimeComparison() bool {
+	if h.db == nil {
+		return true
+	}
+	return h.db.Name() != "sqlite"
+}
+
+// filterByUpdatedAt keeps the rows whose updated_at is strictly before cutoff.
+// Both sides hold absolute instants (the SQLite driver parses the stored
+// offset into the time.Time location), so the comparison is timezone-safe.
+func filterByUpdatedAt(rows []types.Knowledge, cutoff time.Time) []types.Knowledge {
+	out := rows[:0]
+	for _, k := range rows {
+		if k.UpdatedAt.Before(cutoff) {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // filterByLastSpanActivity returns the subset of candidates whose most

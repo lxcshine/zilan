@@ -199,6 +199,42 @@ func TestHousekeeping_PreservesPendingTaskStillQueued(t *testing.T) {
 		"backlogged pending work remains owned by the durable queue")
 }
 
+// TestHousekeeping_NoFalseKill_FreshRowInForeignTimezone is the regression
+// test for the timezone false-kill: SQLite stores timestamps as TEXT, and the
+// same table can hold rows written in different offsets (+08:00 local vs
+// +00:00 UTC-normalized). Comparing them against a local-time cutoff as strings
+// makes a row written seconds ago look hours older than it is, so live parse
+// tasks were flipped to "failed" on every sweep.
+func TestHousekeeping_NoFalseKill_FreshRowInForeignTimezone(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	svc := newHousekeepingSvcForTest(db)
+
+	// 刚更新过、但以 UTC 偏移写入（生产里 updated_at 就是这种形态）。
+	insertKnowledge(t, db, "kid-fresh-utc", types.ParseStatusProcessing, time.Now().UTC())
+	// 另一种偏移（本地 +08:00）也要表现一致。
+	insertKnowledge(t, db, "kid-fresh-local", types.ParseStatusProcessing, time.Now())
+	// 同时放一条真正的陈旧行，确认修复没有把扫描本身关掉。
+	insertKnowledge(t, db, "kid-truly-stale", types.ParseStatusProcessing, time.Now().Add(-3*time.Hour))
+
+	svc.runSweep(context.Background())
+
+	for _, id := range []string{"kid-fresh-utc", "kid-fresh-local"} {
+		var status string
+		require.NoError(t, db.Raw(
+			`SELECT parse_status FROM knowledges WHERE id = ?`, id,
+		).Row().Scan(&status))
+		assert.Equal(t, types.ParseStatusProcessing, status,
+			"%s 刚更新过，不得因时间戳偏移量不同被判为超时", id)
+	}
+
+	var staleStatus string
+	require.NoError(t, db.Raw(
+		`SELECT parse_status FROM knowledges WHERE id = ?`, "kid-truly-stale",
+	).Row().Scan(&staleStatus))
+	assert.Equal(t, types.ParseStatusFailed, staleStatus,
+		"真正陈旧的行仍应被回收")
+}
+
 // TestHousekeeping_NoFalseKill_ActiveSpan is the regression test for
 // the "long DocReader silently runs longer than DocumentProcessTimeout"
 // scenario the user flagged. A knowledge whose knowledge.updated_at
